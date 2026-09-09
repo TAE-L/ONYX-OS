@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["kernel", "user/evtest", "user/argtest", "user/hello", "user/fstest", "user/shell", "tools/mkfat", "tools/mkext2"]
+exclude = ["test_asm"]
+
+[package]
+name = "onyxos"
+version = "0.1.0"
+edition = "2021"
+
+# Panic strategy for the whole workspace. The kernel targets
+# `x86_64-unknown-none` (no std, no unwinder) so it must be built with
+# `panic = "abort"`. Profiles must live in the workspace root manifest.
+[profile.dev]
+panic = "abort"
+# Keep the kernel small enough that the bootloader's auto-created FAT volume
+# stays FAT32 (its `fatfs` picks FAT16 below ~4085 clusters), so stage-2's
+# embedded FAT32-only driver can always load `kernel-x86_64`.
+# -O1 + minimal debug keeps M6 syscall/FAT code debuggable while saving ~3 MiB.
+opt-level = 1
+debug = false
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+
+[build-dependencies]
+# Artifact dependency: builds the `kernel` binary for the bare-metal target
+# and exposes its path as CARGO_BIN_FILE_KERNEL_kernel.
+kernel = { path = "kernel", artifact = "bin", target = "x86_64-unknown-none" }
+# M8: user programs seeded into the FAT32 partition by build.rs (the shell is
+# loaded from disk by the kernel's ELF loader; fstest is spawned by the
+# shell's AUTOEXEC via SYS_SPAWN). Exposed as CARGO_BIN_FILE_USER_SHELL_shell
+# and CARGO_BIN_FILE_USER_FSTEST_fstest.
+user-shell = { path = "user/shell", artifact = "bin", target = "x86_64-unknown-none" }
+user-fstest = { path = "user/fstest", artifact = "bin", target = "x86_64-unknown-none" }
+user-evtest = { path = "user/evtest", artifact = "bin", target = "x86_64-unknown-none" }
+# M9.6-C1: argv/envp/auxv regression — spawned by the shell's AUTOEXEC as
+# `run /ARGTEST.ELF alpha beta gamma`; reads the process-start stack.
+user-argtest = { path = "user/argtest", artifact = "bin", target = "x86_64-unknown-none" }
+# BIOS + UEFI output: the bootloader's `uefi` feature builds the GPT UEFI
+# image (`create_uefi_image`, M9). The `uefi` feature pulls in `gpt` (which
+# on this windows host needs mingw-w64's dlltool — available via w64devkit).
+bootloader = { version = "0.11.17", default-features = false, features = ["bios", "uefi"] }
+
+# UEFI note: the framebuffer comes from the firmware (GOP), so the BIOS-only
+# stage-2 VBE cap doesn't apply to the UEFI path.

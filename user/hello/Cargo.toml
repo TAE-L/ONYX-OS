@@ -1,0 +1,12 @@
+[package]
+name = "user-hello"
+version = "0.1.0"
+edition = "2021"
+
+# Bin name matters: the kernel's build script looks for the
+# CARGO_BIN_FILE_USER_HELLO_hello artifact-dependency variable.
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+[dependencies]

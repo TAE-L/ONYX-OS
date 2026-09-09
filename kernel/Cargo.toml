@@ -1,0 +1,30 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Entry point + boot info for the `bootloader` crate (no_std).
+bootloader_api = "0.11.12"
+x86_64 = "0.15.2"
+uart_16550 = "0.8.0"
+# Small 8x8 bitmap fonts for framebuffer text rendering (no_std).
+# default-features off: the `unicode` feature's modules don't compile on
+# recent nightlies; we only need the ASCII BASIC_FONTS table.
+font8x8 = { version = "0.3", default-features = false }
+# Interrupt controller (8259 PIC) + locks for global state.
+pic8259 = "0.10"
+spin = "0.9"
+# Kernel heap: a simple linked-list allocator for `alloc` (Vec/String/Box).
+linked_list_allocator = "0.10"
+# PS/2 keyboard + mouse input drivers (no_std).
+pc-keyboard = "0.9"
+# Ring-3 demo program (M4): built as a separate binary artifact for the
+# bare-metal target; its ELF is embedded into the kernel image by
+# kernel/build.rs (exposed to the source as USER_ELF_PATH) and loaded by
+# kernel/src/userspace.rs at 0x400000, run at CPL 3.
+user-hello = { path = "../user/hello", artifact = "bin", target = "x86_64-unknown-none" }
+# M6 ring-3 filesystem test program (same artifact mechanism, base 0x800000).
+user-fstest = { path = "../user/fstest", artifact = "bin", target = "x86_64-unknown-none" }
+# NOTE: ps2-mouse 0.1.4 pulls in x86_64 0.14 which fails to compile on the 2026
+# nightly, so the PS/2 mouse is implemented directly in `src/mouse.rs`.

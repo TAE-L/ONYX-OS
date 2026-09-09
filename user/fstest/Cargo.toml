@@ -1,0 +1,12 @@
+[package]
+name = "user-fstest"
+version = "0.1.0"
+edition = "2021"
+
+# Bin name matters: the kernel reads the CARGO_BIN_FILE_USER_FSTEST_fstest
+# artifact-dependency variable.
+[[bin]]
+name = "fstest"
+path = "src/main.rs"
+
+[dependencies]

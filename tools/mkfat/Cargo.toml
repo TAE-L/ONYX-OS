@@ -1,0 +1,13 @@
+[package]
+name = "mkfat"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mkfat"
+path = "src/main.rs"
+
+[dependencies]
+# Same FAT library the bootloader builder uses, so our FAT32 is toolchain-consistent.
+fatfs = "0.3"
+fscommon = "0.1"

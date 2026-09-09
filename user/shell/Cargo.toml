@@ -1,0 +1,12 @@
+[package]
+name = "user-shell"
+version = "0.1.0"
+edition = "2021"
+
+# Bin name matters: the image build reads the CARGO_BIN_FILE_USER_SHELL_shell
+# artifact-dependency variable and seeds it into the FAT32 partition.
+[[bin]]
+name = "shell"
+path = "src/main.rs"
+
+[dependencies]

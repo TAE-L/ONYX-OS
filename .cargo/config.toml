@@ -1,0 +1,10 @@
+# Enable unstable cargo features required for artifact dependencies
+# (kernel = { path = "kernel", artifact = "bin", ... }).
+[unstable]
+bindeps = true
+
+# Use rust-lld (bundled with the toolchain) as the host linker so no
+# Visual-Studio Build Tools are needed on this machine.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+rustflags = ["-C", "link-arg=/machine:x64"]

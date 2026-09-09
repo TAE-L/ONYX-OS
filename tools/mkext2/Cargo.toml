@@ -1,0 +1,12 @@
+[package]
+name = "mkext2"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mkext2"
+path = "src/main.rs"
+
+# No dependencies: the ext2 layout this tool emits (1 KiB blocks, rev 1,
+# single block group, no features) is small enough to generate by hand.
+[dependencies]
