@@ -268,6 +268,61 @@ pub fn cursor_pos() -> (usize, usize) {
     (CUR_X.load(Ordering::Relaxed), CUR_Y.load(Ordering::Relaxed))
 }
 
+/// M10a: re-point the *kernel console* at a new framebuffer surface after a
+/// kernel-controlled modesetting operation (see `gpu::init`).
+///
+/// Both views of the screen are re-created here:
+///   * `FB` — the text writer and the mouse sprite owner (cleared first: the
+///     sprite's saved background belongs to the old surface, and letting
+///     `move_cursor` diff against a byte range that is no longer the screen
+///     would paint garbage);
+///   * `CONSOLE` — the scrolling text console.
+///
+/// The bootloader framebuffer is NOT freed: it stays mapped and simply stops
+/// being written to, so a later `adopt` (M10b/c) can switch back to it.
+///
+/// Enters with a framebuffer the caller owns exclusively — called from the boot
+/// path (IF=0, before interrupts exist) so no renderer can be mid-draw. The two
+/// mutexes make that explicit rather than assumed.
+pub fn adopt(framebuffer: &'static mut [u8], info: FrameBufferInfo) {
+    // Clear SAVE/SAVE_PREV: their contents describe the previous surface.
+    unsafe {
+        let save = &mut *core::ptr::addr_of_mut!(SAVE);
+        save.fill(0);
+        let prev = &mut *core::ptr::addr_of_mut!(SAVE_PREV);
+        prev.fill(0);
+    }
+    // `new` clears the surface and picks the scale from the width, exactly like
+    // the boot path (1080p got scale 2, a 1024-wide mode gets 1).
+    let mut writer = FrameBufferWriter::new(framebuffer, info);
+    writer.x_pos = 0;
+    writer.y_pos = HEADER_BAR_H + 8; // keep the console's top gap
+    // The modeset surface has no header yet: draw one so the text area starts
+    // under it (the same bar the boot path drew on the old surface).
+    writer.draw_header("OnyxOS 0.1");
+    let writable = writer.framebuffer as *mut [u8];
+    let writer_scale = writer.scale;
+    *FB.lock() = Some(writer);
+    // Re-arm the cursor at the centre of the new mode.
+    let x = (info.width / 2).min(info.width.saturating_sub(CURSOR_W));
+    let y = (info.height / 2).min(info.height.saturating_sub(CURSOR_H));
+    CUR_X.store(x, Ordering::Relaxed);
+    CUR_Y.store(y, Ordering::Relaxed);
+    // SAFETY: same discipline as `init_global`: `writable` is the 'static
+    // buffer just handed to the writer, and `CONSOLE` is its only other view.
+    let fb: &'static mut [u8] = unsafe { &mut *writable };
+    *CONSOLE.lock() = Some(TextConsole::new(fb, info, writer_scale));
+}
+
+/// `(width, height, bytes_per_pixel)` of the surface the console is drawing
+/// into (`(0, 0, 0)` before `init_global`). Used for `[gpu]` fallback lines.
+pub fn current_geometry() -> (usize, usize, usize) {
+    match FB.lock().as_ref() {
+        Some(w) => (w.info.width, w.info.height, w.info.bytes_per_pixel),
+        None => (0, 0, 0),
+    }
+}
+
 /// Apply a mouse delta and redraw. Called from IRQ 12 — keep it allocation-
 /// free and fast (it is ~500 byte writes for a full-sprite move).
 pub fn move_cursor(dx: i32, dy: i32) {

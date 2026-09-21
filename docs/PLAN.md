@@ -54,7 +54,7 @@ Two signature goals beyond "a working hobby OS":
 | **M9.6** | **Core hardening + missing subsystems** — A: upgrades (TSC ns timekeeping ✅, APIC/IOAPIC + LAPIC timer ✅, scheduler v2 ✅, FPU/SIMD save-restore ✅, block cache ✅, frame alloc v2 ✅) · B: missing subsystems (PCI ✅, ACPI ✅, process lifecycle ✅, raw input ring ✅, `perf` instrumentation ✅) · C: ABI/file-API foundation (argv/envp/auxv ✅, user-pointer validation ✅, errno ✅, mount table) | **done** — A1–A6, B1–B5, C1–C3 all complete; M9.6 regressions pass on BIOS + UEFI (test-fs, test-sched, test-proc, test-block, test-memory, test-pci, test-acpi, test-raw, test-input, test-fpu, test-time, test-args). |
 | **M9.7** | **Linux ABI compat — run static Linux ELFs**: syscall-number shim, argv/envp/auxv, `arch_prctl` TLS, mmap/brk, PIE/relocations | ✅ done |
 | **M9.8** | **SMP — multi-core** (its own stage, per decision): MADT-driven AP startup, per-CPU data, per-CPU run queues + IPIs | ✅ done — GS-base per-CPU blocks, INIT-SIPI-SIPI AP bring-up through a hand-assembled low-page trampoline, per-CPU GDT/TSS + IDT + LAPIC timers, reschedule IPI, per-CPU RSP/syscall slots, boot context restored as a task, kernel-service lock (`ksl`) + input/keyboard/mouse locking, **task migration with work stealing**, stall diagnostic re-based on provable starvation, and the `xsave64`/`xrstor64` EDX:EAX mask bug fixed (AVX/YMM now survives switches under migration); `test-smp.ps1` passes at `-smp 1/2/4`, `test-avx.ps1` at `-smp 4 -cpu max` (200+ rounds, zero failures), all 25 suites green |
-| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | gaming track start |
+| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b/c direction updated: **virtio-gpu becomes the primary backend** (modern paravirtual GPU: DMA resources, command virtqueues, host-GPU 3D via virgl), the dispi driver stays as the legacy fallback backend |
 | M11 | NTFS read-only + multi-drive mounting | extra Windows compat |
 | **M12** | **PE foundation**: parse `.exe` / `.dll` (PE/COFF), relocations, DLL imports groundwork | solid foundation only |
 | M13 | GUI: window manager + compositor + built-in apps (terminal, file manager) | apps on the M9.5 base |
@@ -510,6 +510,114 @@ leaves the single-CPU path untouched.
 
 ---
 
+## M10a — GPU scan + kernel-controlled modesetting (done)
+
+**What was built:**
+
+1. **PCI layer extension** (`pci.rs`): display-class devices (class 0x03,
+   VGA-compat subclass 0x00 preferred) are identified out of the existing
+   registry; their MEM BARs are *sized* (write-probe under IF=0 only, display
+   class only — the general PIIX IDE IO-BAR probe stays forbidden). New API:
+   `find_display()`, `framebuffer_bar()` (first sized MEM BAR — the LFB is not
+   always BAR0), `read_bar_base()` (post-modeset re-read; a mode switch may
+   move/resize the VGA window), `size_str()`.
+2. **Modesetting driver** (`gpu.rs`, new): talks to QEMU's bochs VBE/dispi
+   interface (ports 0x1CE index / 0x1CF data). Boot-path sequence, every step
+   with an honest check: save the firmware's "mode as found" → dispi ID probe
+   → program the kernel mode → **read the registers back** (QEMU silently
+   rejects unbootable geometry by leaving registers unchanged, so read-back is
+   the only truth) → re-read the LFB BAR → map it → canary → console hand-over
+   → record `GpuMode`.
+3. **Mapping**: 8100 KiB (1920x1080x32) at `0x400_0000_0000` (PML4 slot 8 —
+   kernel slot 0, phys window slot 5, heap slot 136; `translate_addr`-guarded
+   so a live mapping is never clobbered), 4 KiB pages through
+   `with_global_frames` (KSL discipline).
+4. **Canary**: 192 tagged pixels at top-left / bottom-right / middle-right
+   (position+stride folded into each value), written and read back; the 32-bit
+   wrapped sums must match — proves the mapping reaches the *device's* memory
+   and the row stride is right.
+5. **Console hand-over** (`framebuffer::adopt`): re-points the writer,
+   scrolling console and mouse cursor at the dispi surface; the bootloader
+   framebuffer stays mapped (adopt-able again later).
+6. **Graceful fallback**: every failure path logs `[gpu] ... fallback`, counts,
+   **restores the firmware mode** and keeps the bootloader framebuffer live.
+   Plus a per-boot **fallback rehearsal**: a deliberately bogus mode write
+   whose read-back must be caught by the same decision function the live path
+   uses, then restored — the graceful-fallback path is exercised and verified
+   in every single boot.
+7. **Task-context re-verification**: a spawned scheduler task re-reads the
+   dispi registers and probes the mapped LFB (proves the modeset survives the
+   boot→scheduler hand-over; follows the M9.8 "boot work goes in a task" rule).
+
+**What was measured (std-VGA 1234:1111 qemu-std-vga, class 0300):**
+
+- BARs sized: BAR0 (LFB) 16 MiB default / **128 MiB** with
+  `-global VGA.vgamem_mb=128`; BAR2 4 KiB. Dispi id `0xb0c5`, vram 16384 /
+  131072 KiB, mode as found `1920x1080x24 enable=1` (SeaBIOS's VBE mode).
+- Modeset `1920x1080x32` programmed, read back `enable=1` in both configs;
+  canary sum `0xc6593ea0` (128 MiB) / `0xc4847ea0` (16 MiB, pre-resize run at
+  1024x768) verified exactly.
+- Fallback rehearsal: bogus 16bpp write caught by the read-back check and
+  restored + re-verified, every boot (`fallbacks=0 rehearsals=1`).
+- External confirmation: QEMU `screendump` geometry follows the kernel-chosen
+
+### M10a — bugs found in my own logic and how each was solved
+
+1. **BAR0 is not always the framebuffer.** My first mapping code read BAR index
+   0 blindly. On QEMU's vmware-svga the *IO ports* live in BAR0 and the LFB in
+   BAR1 — reading BAR0 there returned an IO base and the canary would have
+   written megabytes into IO/config space. Fix: `framebuffer_bar()` picks the
+   first *sized MEM* BAR, the chosen index is recorded (`GpuMode::bar_idx`) and
+   used for the post-modeset re-read.
+2. **A failed modeset left a half-programmed mode nobody owned.** After a
+   rejected mode the dispi registers held the kernel's geometry while the
+   console kept drawing into the bootloader framebuffer — the device scanned
+   out something nothing owned. Fix: the "mode as found" is saved before the
+   first write; *every* failure after the modeset attempt restores it and
+   re-reads it (`restore_and_log` / `fallback_restore`).
+3. **The decision function's log named the wrong mode.** `unusable_mode()`
+   printed `want` (the good mode) in its "was not accepted" wording while the
+   rehearsal deliberately asks for a bogus mode — the log said
+   "1920x1080x32 was not accepted" right after a 16bpp write the device *had*
+   accepted. Fix: `want` (what the kernel needs) is separate from `attempted`
+   (what was written); the rehearsal wording states the read-back factually.
+4. **`-vga none` is unbootable on this QEMU/SeaBIOS** (no VGA BIOS → the boot
+   never reaches the bootloader; serial stays empty), and `-device
+   bochs-display` alone does not replace the std-VGA (QEMU keeps both; the
+   class-0300 device wins the scan — bochs-display, whose dispi is MMIO-only,
+   would be the ideal real fallback device but cannot be selected alone).
+   Fix: the fallback is asserted via the in-boot bogus-mode rehearsal, the
+   alternative the M10a spec sanctions for exactly this case.
+5. **Device survey became the M10b input (measurement, not a bug):**
+   virtio-vga boots end-to-end (1af4:1050, BAR0 8 MiB, dispi id 0xb0c5 — the
+   modern device with a legacy-compatible face); qxl boots; vmware-svga boots
+   and exposes a working dispi (and caused bug 1). Combined with the
+   architecture goal, this fixed the M10b direction: **virtio-gpu becomes the
+   primary backend** (capability discovery, DMA resources, command virtqueues,
+   host-GPU 3D via virgl), with the M10a dispi driver kept verbatim as the
+   legacy fallback behind a `DisplayBackend` trait.
+
+### M10a success criteria
+
+`test-gpu.ps1`: two boots (std-VGA with 128 MiB VRAM, std-VGA with QEMU's
+default 16 MiB). Each must find the display device in the PCI scan
+(1234:1111, class 0300, a sized MMIO framebuffer BAR), detect the bochs VBE
+interface (`id=0xb0c*`), program and read back 1920x1080x32, verify the
+framebuffer canary, switch the console to the dispi framebuffer, re-verify the
+mode from a scheduler task, run the fallback rehearsal (bogus mode caught,
+good mode restored), complete the full boot flow (fstest PASSED, interactive
+shell) with no actual fallback and no unexpected exception.
+
+
+  mode (1920x1080 after the resize-capable runs).
+- Scheduler-task probe: dispi registers still `1920x1080x32 enable=1` from a
+  scheduled task; LFB byte probe translates.
+- Suites: `test-gpu.ps1` ×2 (default VRAM + 128 MiB) green;
+  `test-smp`, `test-avx`, `test-fs`, `test-shell`, `test-pci` all green after
+  the kernel changes.
+
+
+
 ## M9.5 — Graphical desktop userspace (DEFERRED)
 
 **Why it exists (inserted between M9 and M10):** M13's full GUI was too big a
@@ -550,12 +658,27 @@ can't see pixels), plus serial markers for the server's lifecycle.
   one emulation thread so only near-neutral overhead is assertable).
 - **M10** — GPU driver system, built in stages ("basic first, then scale up to
   decent" — NOT a placeholder anymore):
-  - **M10a (basic):** PCI GPU scan + modesetting — kernel-controlled
-    framebuffer (QEMU std-VGA / bochs-display BARs, resolution set by the
-    kernel instead of the bootloader), pixel-draw primitives.
+  - **M10a (basic): ✅ done.** PCI GPU scan (display class, sized MEM BARs,
+    display-function registry lookup) + kernel-controlled modesetting through
+    QEMU's bochs VBE/dispi interface (`kernel/src/gpu.rs`): kernel-chosen mode
+    **1920x1080x32** programmed with hardware read-back verification, LFB BAR
+    mapped at a fixed kernel address (`0x400_0000_0000`, translate-guarded),
+    canary-verified mapping, console handed over (`framebuffer::adopt`),
+    save/restore of the firmware mode on every failure path, an in-boot
+    fallback rehearsal (deliberately bogus mode write → detected → restored),
+    and a scheduler-task re-verification of the installed mode. Full details,
+    measurements and the bug log in the M10a section below. `test-gpu.ps1`.
   - **M10b (usable):** render-surface API (`surface_create` / `blit` /
     `present` syscalls), compositor stub, 2D blits/fills, dirty-rect present —
-    the API shape the whole GUI track programs against.
+    the API shape the whole GUI track programs against. **Direction decision
+    (post-M10a):** the *primary* display backend becomes **virtio-gpu** — QEMU's
+    modern paravirtual GPU (capability discovery, DMA buffer resources, command
+    virtqueues, per-scanout planes, host-GPU 3D via virgl contexts) — the only
+    device in this VM with a non-legacy hardware model. The M10a dispi driver
+    is kept verbatim as the legacy fallback backend behind a `DisplayBackend`
+    trait; bootloader framebuffer stays the last resort. This is what makes the
+    "modern driver architecture" goal (buffer objects, rings, fences, flips)
+    reachable at all.
   - **M10c (decent):** the acceleration path — hardware-accelerated fill/blit
     where QEMU's devices expose it (virtio-gpu / bochs), presentation pacing,
     multi-surface composition — scaling the basic driver into a decent one.

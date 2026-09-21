@@ -18,6 +18,7 @@ mod fat;
 mod fpu;
 mod framebuffer;
 mod gdt;
+mod gpu;
 mod input;
 mod interrupts;
 mod keyboard;
@@ -246,6 +247,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // test-para.ps1 compares -smp 1 vs -smp 4 for real speedup.
     scheduler::spawn(crate::bench::task);
     serial_writeln!("spawned para bench");
+    // M10a: re-verify the installed GPU mode from a real task (the boot path
+    // did the modeset; this proves the dispi registers and the mapped LFB
+    // survive the hand-over to the scheduler). No-op without a dispi mode.
+    crate::gpu::spawn_task();
+    serial_writeln!("spawned gpu-verify");
     serial_writeln!("multitasking initialized: 5 tasks spawned");
 
     // --- M4: syscalls + ring-3 userspace ---
@@ -312,6 +318,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // config I/O ever happens with interrupts on. The registry feeds the
     // shell's `lspci` and the M10 GPU track (VGA BAR = framebuffer base).
     pci::init();
+
+    // --- M10a: GPU scan + kernel-controlled modesetting --------------------
+    // Must run AFTER `pci::init` (it reads the display function out of that
+    // registry) and AFTER `memory::init_global_frames` above (mapping the
+    // framebuffer BAR needs the runtime frame allocator), and it must run with
+    // interrupts disabled: the dispi index/data ports (0x1CE/0x1CF) are a
+    // two-step access like the PCI config port, and the page-table edits it
+    // makes must not interleave with anything else's `map_to`.
+    //
+    // Either outcome is fine: `gpu::init` only ever logs `[gpu]` markers and
+    // falls back to the bootloader framebuffer (which stays mapped and live),
+    // so a machine without a display device still boots normally.
+    gpu::init();
 
     // --- M9.6-B2: ACPI core (RSDP/RSDT/XSDT/MADT/HPET). Read-only decode
     // through the physical-memory window; also runs before interrupts for

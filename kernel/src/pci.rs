@@ -6,11 +6,12 @@
 //! function by class/subclass with a small vendor/device name table.
 //!
 //! The device list is kept for the shell's `lspci` command (SYS_LSPCI) and
-//! for the M10 GPU track — the VGA controller's BARs are the framebuffer's
+//! for the M10 GPU track ??? the VGA controller's BARs are the framebuffer's
 //! next address source once the full GPU driver lands.
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
@@ -18,6 +19,23 @@ const CONFIG_ADDR: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 
 const VENDOR_NONE: u16 = 0xFFFF;
+
+/// Base class code of a display controller (VGA compatible subclass 0x00).
+/// M10a drives the first function of this class found on the bus.
+pub const CLASS_DISPLAY: u8 = 0x03;
+
+/// Set when the config-space scan found no display-class function, so the boot
+/// path can put a visible `[gpu]` line on the *framebuffer console* as well as
+/// on serial. Without this, a machine with no display controller (`-vga none`)
+/// would leave the screen frozen on the bootloader's last write — the log line
+/// alone is not discoverable by someone looking at the monitor.
+pub static NO_DISPLAY: AtomicBool = AtomicBool::new(true);
+
+/// Whether the boot scan saw a display-class function. `true` before `pci::init`
+/// finishes scanning (optimistic: "assume there is one").
+pub fn display_seen() -> bool {
+    !NO_DISPLAY.load(Ordering::Relaxed)
+}
 
 /// One PCI function found on the bus.
 #[derive(Clone, Copy)]
@@ -121,10 +139,10 @@ fn config_read_u16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
 }
 
 /// Size a 32-bit MEM BAR: write all-ones, read back, restore.
-/// Returns (base, size) — size 0 for an absent/unavailable BAR.
+/// Returns (base, size) ??? size 0 for an absent/unavailable BAR.
 ///
 /// DANGER: only MEM-type BARs are probed. Probing IO-type BARs is
-/// destructive — the PIIX3 IDE's IO BARs alias our LIVE ATA ports (0x1F0),
+/// destructive ??? the PIIX3 IDE's IO BARs alias our LIVE ATA ports (0x1F0),
 /// and write-0xFFFFFFFF to them wedges the drive (observed). IO BARs are
 /// reported base-only (size = UNSIZED marker).
 fn size_bar(bus: u8, device: u8, function: u8, bar_off: u8) -> (u32, u32) {
@@ -141,7 +159,7 @@ fn size_bar(bus: u8, device: u8, function: u8, bar_off: u8) -> (u32, u32) {
 }
 
 /// Marker size for a present IO-type BAR whose real size we do not probe
-/// (see `size_bar` — probing IO BARs can wedge the live ATA drive).
+/// (see `size_bar` ??? probing IO BARs can wedge the live ATA drive).
 pub const UNSIZED: u32 = 0xFFFF_FFFF;
 
 /// Enumerate the whole bus and return every function found.
@@ -174,18 +192,44 @@ pub fn enumerate() -> Vec<PciFunction> {
                     (config_read_u32(bus, device, function, 0x0C) >> 16) as u8 & 0x7F;
 
                 let mut bars = [(false, 0u32, 0u32); 6];
-                // B1 is discovery-only: BAR bases are read, never written.
-                // (The config-space size probe's writes proved unsafe — the
-                // PIIX IDE's IO BARs alias the live ATA ports; and with
-                // interrupts on, the two-step config handshake races the timer
-                // and wedges QEMU's config port. The scan now runs with IF=0
-                // at boot; BAR *sizing* is deferred to the M10 GPU driver.)
+                // BAR *bases* are read, never written ??? except for display
+                // devices, whose MEM BARs are sized by M10a below. (The
+                // config-space size probe's writes proved unsafe in general:
+                // the PIIX IDE's IO BARs alias the live ATA ports, so probing
+                // an IO BAR wedges the drive.)
                 for i in 0..6u8 {
                     let off = 0x10 + i * 4;
                     let raw = config_read_u32(bus, device, function, off);
                     if raw & !0x3 != 0 {
                         let is_io = raw & 1 != 0;
                         bars[i as usize] = (is_io, raw & !0xFFF, UNSIZED);
+                    }
+                }
+                // M10a: the GPU driver needs the framebuffer BAR's *real* size
+                // (to map exactly the mode's surface, no more). Only the
+                // display function's MEM BARs are ever probed, and only with
+                // interrupts disabled: the config port is a two-step
+                // (select/read) handshake that a preemption between the two
+                // halves wedges for the rest of the boot ??? the reason the whole
+                // scan runs before `interrupts::enable()`. The IF check makes
+                // that invariant self-enforcing instead of a comment.
+                if class == CLASS_DISPLAY && !x86_64::instructions::interrupts::are_enabled() {
+                    for i in 0..6usize {
+                        if bars[i].2 != UNSIZED {
+                            continue; // absent BAR
+                        }
+                        let off = 0x10 + i as u8 * 4;
+                        let raw = config_read_u32(bus, device, function, off);
+                        if raw & 1 != 0 {
+                            continue; // IO BAR: never probe (see above)
+                        }
+                        if raw & 0b110 == 0b100 {
+                            continue; // 64-bit BAR pair: not handled yet
+                        }
+                        let (_, size) = size_bar(bus, device, function, off);
+                        if size != 0 {
+                            bars[i].2 = size;
+                        }
                     }
                 }
                 let _ = header_type;
@@ -263,6 +307,10 @@ pub fn init() {
     crate::framebuffer::console_bytes(
         alloc::format!("[pci] {} pci functions found\n", count).as_bytes(),
     );
+    // M10a: remember whether this machine has a display controller *at all*, so
+    // the GPU track can tell "no device" (nothing to do) from "device present but
+    // modesetting failed" (a real bug) — and so the absence is visible on screen.
+    NO_DISPLAY.store(!devices.iter().any(|d| d.class == CLASS_DISPLAY), Ordering::Relaxed);
     *DEVICES.lock() = devices;
 }
 
@@ -288,3 +336,87 @@ pub fn render_lines() -> Vec<String> {
     }
     out
 }
+
+/// M10a: the display function the GPU driver owns.
+///
+/// Prefers the VGA-compatible subclass (0x00) ??? that is the one with the
+/// legacy VBE/dispi register window QEMU's `std`, `bochs-display` and
+/// `virtio-vga` expose ??? then falls back to any other display subclass.
+/// `None` when the machine has no display device at all (`-vga none`).
+pub fn find_display() -> Option<PciFunction> {
+    let g = DEVICES.lock();
+    let mut other: Option<PciFunction> = None;
+    for f in g.iter() {
+        if f.class != CLASS_DISPLAY {
+            continue;
+        }
+        if f.subclass == 0x00 {
+            return Some(*f);
+        }
+        if other.is_none() {
+            other = Some(*f);
+        }
+    }
+    other
+}
+
+/// M10a: the function's framebuffer BAR ??? the first MEM-type BAR with a real
+/// size (QEMU's VGA puts the linear framebuffer in BAR0). Returns
+/// `(index, base, size)`.
+pub fn framebuffer_bar(f: &PciFunction) -> Option<(usize, u32, u32)> {
+    for i in 0..6usize {
+        let (is_io, base, size) = f.bars[i];
+        if !is_io && base != 0 && size != UNSIZED && size != 0 {
+            return Some((i, base, size));
+        }
+    }
+    None
+}
+
+/// M10a: re-read one BAR's base address straight from config space.
+///
+/// The registry's copy is a boot-time snapshot; the GPU driver needs the
+/// *current* value after programming a mode (a mode switch may move or resize
+/// the VGA window). Returns 0 if the BAR is absent or the offset is invalid.
+///
+/// # Safety contract (callers): interrupts MUST be disabled — the config port is
+/// the two-step CF8h/CFCh handshake that a preemption between the two halves
+/// wedges for the rest of the boot (PLAN.md M9.6-B1). The check below is a hard
+/// guard, not a comment: a caller that gets it wrong loses the read instead of
+/// the machine.
+pub fn read_bar_base(f: &PciFunction, index: usize) -> u32 {
+    if index > 5 {
+        return 0;
+    }
+    if x86_64::instructions::interrupts::are_enabled() {
+        // Do not touch the config port from a preemptible context (M9.6-B1).
+        // Make it loud on the console as well as serial: a silently-zero BAR
+        // would look like "no framebuffer" downstream and hide the real bug.
+        let msg = alloc::format!(
+            "[pci] refused BAR{index} read with interrupts enabled (two-step \
+             config access) - see M9.6-B1\n"
+        );
+        crate::serial_writeln!("{}", msg.trim_end());
+        crate::framebuffer::console_bytes(msg.as_bytes());
+        return 0;
+    }
+    let off = 0x10 + index as u8 * 4;
+    let raw = config_read_u32(f.bus, f.device, f.function, off);
+    if raw & 1 != 0 {
+        raw & !0x3 // IO BAR: 4-byte granularity
+    } else {
+        raw & !0xF // MEM BAR: 16-byte granularity
+    }
+}
+
+/// Human size for log lines ("16 MiB" / "4 KiB" / "512 B").
+pub fn size_str(size: u32) -> alloc::string::String {
+    if size >= 0x10_0000 {
+        alloc::format!("{} MiB", size >> 20)
+    } else if size >= 0x400 {
+        alloc::format!("{} KiB", size >> 10)
+    } else {
+        alloc::format!("{} B", size)
+    }
+}
+
