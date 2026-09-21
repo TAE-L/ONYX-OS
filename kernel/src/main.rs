@@ -9,6 +9,7 @@ mod allocator;
 mod apic;
 mod acpi;
 mod ata;
+mod bench;
 mod blkcache;
 mod block;
 mod errno;
@@ -241,6 +242,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // shell's `perf` command re-renders it live at any time).
     scheduler::spawn(perf_task);
     serial_writeln!("spawned blk-test");
+    // M9.8: parallelism benchmark — 4 CPU-bound workers, wall-clock measured;
+    // test-para.ps1 compares -smp 1 vs -smp 4 for real speedup.
+    scheduler::spawn(crate::bench::task);
+    serial_writeln!("spawned para bench");
     serial_writeln!("multitasking initialized: 5 tasks spawned");
 
     // --- M4: syscalls + ring-3 userspace ---

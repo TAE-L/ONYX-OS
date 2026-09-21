@@ -1129,17 +1129,13 @@ unsafe fn plan_switch(me: usize) -> Option<SwitchPlan> {
         new_fpu: fpu_ptr(next) as *const fpu::FpuArea,
     };
     if SCHED_TRACE
-        || (crate::fpu::AVX_TRACE.load(Ordering::Relaxed) && (cur == crate::fpu::avx_task_index() || next == crate::fpu::avx_task_index()))
+        || (crate::bench::TRACE.load(Ordering::Relaxed) == 1
+            && (crate::bench::is_bench_worker(cur) || crate::bench::is_bench_worker(next)))
     {
-        // Image headers (XSTATE_BV, first header qword at +512) localize a
-        // degrading save: the first line where the outgoing task's BV loses
-        // bits identifies the switch pair that produced it.
-        let obv = if plan.old_fpu.is_null() { 0 } else { unsafe { plan.old_fpu.cast::<u64>().add(64).read_volatile() } };
-        let nbv = if plan.new_fpu.is_null() { 0 } else { unsafe { plan.new_fpu.cast::<u64>().add(64).read_volatile() } };
         crate::serial_writeln!(
-            "[avxsw] cpu={me} cur={cur} next={next} old_fpu={:p} new_fpu={:p} obv={obv:#x} nbv={nbv:#x}",
-            plan.old_fpu,
-            plan.new_fpu
+            "[psw] cpu={me} cur={cur} next={next} curstate={:?} nextstate={:?}",
+            unsafe { TASKS[cur].state } as u32,
+            unsafe { TASKS[next].state } as u32,
         );
     }
     smp::set_current_index(next);

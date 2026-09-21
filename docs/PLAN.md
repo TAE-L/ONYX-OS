@@ -54,7 +54,7 @@ Two signature goals beyond "a working hobby OS":
 | **M9.6** | **Core hardening + missing subsystems** — A: upgrades (TSC ns timekeeping ✅, APIC/IOAPIC + LAPIC timer ✅, scheduler v2 ✅, FPU/SIMD save-restore ✅, block cache ✅, frame alloc v2 ✅) · B: missing subsystems (PCI ✅, ACPI ✅, process lifecycle ✅, raw input ring ✅, `perf` instrumentation ✅) · C: ABI/file-API foundation (argv/envp/auxv ✅, user-pointer validation ✅, errno ✅, mount table) | **done** — A1–A6, B1–B5, C1–C3 all complete; M9.6 regressions pass on BIOS + UEFI (test-fs, test-sched, test-proc, test-block, test-memory, test-pci, test-acpi, test-raw, test-input, test-fpu, test-time, test-args). |
 | **M9.7** | **Linux ABI compat — run static Linux ELFs**: syscall-number shim, argv/envp/auxv, `arch_prctl` TLS, mmap/brk, PIE/relocations | ✅ done |
 | **M9.8** | **SMP — multi-core** (its own stage, per decision): MADT-driven AP startup, per-CPU data, per-CPU run queues + IPIs | ✅ done — GS-base per-CPU blocks, INIT-SIPI-SIPI AP bring-up through a hand-assembled low-page trampoline, per-CPU GDT/TSS + IDT + LAPIC timers, reschedule IPI, per-CPU RSP/syscall slots, boot context restored as a task, kernel-service lock (`ksl`) + input/keyboard/mouse locking, **task migration with work stealing**, stall diagnostic re-based on provable starvation, and the `xsave64`/`xrstor64` EDX:EAX mask bug fixed (AVX/YMM now survives switches under migration); `test-smp.ps1` passes at `-smp 1/2/4`, `test-avx.ps1` at `-smp 4 -cpu max` (200+ rounds, zero failures), all 25 suites green |
-| **M10** | **GPU drivers — placeholder**: PCI GPU scan + modesetting + framebuffer-accelerated stubs (no full accel yet) | gaming track start |
+| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | gaming track start |
 | M11 | NTFS read-only + multi-drive mounting | extra Windows compat |
 | **M12** | **PE foundation**: parse `.exe` / `.dll` (PE/COFF), relocations, DLL imports groundwork | solid foundation only |
 | M13 | GUI: window manager + compositor + built-in apps (terminal, file manager) | apps on the M9.5 base |
@@ -483,6 +483,20 @@ serial trace, never assumed.
     counter and one batch run of `test-pci`/`test-perf` failed once each and
     passed on immediate retry with no kernel change — host-load timing flakes,
     not kernel regressions. The final full sweep: all 25 suites exit 0.
+12. **Parallelism benchmark findings (measurement, not a bug).** The first
+    benchmark runs exposed two things worth recording: (a) software TCG
+    time-shares ONE emulation thread across the vCPUs, so at `-smp 4` every
+    core runs at ~1/4 speed — SMP can only break even there, never speed up;
+    (b) switching the harness to WHPX (Windows Hypervisor Platform) gives real
+    hardware vCPUs: 4 workers go from 782 ms serial to 156-266 ms at `-smp 4`
+    (**x2.9-5.1**). Also found while tracing: the per-AP demo workers busy-spin
+    between 100 ms sleeps, and the claim-then-migrate pattern means all Ready
+    workers may *start* on one CPU yet still finish in parallel — the
+    benchmark therefore records completion CPUs, not start CPUs. The switch
+    tracer itself (`bench::TRACE`) stays off by default: an early version
+    collided its `usize::MAX` "no worker yet" sentinel with a `usize::MAX`
+    current-task sentinel and wedged the first boot switch — kept for future
+    debugging only, with the sentinel fixed by never matching the idle index.
 
 ### Success criteria
 
@@ -530,9 +544,23 @@ can't see pixels), plus serial markers for the server's lifecycle.
 
 - **M3** — scheduler designed with low latency in mind: per-task priorities,
   interruptible syscalls, minimal lock contention in the hot path.
-- **M10** — GPU *placeholder*: detect the GPU (PCI), set framebuffer
-  resolution/modes, expose a small "render surface" API, and stub the
-  acceleration interfaces (so the API shape is set before the full driver).
+- **M9.8** — SMP: multi-core scheduling with task migration + work stealing,
+  verified by a parallelism benchmark (`test-para.ps1`: 4 CPU-bound workers,
+  x2.9-5.1 wall-clock speedup at `-smp 4` on WHPX; on TCG the vCPUs time-share
+  one emulation thread so only near-neutral overhead is assertable).
+- **M10** — GPU driver system, built in stages ("basic first, then scale up to
+  decent" — NOT a placeholder anymore):
+  - **M10a (basic):** PCI GPU scan + modesetting — kernel-controlled
+    framebuffer (QEMU std-VGA / bochs-display BARs, resolution set by the
+    kernel instead of the bootloader), pixel-draw primitives.
+  - **M10b (usable):** render-surface API (`surface_create` / `blit` /
+    `present` syscalls), compositor stub, 2D blits/fills, dirty-rect present —
+    the API shape the whole GUI track programs against.
+  - **M10c (decent):** the acceleration path — hardware-accelerated fill/blit
+    where QEMU's devices expose it (virtio-gpu / bochs), presentation pacing,
+    multi-surface composition — scaling the basic driver into a decent one.
+  - M15 remains the endgame (full accelerated graphics API), but M10's target
+    is a *working* driver system, not stubs.
 - **M15** — *full* GPU driver with an accelerated, low-overhead graphics API
   (QEMU's VM GPU; Vulkan-lite surface) — the last milestone on purpose: it
   needs the entire kernel (scheduler, memory, GUI, syscalls) to be useful.
@@ -561,6 +589,10 @@ defaulting to responsiveness over throughput.
 - `cargo build` → `bios.img` (and `uefi.img` from M9) via `build.rs` +
   `bootloader`.
 - `test.ps1` boots headless QEMU, greps serial markers, auto-passes/fails.
+- `test-para.ps1` measures SMP wall-clock speedup; it prefers **WHPX**
+  (hardware vCPUs — a real parallelism measurement) and falls back to
+  `tcg,thread=multi` with relaxed assertions, because software TCG time-shares
+  one emulation thread across the vCPUs.
 - FS drivers (M6/M7) tested from **ring 3** through the shell — the payoff of
   the M4-first ordering.
 - Manually: `cargo run -- bios-gui` for the graphical window.

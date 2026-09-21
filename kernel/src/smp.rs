@@ -253,6 +253,11 @@ static LOW_PAGE: AtomicU64 = AtomicU64::new(0);
 /// True once [`prepare`] copied + identity-mapped the trampoline page.
 static PREPARED: AtomicBool = AtomicBool::new(false);
 
+/// True once `bringup_task` finished (all MADT-listed APs online or given up
+/// on). The parallelism benchmark waits for this before spawning workers, so
+/// its measurement always covers the *full* CPU count of the machine.
+pub static BRINGUP_DONE: AtomicBool = AtomicBool::new(false);
+
 /// Record the sub-1 MiB page the AP trampoline is copied into. Called at boot
 /// while the boot frame allocator is still owned by `kernel_main` (BEFORE the
 /// heap claims frames), so the page is guaranteed untouched.
@@ -901,6 +906,7 @@ fn bringup_task() {
             "empty"
         }
     );
+    BRINGUP_DONE.store(true, Ordering::Release);
     crate::scheduler::exit_current();
 }
 
