@@ -119,18 +119,26 @@ pub const SYS_UNLINK: u64 = 20;
 /// (RFLAGS), so r8 survives into the saved frame untouched.
 pub const SYS_RENAME: u64 = 21;
 
-/// Scratch area for the syscall entry stub, reached via RIP-relative
-/// addressing to this `no_mangle` symbol: no `rdfsbase`/`wrfsbase` (FSGSBASE
-/// instructions are absent on QEMU's default CPU model and raise #UD) and no
-/// `sym` inline-asm operand (which LLVM's IAS rejects with "offset is not a
-/// multiple of 16" on this toolchain). 24 bytes / 8-aligned.
+/// Scratch area for the syscall entry stub.
+///
+/// M9.8: the two hot slots (`kstack_top`, `user_rsp`) moved into the per-CPU
+/// block (`smp::PerCpu`, reached as `gs:[32]`/`gs:[40]`): a single shared slot
+/// would be clobbered by a second CPU entering a syscall at the same time —
+/// including between the entry store and the load, which no `IF=0` protects
+/// against across cores. `user_rsp` follows the classic pattern of being
+/// re-read from the saved frame on the way out, so a task suspended inside a
+/// syscall resumes with its own value.
+///
+/// What is left here is genuinely global: the `dispatch` function pointer.
+/// The struct layout is kept (offsets 0/8/16 documented) because the stub
+/// still loads `dispatch_ptr` RIP-relative to the `no_mangle` symbol — no
+/// FSGSBASE (absent on QEMU's default CPU model, would raise #UD) and no `sym`
+/// inline-asm operand (which LLVM's IAS rejects on this toolchain).
 #[repr(C, align(16))]
 struct SyscallScratch {
-    /// Current task's kernel-stack top. SYSCALL entry loads RSP from here;
-    /// updated by the scheduler on every context switch (with IF off).
+    /// Unused (per-CPU now; see `smp::GS_KSTACK_OFF`).
     kstack_top: u64,
-    /// User RSP parked here across the stack switch. SYSCALL clears IF via
-    /// SFMASK, so nothing can run between the store at entry and the load.
+    /// Unused (per-CPU now; see `smp::GS_USER_RSP_OFF`).
     user_rsp: u64,
     /// Function pointer to `dispatch`, read by the entry stub.
     dispatch_ptr: u64,
@@ -182,8 +190,12 @@ pub struct SyscallFrame {
     pub r15: u64,
 }
 
-/// Program the SYSCALL/SYSRET MSRs. Call once at boot, after `gdt::init()`.
-pub fn init() {
+/// Program the SYSCALL/SYSRET MSRs for the CURRENT CPU. Called once per CPU:
+/// `init` on the boot CPU (after `gdt::init`), `init_ap` on each AP.
+///
+/// STAR/LSTAR/SFMASK are per-CPU MSRs — an AP running user code without them
+/// would `syscall` straight into address 0 (M9.8).
+fn program_msrs() {
     let sels = gdt::selectors();
     let kernel_cs = u64::from(sels.code_selector.0) & !3;
     let user_code = u64::from(sels.user_code_selector.0) & !3;
@@ -205,13 +217,29 @@ pub fn init() {
     let raw = unsafe { efer.read() };
     unsafe { efer.write(raw | 1) };
 
-    // Initialize the scratch area: idle kernel stack + dispatch pointer.
+    // The dispatch pointer is global; the per-CPU slots (`gs:[32]`/`gs:[40]`)
+    // are filled by `smp::init_bsp`/`smp::start_aps` and re-pointed by the
+    // scheduler on every context switch.
     unsafe {
-        SCRATCH.kstack_top = scheduler::idle_kstack_top();
         SCRATCH.dispatch_ptr = dispatch as *const () as u64;
     }
 
     serial_writeln!("syscall: STAR={star:#x} LSTAR={entry_addr:#x} SFMASK=0x257fd5 EFER.SCE=1");
+}
+
+/// Program the SYSCALL MSRs on the boot CPU (after `gdt::init`).
+pub fn init() {
+    program_msrs();
+    // Idle kernel stack for this CPU's syscall entry, until the scheduler
+    // points it at the current task's stack.
+    set_kernel_stack_top(crate::smp::idle_kstack_top());
+}
+
+/// Program the SYSCALL MSRs on an AP (from `smp::ap_entry`, once the AP's
+/// GDT/TSS and per-CPU block are live).
+pub fn init_ap() {
+    program_msrs();
+    set_kernel_stack_top(crate::smp::idle_kstack_top());
 }
 
 fn msr_write(msr: Msr, value: u64) {
@@ -222,10 +250,12 @@ fn msr_write(msr: Msr, value: u64) {
 /// Update the kernel-stack top in the per-CPU scratch area. The syscall entry
 /// stub reads this via RIP-relative addressing, so the scheduler must call
 /// this on every context switch (with IF off, which the switch guarantees).
+/// Update the CURRENT CPU's kernel-stack top (the `gs:[32]` slot read by the
+/// syscall entry stub). The scheduler calls this on every context switch (IF
+/// off, which the switch guarantees), so each CPU enters the next syscall on
+/// the stack of the task IT is about to run.
 pub fn set_kernel_stack_top(top: u64) {
-    unsafe {
-        SCRATCH.kstack_top = top;
-    }
+    crate::smp::set_kstack_top(top);
 }
 
 /// SYSCALL entry. On arrival: RSP = user RSP (untouched by `syscall`),
@@ -233,18 +263,21 @@ pub fn set_kernel_stack_top(top: u64) {
 /// captured in a `SyscallFrame`, `dispatch` runs, then everything is restored
 /// and `sysretq` jumps back to ring 3.
 ///
-/// Naked (no prologue) so RSP is still the user RSP on entry. The stub finds
-/// `SCRATCH` via RIP-relative addressing to the `no_mangle` symbol (see the
-/// struct docs for why not FSGSBASE / `sym`).
+/// Naked (no prologue) so RSP is still the user RSP on entry. M9.8: the
+/// kernel-stack top and the parked user RSP live in the CALLING CPU's block
+/// (`gs:[32]`, `gs:[40]` — see `smp::PerCpu`); `dispatch` is a plain global
+/// read via RIP-relative addressing to the `no_mangle` symbol.
 #[no_mangle]
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
     naked_asm!(
-        // Park the true user RSP in SCRATCH.user_rsp, then switch to the
-        // current task's kernel stack (SCRATCH.kstack_top). SFMASK cleared
-        // IF on entry, so no interrupt can run between the two.
-        "mov [rip + SCRATCH + 8], rsp",
-        "mov rsp, [rip + SCRATCH]",
+        // Park the true user RSP in this CPU's slot, then switch to the
+        // current task's kernel stack from this CPU's slot. SFMASK cleared IF
+        // on entry, so no interrupt can run between the two — and the slots
+        // are private to this CPU, so a concurrent syscall on another core
+        // cannot clobber them.
+        "mov qword ptr gs:[40], rsp",
+        "mov rsp, qword ptr gs:[32]",
         // Save all user registers (frame layout matches `SyscallFrame`).
         "push r15", "push r14", "push r13", "push r12",
         "push r11", "push r10", "push r9", "push r8",
@@ -253,9 +286,9 @@ unsafe extern "C" fn syscall_entry() {
         // Frame padding for 16-byte alignment (kstack_top is 16-aligned).
         "sub rsp, 24",
         // Store the true user_rsp at frame offset 16.
-        "mov rax, [rip + SCRATCH + 8]",
+        "mov rax, qword ptr gs:[40]",
         "mov [rsp + 16], rax",
-        // dispatch(&mut frame) — pointer at SCRATCH.dispatch_ptr.
+        // dispatch(&mut frame) — global function pointer in SCRATCH.
         "mov rdi, rsp",
         "mov rax, [rip + SCRATCH + 16]",
         "call rax",
@@ -267,8 +300,8 @@ unsafe extern "C" fn syscall_entry() {
         "pop r13", "pop r14", "pop r15",
         // Back to the user stack: the true user RSP lives in THIS frame at
         // [frame+16] = [rsp_after_pops - 128] — reading it from the frame
-        // (not the shared SCRATCH slot) makes a suspended syscall resume
-        // safely even if another task ran its own syscall meanwhile.
+        // (not a shared slot) makes a suspended syscall resume safely even if
+        // other tasks ran their own syscalls meanwhile.
         "mov rsp, [rsp - 128]",
         "sysretq",
     );
@@ -278,6 +311,14 @@ unsafe extern "C" fn syscall_entry() {
 #[no_mangle]
 extern "C" fn dispatch(f: &mut SyscallFrame) {
     let t0 = crate::perf::syscall_enter(f.rax);
+    // M9.7: Linux-ABI binaries speak Linux syscall numbers (a wholly
+    // different table — e.g. Linux write=1 collides with our SYS_EXIT=1),
+    // pass arg 4 in r10, and return -errno. Route them to the shim first.
+    if scheduler::current_is_linux() {
+        linux_dispatch(f);
+        crate::perf::syscall_exit(t0);
+        return;
+    }
     match f.rax {
         SYS_WRITE => f.rax = sys_write(f.rdi, f.rsi, f.rdx),
         SYS_EXIT => sys_exit(f),
@@ -342,6 +383,8 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
 fn sys_exit(f: &mut SyscallFrame) {
     serial_writeln!("user exited cleanly, code={}", f.rdi);
     drop_task_fds(); // fds die with the task (before its id goes stale)
+    // M9.7: Linux-ABI brk/mmap bookkeeping dies with the task too.
+    userspace::linux_mem_drop(scheduler::current_task_id());
     scheduler::record_exit(f.rdi as u32);
     dead_frame_rewrite(f);
 }
@@ -426,9 +469,9 @@ fn sys_input_read(buf: u64, len: u64, blocking: u64) -> u64 {
 }
 
 /// Called by the scheduler on every context switch (IF off) so that syscall
-/// entry lands on the incoming task's own kernel stack.
+/// entry lands on the incoming task's own kernel stack on the switching CPU.
 pub fn set_kstack(top: u64) {
-    unsafe { core::ptr::write_volatile(&raw mut SCRATCH.kstack_top, top) }
+    crate::smp::set_kstack_top(top);
 }
 
 // ---------------------------------------------------------------------------
@@ -910,5 +953,307 @@ fn sys_rename(from: u64, flen: u64, to: u64, tlen: u64) -> u64 {
         Err(e) => fs_err(e),
     }
 }
+
+// --- M9.7: Linux ABI shim ---------------------------------------------------
+//
+// Static Linux x86-64 binaries speak the Linux syscall table (via `syscall`):
+//   rax = number, rdi/rsi/rdx/r10/r8/r9 = args 1-6, return in rax (-errno).
+// Numbers are the real x86-64 Linux table — no renumbering. Coverage targets
+// static-PIE startup and simple programs; unimplemented-but-harmless calls
+// (futex without contention, sigaction, console ioctl) return success so
+// glibc/musl startup paths proceed. fork/clone/execve/file-mmap: -ENOSYS.
+mod lx {
+    pub const READ: u64 = 0;
+    pub const WRITE: u64 = 1;
+    pub const OPEN: u64 = 2;
+    pub const CLOSE: u64 = 3;
+    pub const FSTAT: u64 = 5;
+    pub const LSEEK: u64 = 8;
+    pub const MMAP: u64 = 9;
+    pub const MUNMAP: u64 = 11;
+    pub const BRK: u64 = 12;
+    pub const RT_SIGACTION: u64 = 13;
+    pub const RT_SIGPROCMASK: u64 = 14;
+    pub const IOCTL: u64 = 16;
+    pub const PREAD64: u64 = 17;
+    pub const WRITEV: u64 = 20;
+    pub const ACCESS: u64 = 21;
+    pub const NANOSLEEP: u64 = 35;
+    pub const GETPID: u64 = 39;
+    pub const UNAME: u64 = 63;
+    pub const GETCWD: u64 = 79;
+    pub const GETPPID: u64 = 110;
+    pub const ARCH_PRCTL: u64 = 158;
+    pub const FUTEX: u64 = 202;
+    pub const SET_TID_ADDRESS: u64 = 218;
+    pub const CLOCK_GETTIME: u64 = 228;
+    pub const EXIT_GROUP: u64 = 231;
+    pub const OPENAT: u64 = 257;
+    pub const GETRANDOM: u64 = 318;
+    // arch_prctl codes
+    pub const ARCH_SET_FS: u64 = 0x1002;
+    pub const ARCH_GET_FS: u64 = 0x1003;
+}
+
+/// Linux `syscall` passes arg 4 in r10 (rcx is destroyed by the instruction).
+/// The frame captures r10 verbatim, so the shim reads args 1-6 from rdi, rsi,
+/// rdx, r10, r8, r9.
+fn linux_dispatch(f: &mut SyscallFrame) {
+    let pid = scheduler::current_task_id();
+    match f.rax {
+        lx::READ => f.rax = sys_read(f.rdi, f.rsi, f.rdx),
+        lx::WRITE => f.rax = sys_write(f.rdi, f.rsi, f.rdx),
+        lx::OPEN | lx::OPENAT => {
+            // open(path,len) / openat(dirfd,path,flags,mode) — path in rsi.
+            if f.rsi == 0 || f.rsi.checked_add(4096).is_none() {
+                f.rax = errno::err(errno::EFAULT);
+                return;
+            }
+            match linux_cstr_len(f.rsi) {
+                Some(l) => f.rax = sys_open(f.rsi, l),
+                None => f.rax = errno::err(errno::EFAULT),
+            }
+        }
+        lx::CLOSE => f.rax = sys_close(f.rdi),
+        lx::FSTAT => {
+            // musl wants a valid struct; zero 144 bytes (x86-64 struct stat).
+            match f.rsi.checked_add(144).filter(|_| linux_zero_user(f.rsi, 144)) {
+                Some(_) => f.rax = 0,
+                None => f.rax = errno::err(errno::EFAULT),
+            }
+        }
+        lx::LSEEK => f.rax = sys_seek(f.rdi, f.rsi, f.rdx),
+        lx::MMAP => {
+            // Anonymous mmap only — the Linux ABI is
+            //   mmap(addr, len, prot, flags, fd, off): rdi/rsi/rdx/r10/r8/r9,
+            // with fd = -1 for MAP_ANONYMOUS. fd-backed mappings unsupported.
+            let len = f.rsi;
+            if f.r8.wrapping_add(1) != 0 {
+                f.rax = errno::err(errno::ENOMEM); // fd-backed mmap unsupported
+                return;
+            }
+            f.rax = match linux_mem_call(|m, fr| userspace::linux_mmap_anon(pid, len, m, fr)) {
+                Some(r) => r,
+                None => errno::err(errno::ENOMEM),
+            };
+        }
+        lx::MUNMAP => f.rax = 0, // regions are never reclaimed back
+        lx::BRK => {
+            let addr = f.rdi;
+            f.rax = match linux_mem_call(|m, fr| userspace::linux_brk(pid, addr, m, fr)) {
+                Some(r) => r,
+                None => errno::err(errno::ENOMEM),
+            };
+        }
+        _ => linux_dispatch_more(f, pid),
+    }
+}
+
+/// Second tier of the Linux shim (kept separate so each fn stays reviewable).
+fn linux_dispatch_more(f: &mut SyscallFrame, pid: u64) {
+    match f.rax {
+        lx::RT_SIGACTION | lx::RT_SIGPROCMASK | lx::FUTEX | lx::IOCTL | lx::ACCESS => {
+            // No real signals/access bits yet: report success so glibc/musl
+            // startup proceeds (futex without waiters "wakes" nothing).
+            f.rax = 0;
+        }
+        lx::SET_TID_ADDRESS => f.rax = pid,
+        lx::PREAD64 => f.rax = sys_read(f.rdi, f.rsi, f.rdx), // offset ignored
+        lx::WRITEV => {
+            // iovec = { base: u64, len: u64 }; sum the per-vec write counts.
+            let (iovs, cnt) = (f.rsi, f.rdx);
+            let cnt = (cnt as usize).min(64);
+            let mut total = 0u64;
+            for i in 0..cnt {
+                let rec = iovs.checked_add(i as u64 * 16).unwrap_or(u64::MAX);
+                if !user_buf_ok(rec, 16, false) {
+                    f.rax = errno::err(errno::EFAULT);
+                    return;
+                }
+                let base = unsafe { (rec as *const u64).read_volatile() };
+                let len = unsafe { ((rec as *const u64).add(1) as *const u64).read_volatile() };
+                if len == 0 {
+                    continue;
+                }
+                let r = sys_write(f.rdi, base, len);
+                if r & 0x8000_0000_0000_0000 != 0 {
+                    f.rax = r; // -errno from the first failed vec
+                    return;
+                }
+                total += r;
+            }
+            f.rax = total;
+        }
+        lx::NANOSLEEP => {
+            // struct timespec { tv_sec: u64, tv_nsec: u64 } at rdi.
+            if user_buf_ok(f.rdi, 16, false) {
+                let sec = unsafe { (f.rdi as *const u64).read_volatile() };
+                let nsec = unsafe { ((f.rdi as *const u64).add(1)).read_volatile() };
+                f.rax = sys_sleep(sec.saturating_mul(1_000_000_000).saturating_add(nsec));
+            } else {
+                f.rax = errno::err(errno::EFAULT);
+            }
+        }
+        lx::GETPID => f.rax = pid,
+        lx::GETPPID => f.rax = 0,
+        _ => linux_dispatch_tail(f, pid),
+    }
+}
+
+/// Third tier: uname/getcwd/TLS/time/exit/random + the helper fns.
+fn linux_dispatch_tail(f: &mut SyscallFrame, pid: u64) {
+    match f.rax {
+        lx::UNAME => {
+            // struct utsname: six 65-byte NUL-padded string fields.
+            let buf = f.rdi;
+            const SZ: u64 = 6 * 65;
+            if user_buf_ok(buf, SZ, true) {
+                unsafe {
+                    core::ptr::write_bytes(buf as *mut u8, 0, SZ as usize);
+                    let put = |off: u64, s: &str| {
+                        for (i, b) in s.as_bytes().iter().enumerate() {
+                            ((buf + off) as *mut u8).add(i).write_volatile(*b);
+                        }
+                    };
+                    put(0, "OnyxOS");
+                    put(65, "onyx");
+                    put(130, "9.7.0");
+                    put(195, "(none)");
+                    put(260, "x86_64");
+                    put(325, "(none)");
+                }
+                f.rax = 0;
+            } else {
+                f.rax = errno::err(errno::EFAULT);
+            }
+        }
+        lx::GETCWD => {
+            // Report "/" (buf at rdi, size rsi) — enough for shell-like tools.
+            let (buf, sz) = (f.rdi, f.rsi);
+            if sz >= 2 && user_buf_ok(buf, 2, true) {
+                unsafe {
+                    (buf as *mut u8).write_volatile(b'/');
+                    ((buf as *mut u8).add(1)).write_volatile(0);
+                }
+                f.rax = 2;
+            } else {
+                f.rax = errno::err(errno::EINVAL);
+            }
+        }
+        lx::ARCH_PRCTL => {
+            // TLS base (FS) setup: required by static-PIE before it touches
+            // any TCB-relative data. QEMU's default CPU lacks FSGSBASE, so go
+            // through the IA32_FS_BASE MSR (wrmsr is ring-0 only — we are).
+            let (code, addr) = (f.rdi, f.rsi);
+            match code {
+                lx::ARCH_SET_FS => {
+                    if addr != 0 && !user_buf_ok(addr, 1, true) {
+                        f.rax = errno::err(errno::EFAULT);
+                        return;
+                    }
+                    let mut msr = Msr::new(0xC000_0100); // IA32_FS_BASE
+                    unsafe { msr.write(addr) };
+                    serial_writeln!("lx: ARCH_SET_FS base={:#x}", addr);
+                    f.rax = 0;
+                }
+                lx::ARCH_GET_FS => {
+                    if !user_buf_ok(addr, 8, true) {
+                        f.rax = errno::err(errno::EFAULT);
+                        return;
+                    }
+                    let v = unsafe { Msr::new(0xC000_0100).read() };
+                    unsafe { (addr as *mut u64).write_volatile(v) };
+                    f.rax = 0;
+                }
+                _ => f.rax = errno::err(errno::EINVAL),
+            }
+        }
+        lx::CLOCK_GETTIME => {
+            // clk 0 = REALTIME (wall), 1 = MONOTONIC (TSC ns) -> timespec out.
+            let (clk, out) = (f.rdi, f.rsi);
+            if !user_buf_ok(out, 16, true) {
+                f.rax = errno::err(errno::EFAULT);
+                return;
+            }
+            let ns = if clk == 0 { sys_gettime(1) } else { sys_gettime(0) };
+            let ns = if ns == u64::MAX { 0 } else { ns };
+            unsafe {
+                (out as *mut u64).write_volatile(ns / 1_000_000_000);
+                ((out as *mut u64).add(1)).write_volatile(ns % 1_000_000_000);
+            }
+            f.rax = 0;
+        }
+        lx::EXIT_GROUP => sys_exit(f),
+        lx::GETRANDOM => {
+            // Not cryptographic: a counter stream is enough for the programs
+            // the shim serves (they seed their PRNGs from it).
+            let (buf, len) = (f.rdi, f.rsi);
+            let len = (len as usize).min(256);
+            if len == 0 || !user_buf_ok(buf, len as u64, true) {
+                f.rax = errno::err(errno::EFAULT);
+                return;
+            }
+            static LX_RNG: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+            let mut s = LX_RNG.load(core::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                for i in 0..len {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (buf as *mut u8).add(i).write_volatile(s as u8);
+                }
+            }
+            LX_RNG.store(s, core::sync::atomic::Ordering::Relaxed);
+            f.rax = len as u64;
+        }
+        _ => f.rax = errno::err(errno::ENOSYS),
+    }
+    let _ = pid;
+}
+
+/// Run `f(&mut mapper, &mut frames)` with the runtime paging + global frame
+/// snapshot (syscall context is not the boot allocator). None when not ready.
+fn linux_mem_call<R>(
+    f: impl FnOnce(
+        &mut x86_64::structures::paging::OffsetPageTable<'static>,
+        &mut memory::BootInfoFrameAllocator,
+    ) -> R,
+) -> Option<R> {
+    let mut mapper = memory::runtime_mapper()?;
+    memory::with_global_frames(|frames| f(&mut mapper, frames))
+}
+
+/// User NUL-terminated string length, validating each byte's mapping first.
+fn linux_cstr_len(mut p: u64) -> Option<u64> {
+    let mut n = 0u64;
+    loop {
+        if n >= 4096 || memory::page_flags(VirtAddr::new(p)).is_none() {
+            return None;
+        }
+        let b = unsafe { (p as *const u8).read_volatile() };
+        if b == 0 {
+            return Some(n);
+        }
+        n += 1;
+        p += 1;
+    }
+}
+
+/// Zero `len` user bytes with mapping validation per byte; false on a bad
+/// range (nothing is written in that case).
+fn linux_zero_user(start: u64, len: u64) -> bool {
+    for i in 0..len {
+        let p = start + i;
+        if memory::page_flags(VirtAddr::new(p)).is_none() {
+            return false;
+        }
+        unsafe { (p as *mut u8).write_volatile(0) };
+    }
+    true
+}
+
+
+
 
 

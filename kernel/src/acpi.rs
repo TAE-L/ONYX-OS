@@ -17,7 +17,7 @@
 //! page-table entries (the A2 aliasing lesson). Runs with interrupts off,
 //! like the rest of the boot-time discovery.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::{memory, serial_writeln};
 
@@ -143,10 +143,26 @@ fn parse_madt(base: *const u8, len: usize) {
         }
         match ty {
             0 => {
-                // LAPIC: uid at +2, apic id at +3.
+                // LAPIC: uid at +2, apic id at +3, flags at +4 (bit 0 =
+                // enabled). M9.8 starts exactly the enabled ones.
                 let uid = unsafe { rd_u8(base, off + 2) };
                 let id = unsafe { rd_u8(base, off + 3) };
-                serial_writeln!("[acpi] MADT: LAPIC uid={} id={:#x}", uid, id);
+                let flags = unsafe { rd_u32(base, off + 4) };
+                serial_writeln!(
+                    "[acpi] MADT: LAPIC uid={} id={:#x} flags={:#x}",
+                    uid,
+                    id,
+                    flags
+                );
+                if flags & 1 != 0 {
+                    let n = LAPIC_COUNT.load(Ordering::Relaxed);
+                    if n < LAPIC_MAX {
+                        LAPIC_IDS[n].store(u32::from(id), Ordering::Relaxed);
+                        LAPIC_COUNT.store(n + 1, Ordering::Relaxed);
+                    } else {
+                        serial_writeln!("[acpi] MADT: more than {LAPIC_MAX} enabled LAPICs - ignoring id={id:#x}");
+                    }
+                }
                 lapics += 1;
             }
             1 => {
@@ -188,6 +204,34 @@ fn parse_madt(base: *const u8, len: usize) {
 /// Cached MADT IOAPIC record (for M9.8 SMP + the A2 cross-check).
 static IOAPIC_ADDR: AtomicU64 = AtomicU64::new(0);
 static GSI_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Largest LAPIC list cached (`smp::MAX_CPUS` plus slack: extra entries are
+/// counted but never started).
+const LAPIC_MAX: usize = 8;
+
+/// Enabled LAPIC ids, in MADT order — the input to M9.8's AP bring-up.
+static LAPIC_IDS: [AtomicU32; LAPIC_MAX] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static LAPIC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// The enabled LAPIC ids the MADT advertised. Returns `(ids, count)`;
+/// `count == 0` means the MADT gave no usable processors and SMP stays off.
+pub fn lapic_ids() -> ([u8; LAPIC_MAX], usize) {
+    let mut out = [0u8; LAPIC_MAX];
+    let n = LAPIC_COUNT.load(Ordering::Relaxed).min(LAPIC_MAX);
+    for i in 0..n {
+        out[i] = LAPIC_IDS[i].load(Ordering::Relaxed) as u8;
+    }
+    (out, n)
+}
 
 /// Entry point: locate + parse the ACPI tables. Call once at boot (IF=0).
 pub fn init(provided_rsdp: Option<u64>) {

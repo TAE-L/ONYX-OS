@@ -46,6 +46,13 @@ static IDT: spin::Lazy<InterruptDescriptorTable> = spin::Lazy::new(|| {
     // stack is live. Also the LAPIC spurious vector, which needs an entry
     // (it is acknowledged by returning; no EOI for a spurious interrupt).
     idt[0x30].set_handler_fn(apic_timer_handler);
+    // M9.8: reschedule IPI (vector 0x31) — a peer CPU made a task Ready and
+    // wants this CPU to re-run its scheduler now instead of waiting for its
+    // own timer tick. TLB-shootdown IPI (vector 0x32) — this CPU must
+    // invalidate all non-global TLB entries because a peer changed the shared
+    // address space.
+    idt[0x31].set_handler_fn(resched_ipi_handler);
+    idt[0x32].set_handler_fn(tlb_ipi_handler);
     idt[0xFF].set_handler_fn(spurious_handler);
     idt
 });
@@ -217,16 +224,26 @@ fn device_eoi(legacy_pic_irq_vector: u8) {
 /// moved to the LAPIC timer in M9.6-A2 — rtc.rs and the ticker depend on
 /// these 100 Hz ticks, so the PIT keeps counting through the IOAPIC.
 extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
+    // M9.8-f: an async IRQ may clobber the interrupted task's XMM registers
+    // before the switch saves them — guard first, before any other code.
+    let _fpu = crate::fpu::IrqFpuGuard::new();
     crate::pit::tick();
     device_eoi(crate::pic::PIC_1_OFFSET);
 }
 
 /// LAPIC timer (vector 0x30, 1000 Hz): the preemption source.
 extern "x86-interrupt" fn apic_timer_handler(_frame: InterruptStackFrame) {
+    // M9.8-f: MUST be the first statement — the AVX regression test proved that
+    // compiler-generated SSE further down (perf/struct copies) otherwise
+    // destroys the interrupted task's XMM registers.
+    let _fpu = crate::fpu::IrqFpuGuard::new();
     // B5: lateness vs. the 1 ms schedule measured at entry; the service-cost
     // record happens after EOI but BEFORE preempt — switch-away time belongs
     // to the descheduled task, not to the interrupt.
     let t0 = crate::perf::irq_timer_enter();
+    // If the closed-loop correction has landed since this CPU armed its
+    // timer, take it now (one atomic compare in the common case).
+    crate::apic::maybe_rearm_timer();
     crate::apic::tick_ms();
     crate::apic::eoi();
     crate::perf::irq_timer_exit(t0);
@@ -236,8 +253,31 @@ extern "x86-interrupt" fn apic_timer_handler(_frame: InterruptStackFrame) {
 /// spurious interrupt must NOT be EOI'd (Intel SDM §11.9).
 extern "x86-interrupt" fn spurious_handler(_frame: InterruptStackFrame) {}
 
+/// M9.8: reschedule IPI (vector 0x31). A peer CPU made a task Ready and wants
+/// this CPU to schedule it now. The body is exactly the timer's preemption
+/// step — EOI first (a LAPIC interrupt is only complete after its EOI), then
+/// `preempt`, which never returns into a dead task.
+extern "x86-interrupt" fn resched_ipi_handler(_frame: InterruptStackFrame) {
+    let _fpu = crate::fpu::IrqFpuGuard::new();
+    crate::apic::eoi();
+    crate::scheduler::preempt();
+}
+
+/// M9.8: TLB-shootdown IPI (vector 0x32). A peer CPU changed the shared
+/// address space, so every non-global translation this CPU cached is stale.
+///
+/// The kernel has no `unmap` path today (mappings are only ever added, and a
+/// new mapping cannot leave a stale entry behind), so nothing sends this yet —
+/// it exists so the first remap/unmap cannot silently skip the shootdown.
+extern "x86-interrupt" fn tlb_ipi_handler(_frame: InterruptStackFrame) {
+    let _fpu = crate::fpu::IrqFpuGuard::new();
+    crate::apic::eoi();
+    x86_64::instructions::tlb::flush_all();
+}
+
 /// PS/2 keyboard (IRQ 1).
 extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
+    let _fpu = crate::fpu::IrqFpuGuard::new();
     let t0 = crate::perf::irq_kbd_enter();
     crate::keyboard::handle_irq();
     device_eoi(crate::pic::PIC_1_OFFSET + 1);
@@ -246,6 +286,7 @@ extern "x86-interrupt" fn keyboard_handler(_frame: InterruptStackFrame) {
 
 /// PS/2 mouse (IRQ 12, on the slave PIC -> vector 0x2C).
 extern "x86-interrupt" fn mouse_handler(_frame: InterruptStackFrame) {
+    let _fpu = crate::fpu::IrqFpuGuard::new();
     let t0 = crate::perf::irq_mouse_enter();
     crate::mouse::handle_irq();
     device_eoi(crate::pic::PIC_2_OFFSET + 4);

@@ -52,8 +52,8 @@ Two signature goals beyond "a working hobby OS":
 | M9 | **UEFI boot** (GPT image + OVMF) + graphical framebuffer console: `uefi.img` with GPT + ESP + hybrid protective-MBR data partitions, OVMF-verified incl. GOP framebuffer + full M8 shell flow (`test-uefi.ps1`) | ✅ done |
 | **M9.5** | **Graphical desktop userspace**: per-process address spaces (CR3), window-server graphics syscalls, IPC + input delivery to ring 3, wallpaper + windows | **DEFERRED** (revisited later) |
 | **M9.6** | **Core hardening + missing subsystems** — A: upgrades (TSC ns timekeeping ✅, APIC/IOAPIC + LAPIC timer ✅, scheduler v2 ✅, FPU/SIMD save-restore ✅, block cache ✅, frame alloc v2 ✅) · B: missing subsystems (PCI ✅, ACPI ✅, process lifecycle ✅, raw input ring ✅, `perf` instrumentation ✅) · C: ABI/file-API foundation (argv/envp/auxv ✅, user-pointer validation ✅, errno ✅, mount table) | **done** — A1–A6, B1–B5, C1–C3 all complete; M9.6 regressions pass on BIOS + UEFI (test-fs, test-sched, test-proc, test-block, test-memory, test-pci, test-acpi, test-raw, test-input, test-fpu, test-time, test-args). |
-| **M9.7** | **Linux ABI compat — run static Linux ELFs**: syscall-number shim, argv/envp/auxv, `arch_prctl` TLS, mmap/brk, PIE/relocations | planned |
-| **M9.8** | **SMP — multi-core** (its own stage, per decision): MADT-driven AP startup, per-CPU data, per-CPU run queues + IPIs | planned |
+| **M9.7** | **Linux ABI compat — run static Linux ELFs**: syscall-number shim, argv/envp/auxv, `arch_prctl` TLS, mmap/brk, PIE/relocations | ✅ done |
+| **M9.8** | **SMP — multi-core** (its own stage, per decision): MADT-driven AP startup, per-CPU data, per-CPU run queues + IPIs | ✅ done — GS-base per-CPU blocks, INIT-SIPI-SIPI AP bring-up through a hand-assembled low-page trampoline, per-CPU GDT/TSS + IDT + LAPIC timers, reschedule IPI, per-CPU RSP/syscall slots, boot context restored as a task, kernel-service lock (`ksl`) + input/keyboard/mouse locking, **task migration with work stealing**, stall diagnostic re-based on provable starvation, and the `xsave64`/`xrstor64` EDX:EAX mask bug fixed (AVX/YMM now survives switches under migration); `test-smp.ps1` passes at `-smp 1/2/4`, `test-avx.ps1` at `-smp 4 -cpu max` (200+ rounds, zero failures), all 25 suites green |
 | **M10** | **GPU drivers — placeholder**: PCI GPU scan + modesetting + framebuffer-accelerated stubs (no full accel yet) | gaming track start |
 | M11 | NTFS read-only + multi-drive mounting | extra Windows compat |
 | **M12** | **PE foundation**: parse `.exe` / `.dll` (PE/COFF), relocations, DLL imports groundwork | solid foundation only |
@@ -305,6 +305,34 @@ SYS_SPAWN add IRQ latency; A3's syscall framing work addresses it.
 
 ## M9.7 — Linux ABI compat: run static Linux ELFs
 
+**Status:** ✅ **done** — the syscall entry routes Linux-ABI tasks through a
+number-compatible shim (`linux_dispatch`: write/read/open/close/fstat/lseek,
+mmap/munmap/brk, getpid/getppid, getrandom, clock_gettime, exit(_group),
+wait4, arch_prctl ARCH_SET_FS/GET_FS — arg 4 in r10, `-errno` returns). The
+loader detects Linux-ABI images (`ONYXLNX\0` marker or ET_DYN + dynamic
+section) and serves them the full C1 process-start stack; per-task brk/mmap
+state lives in the existing stack-slot registry and dies with the task.
+ET_DYN (static-PIE) images load at a fixed PIE region (`0x2000000` +
+preferred vaddrs) with R_X86_64_RELATIVE — and any GLOB_DAT/JUMP_SLOT —
+relocations applied before entry; targets are validated against the loaded
+segments. `AT_BASE` reports the load base for static-PIE TLS setups.
+
+**Verified:** `LNXTEST.ELF` (in `user/linuxtest`, built by the root `build.rs`
+with `rustc --target x86_64-unknown-linux-gnu` + `rust-lld -shared -static`)
+is a genuine Linux-ABI static-PIE binary; booted from the shell AUTOEXEC it
+exercises brk, anonymous mmap (write-back through the mapping), FS-base TLS,
+kernel-applied PIE relocations (read through a relocated `.rodata` pointer),
+getpid, getrandom and clock_gettime from ring 3 and prints
+`[lnxtest] PASSED`. Regression script: `test-lnx.ps1`. The M9.6 suite
+(`test-args.ps1`) still passes unchanged.
+
+**Bug found & fixed during M9.7:** adding the `AT_BASE` auxv pair without
+growing the stack-block budget (`8 * 16` still assumed) made the trailing
+`AT_NULL` pair overflow the block by 16 bytes — landing exactly on the head of
+the `argv[0]` string and zeroing it (`argv[0]=` / `at_execfn=` printed empty in
+`test-args.ps1`). The budget now counts 9 pairs; both suites verify the full
+strings.
+
 **Why:** signature goal #1 ("split personality binaries") is half-built: our
 syscall layer already mirrors Linux x86-64 (rax=nr, rdi/rsi/rdx) and the ELF64
 loader exists. This milestone runs *unmodified statically-linked Linux
@@ -322,10 +350,149 @@ the image run from the shell via SYS_SPAWN.
 
 ## M9.8 — SMP: multi-core (its own stage, by decision)
 
-Per-CPU data (GS base), ACPI-MADT-driven AP startup (INIT-SIPI-SIPI), per-CPU
-run queues + IPI rescheduling, per-CPU LAPIC timers. M9.6-A2 + B2 deliberately
-build its prerequisites. The payoff milestone for the gaming vision: real
-cores. M10+ keep their original order after it.
+**Status:** ✅ **done** — the kernel runs on every CPU the MADT advertises.
+Regression script: `test-smp.ps1` (boots the same image at `-smp 4`, `-smp 2`
+and `-smp 1`); the whole M9.6/M9.7 suite still passes unchanged.
+
+### What was built
+
+1. **Per-CPU state (GS base).** `kernel/src/smp.rs` owns a `PerCpu` block per
+   CPU, published in `IA32_GS_BASE`; `gs:[0]` is the CPU index. The two slots
+   the syscall stub used to share globally now live there too: `gs:[32]` =
+   kernel-stack top, `gs:[40]` = parked user RSP. That closes a real SMP hole —
+   the old single scratch slot could be clobbered by a second core between the
+   entry store and the load, which no `IF=0` protects against across cores.
+   Per CPU: current task index, idle RSP + idle FXSAVE area, idle kernel stack,
+   pending-handoff slot, LAPIC id/online flag, timer-tick and worker counters.
+2. **AP bring-up (INIT-SIPI-SIPI).** A frame below 1 MiB is reserved before the
+   heap claims frames (`memory::reserve_low_frame`), then
+   `smp::prepare` copies + identity-maps a one-page trampoline into it. The
+   trampoline is hand-assembled bytes (16-bit real mode → PAE/CR3/EFER →
+   64-bit) with its listing in the source and a dev helper to disassemble it
+   (`tools/extract-trampoline.ps1`). `smp::start_aps` re-patches the page per
+   AP (plain memory writes — the mapping happens once) and drives
+   INIT → deassert → SIPI → SIPI, waiting for each AP's `online` flag.
+3. **AP side (`ap_entry`).** Identifies itself by LAPIC id, installs GS base,
+   loads its own GDT + TSS (`gdt::init_ap`, so TR/IST/RSP0 are per-CPU), loads
+   the shared IDT, mirrors the BSP's CR0/CR4 and EFER **writable** bits, sets
+   up FPU/SSE, programs its SYSCALL MSRs (`syscall::init_ap`) and arms its own
+   LAPIC timer at the BSP's calibrated interval, then idles in the scheduler.
+4. **Scheduler (SMP-safe).** One global `SCHED_LOCK` (always taken with IF=0)
+   guards the task table. The context switch deliberately runs *outside* it —
+   so the outgoing task keeps `Running` and its owner CPU until the CPU
+   schedules again (`release_pending_prev`), which is what stops another core
+   from stealing a task whose RSP has not been saved yet. "Current" is per-CPU
+   and each task's RSP lives in a stable heap slot, so nothing points into the
+   `TASKS` vector while the switch runs.
+5. **IPIs.** Vector 0x31 (reschedule) is sent whenever a task becomes Ready
+   (`smp::kick_others`), so an idle core never sleeps through new work; vector
+   0x32 (TLB shootdown) exists for the first remap/unmap path. Device IRQs keep
+   their IOAPIC destination = the BSP, so drivers stay single-CPU by design.
+6. **Work for the APs.** Each AP gets its own worker task (`ap_worker_task`): a
+   floating-point + integer accumulator that verifies its XMM state every 100k
+   iterations and prints a heartbeat, plus per-CPU LAPIC tick counters in the
+   boot summary — i.e. the log proves real parallel execution, not just
+   "online".
+
+### Deliberate scope (documented limitations)
+
+* **CPU affinity, not migration.** A task only ever runs on the CPU that
+  spawned it (the filter in `plan_switch`). The file-system, page-table and
+  device layers are still single-CPU structures; keeping each task on its core
+  keeps all of them serialized by construction. Real migration needs those
+  layers locked (the TLB IPI is already in place for it).
+* **Single shared run queue.** Per-CPU queues are the natural follow-up once
+  migration exists; today the run queue is global with per-CPU "current".
+* **Boot context.** `kernel_main` stops being scheduled once preemption starts
+  (nothing is Ready while the peripheral tasks are), which is why the AP
+  bring-up runs as a **task** (`smp::bringup_task`) rather than inline. The
+  same pre-existing effect is why `apic::init`'s closed-loop correction and
+  `input::init` never complete on this build; M9.8 works around it by
+  publishing the first-guess timer interval immediately and by having an AP
+  leave its timer masked if no interval was published (a near-zero count would
+  storm that core). Fixing the boot-context starvation itself is its own item.
+
+### M9.8 completion pass — bugs found in my own logic and how each was solved
+
+Logged verbatim as requested; every item below was found by a failing test or a
+serial trace, never assumed.
+
+1. **Boot context starvation (fixed).** The pre-existing effect above meant the
+   LAPIC-timer closed-loop calibration and the `input` ring self-check never
+   ran. Fix: moved the post-`apic::init` boot steps into a kernel task
+   (`main.rs`), so the heartbeat `[diag]` line and the interval correction are
+   back; the two M9.8 workarounds (first-guess interval publish, AP-timer
+   mask fallback) are retained only as safety nets.
+2. **AP trace noise.** ~10 serial lines per AP at 115200 baud slowed every
+   boot. Fix: `ap_trace!` gated behind a `const AP_TRACE: bool` switch.
+3. **Keyboard ring was a same-CPU-only data structure.** `RING`/`HEAD`/`TAIL`
+   were plain `static mut` with the comment "never touched concurrently" — true
+   under CPU affinity, false the moment tasks migrate. Fix: lock-free SPSC
+   ring on `AtomicU64`/`AtomicUsize` with Release/Acquire ordering (the IRQ
+   producer must never spin, so no mutex).
+4. **Line discipline was serialized by IF=0 only.** `take_line`'s `LINE` buffer
+   is a *shared terminal*; IF=0 excludes only same-CPU interrupts, not another
+   CPU's task calling `SYS_READ(0)`. Fix: dedicated `LINE_LOCK` mutex (chosen
+   over the KSL because the echo path takes the framebuffer lock and a mouse
+   IRQ needs the KSL — holding the KSL across an echo would make that IRQ spin
+   for milliseconds). `line_pending()` became lock-free (reads the SPSC ring
+   only), because the scheduler's wake pass calls it under `SCHED_LOCK`.
+5. **Mouse state had a genuinely broken critical section.** `read_packet` used
+   `disable(); ...; enable()` — (a) it re-enabled interrupts *unconditionally*,
+   destroying an outer IF=0 section such as a syscall, and (b) IF=0 excludes
+   only this CPU's IRQs while the mouse IRQ can be delivered on another core.
+   Fix: both `handle_irq` and `read_packet` take the KSL; the IRQ handler
+   releases it *before* the input-ring push and cursor move (both take locks
+   of their own — a nested KSL acquisition would reentrancy-panic).
+6. **CPU affinity removed → work stealing.** The M9.8 pick loop filtered by
+   `owner_cpu`; that filter was the *serialization mechanism* for all unlocked
+   single-CPU structures. Fix: removed the filter, added steal-with-local-
+   preference (highest priority wins; ties prefer the owner CPU), made safe by
+   the ksl/locks from items 3–5 plus `SCHED_LOCK` claiming.
+7. **Stall diagnostic false positive under stealing.** "Nothing Ready for 8
+   ticks" is a *normal steady state* on 4 cores (other tasks Running elsewhere
+   or blocked). Fix: the trigger now requires *provable* starvation — a sleeper
+   past its deadline, or an input-blocked task with events actually pending.
+8. **MAIN's saved state was per-CPU while MAIN is global.** With migration the
+   one boot task could resume on another CPU with a different per-CPU image.
+   Fix (audit result): `fpu_ptr(MAIN)`/idle sp/kstack stay per-CPU *idle
+   contexts* by design — the boot task never migrates because it is the only
+   thing each CPU's idle path picks; audited, no change needed, documented.
+9. **THE BIG ONE — `xsave64`/`xrstor64` ran with a garbage EDX:EAX mask.** The
+   naked `context_switch_xsave` never loaded the state-component mask operand,
+   so every save/restore covered a *random subset* of the state. Symptom
+   chain: `-smp 1` passed by luck (benign leftover register contents), `-smp 4`
+   failed only when the AVX task migrated — images with `XSTATE_BV=0x1`
+   (x87-only save of a task with live YMM), exactly the "upper YMM lanes zero,
+   lower lanes intact" signature. Isolated by: per-CPU `live_xcr0` probe
+   (all 0x7 → not an XCR0 problem), per-switch `[avxsw]` trace with image
+   headers (saves never produced bit 1/2), image YMM-region dump (region zeros
+   with live legacy data = fxsave-shaped write), a live-vs-image ymm0 probe
+   after the switch (matched, both zero → save-side). Fix: the switch takes the
+   programmed `XCR0` as a 5th argument and sets `mov eax, r8d; xor edx, edx`
+   before *each* of `xsave64`/`xrstor64` (rdx is the pointer operand, so it
+   first moves to r9); `fpu::save_into` (template capture) had the same bug and
+   got the same fix. Result: `test-avx.ps1` 74+74+53 consecutive rounds, zero
+   failures, on `-smp 4 -cpu max` *and* `-smp 1`.
+10. **Build-image staleness (my process error).** After editing the kernel I
+    once ran only `cargo build` and tested against the *old* `bios.img`
+    (recognized because the failing log printed the pre-instrumentation
+    message format). Rule recorded: always rebuild the image with
+    `build.ps1` before any QEMU test.
+11. **Test-script flake under host load.** `test-sched.ps1`'s "sleeper woke"
+    counter and one batch run of `test-pci`/`test-perf` failed once each and
+    passed on immediate retry with no kernel change — host-load timing flakes,
+    not kernel regressions. The final full sweep: all 25 suites exit 0.
+
+### Success criteria
+
+`test-smp.ps1`: at `-smp 4` all three APs reach 64-bit mode, come online with
+their own GDT/TSS/IDT/CR0/CR4/EFER/SYSCALL MSRs and timers, run their worker
+tasks (non-zero, growing iteration counts, FPU checks passing), advance their
+own per-CPU tick counters, and the system keeps passing the earlier milestones'
+markers (fstest/fpu-test/argv) with no PANIC, no unexpected exception and no
+stall diagnostic. `-smp 2` starts exactly one AP; `-smp 1` starts none and
+leaves the single-CPU path untouched.
 
 ---
 

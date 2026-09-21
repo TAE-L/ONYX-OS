@@ -98,6 +98,37 @@ impl BootInfoFrameAllocator {
         (self.used, self.total, self.freed, self.oom)
     }
 
+    /// Reserve a frame BELOW 1 MiB for the M9.8 AP trampoline (SIPI can only
+    /// start a CPU at a real-mode page) and return its physical address.
+    ///
+    /// O(usable regions). This never revisits a handed-out frame: only frames
+    /// past the bump cursor are eligible, which is why it must run BEFORE the
+    /// heap claims frames (it does — right after the allocator is built).
+    /// Returns `None` if every usable low frame is already gone, in which case
+    /// the kernel stays on the BSP.
+    ///
+    /// # Safety
+    /// Same contract as any allocation: the returned frame is now owned by the
+    /// caller and must never be freed (the allocator does not know about it).
+    pub unsafe fn reserve_low_frame(&mut self) -> Option<u64> {
+        let size = Size4KiB::SIZE;
+        for r in self.memory_regions {
+            if r.kind != MemoryRegionKind::Usable {
+                continue;
+            }
+            let r_start = (r.start as u64).max(0x1000);
+            let r_end = r.end as u64;
+            let aligned = (r_start + size - 1) / size * size;
+            let cand = aligned.max((self.bump_next + size - 1) / size * size);
+            if cand + size <= r_end && cand + size <= 0x10_0000 {
+                self.bump_next = cand + size;
+                self.used += 1;
+                return Some(cand);
+            }
+        }
+        None
+    }
+
     /// Return a frame to the free list (A6 v2 — the x86_64 `FrameAllocator`
     /// trait has no deallocation, so this is an inherent extension). O(1):
     /// the frame becomes the new free-list head, its first 8 bytes now hold
@@ -187,8 +218,12 @@ pub fn runtime_mapper() -> Option<OffsetPageTable<'static>> {
 }
 
 /// Post-boot frame allocator snapshot (moved here by `main` once boot-time
-/// allocations are done). Single-owner: only accessed with IF=0 in syscall
-/// context, so `static mut` follows the established kernel pattern.
+/// allocations are done).
+///
+/// M9.8-(d): guarded by the kernel-service lock. It used to rely on IF=0,
+/// which only serializes against interrupts on the *same* CPU — once tasks can
+/// migrate and two CPUs map pages at the same time, two `&mut` views of the
+/// free list would corrupt it.
 static mut GLOBAL_FRAMES: Option<BootInfoFrameAllocator> = None;
 
 /// Hand the boot frame allocator over to the runtime snapshot. Call once,
@@ -202,16 +237,15 @@ pub fn init_global_frames(allocator: BootInfoFrameAllocator) {
 /// Run `f` with the global (post-boot) frame allocator. `None` if the
 /// snapshot was never installed (boot phase still owns it).
 ///
-/// Runs the closure with interrupts disabled (A6): the allocator is handed
-/// out as a bare `&mut`, so a preemption mid-closure would let the next task
-/// open a second `&mut` view of the same allocator — free-list corruption.
-/// The established callers (the SYS_SPAWN syscall path) already run at IF=0;
-/// this makes the guarantee hold for every future caller.
+/// M9.8-(d): runs under the kernel-service lock (IF=0 + KSL). Before (d) it
+/// used `without_interrupts` alone, which was sound only because CPU affinity
+/// kept every task on the CPU that spawned it; with migration, two CPUs can be
+/// inside this closure at the same time, and two `&mut` views of the frame
+/// free list corrupts it.
 pub fn with_global_frames<R>(f: impl FnOnce(&mut BootInfoFrameAllocator) -> R) -> Option<R> {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let frames = unsafe { (&raw mut GLOBAL_FRAMES).as_mut() }?.as_mut()?;
-        Some(f(frames))
-    })
+    let _ksl = crate::ksl::lock();
+    let frames = unsafe { (&raw mut GLOBAL_FRAMES).as_mut() }?.as_mut()?;
+    Some(f(frames))
 }
 
 /// Frame-allocator stats from the runtime snapshot: `(used, total, freed,

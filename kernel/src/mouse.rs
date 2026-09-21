@@ -66,52 +66,76 @@ pub fn init() -> Result<(), &'static str> {
 }
 
 /// Called from the IRQ-12 handler: assemble the 3-byte packet.
+///
+/// M9.8-(d): the packet-assembly state (`IDX`/`FLAGS`/`DX`/`PACKET`) is shared
+/// with `read_packet` (which any task on any CPU may call), so the critical
+/// section is the assembly only — it is kept short and released *before* the
+/// input-ring push and the cursor move, since both of those take locks of their
+/// own (a nested KSL acquisition would be a reentrancy panic).
 pub fn handle_irq() {
-    let mut data = DATA.lock();
-    let byte = unsafe { data.read() };
-    unsafe {
-        match IDX {
-            0 => {
-                // Byte 0: valid packets always have bit 3 set.
-                if (byte & 0x08) != 0 {
-                    FLAGS = byte;
-                    IDX = 1;
+    let byte = {
+        let mut data = DATA.lock();
+        unsafe { data.read() }
+    };
+    let mut completed: Option<(i16, i16, u8)> = None;
+    {
+        let _ksl = crate::ksl::lock();
+        unsafe {
+            match IDX {
+                0 => {
+                    // Byte 0: valid packets always have bit 3 set.
+                    if (byte & 0x08) != 0 {
+                        FLAGS = byte;
+                        IDX = 1;
+                    }
                 }
+                1 => {
+                    let sign = (FLAGS & 0x10) != 0; // XSGN
+                    DX = if sign {
+                        (byte as u16 | 0xFF00) as i16
+                    } else {
+                        byte as i16
+                    };
+                    IDX = 2;
+                }
+                2 => {
+                    let sign = (FLAGS & 0x20) != 0; // YSGN
+                    let dy = if sign {
+                        (byte as u16 | 0xFF00) as i16
+                    } else {
+                        byte as i16
+                    };
+                    PACKET.dx = DX;
+                    PACKET.dy = dy;
+                    PACKET.left = (FLAGS & 0x01) != 0;
+                    PACKET.right = (FLAGS & 0x02) != 0;
+                    IDX = 0;
+                    // Button bitmask for the input ring, computed here while
+                    // the assembly state is still owned by this section.
+                    let buttons = (if (FLAGS & 0x01) != 0 {
+                        crate::input::BTN_LEFT
+                    } else {
+                        0
+                    }) | (if (FLAGS & 0x02) != 0 {
+                        crate::input::BTN_RIGHT
+                    } else {
+                        0
+                    });
+                    completed = Some((DX, dy, buttons));
+                }
+                _ => IDX = 0,
             }
-            1 => {
-                let sign = (FLAGS & 0x10) != 0; // XSGN
-                DX = if sign {
-                    (byte as u16 | 0xFF00) as i16
-                } else {
-                    byte as i16
-                };
-                IDX = 2;
-            }
-            2 => {
-                let sign = (FLAGS & 0x20) != 0; // YSGN
-                let dy = if sign {
-                    (byte as u16 | 0xFF00) as i16
-                } else {
-                    byte as i16
-                };
-                PACKET.dx = DX;
-                PACKET.dy = dy;
-                PACKET.left = (FLAGS & 0x01) != 0;
-                PACKET.right = (FLAGS & 0x02) != 0;
-                IDX = 0;
-                // B4: raw mouse event into the unified input ring (screen-space
-                // deltas + held-button bitmask). Pushed from IRQ context.
-                let buttons = (if (FLAGS & 0x01) != 0 { crate::input::BTN_LEFT } else { 0 })
-                    | (if (FLAGS & 0x02) != 0 { crate::input::BTN_RIGHT } else { 0 });
-                crate::input::push_mouse(DX as i32, -(dy as i32), buttons);
-                // Move the on-screen cursor immediately in IRQ context:
-                // lowest possible input latency (a few hundred byte writes).
-                // PS/2 reports "up" as positive Y, but screen coordinates
-                // grow downward — negate Y to match. X is already correct.
-                crate::framebuffer::move_cursor(DX as i32, -(dy as i32));
-            }
-            _ => IDX = 0,
         }
+    }
+    if let Some((dx, dy, buttons)) = completed {
+        // B4: raw mouse event into the unified input ring (screen-space
+        // deltas + held-button bitmask). Pushed from IRQ context.
+        crate::input::push_mouse(dx as i32, -(dy as i32), buttons);
+        // Move the on-screen cursor immediately in IRQ context: lowest
+        // possible input latency (a few hundred byte writes). PS/2 reports
+        // "up" as positive Y, but screen coordinates grow downward — negate Y
+        // to match. X is already correct.
+        crate::framebuffer::move_cursor(dx as i32, -(dy as i32));
     }
 }
 
@@ -145,13 +169,17 @@ pub fn run_reader() {
 /// Consume the latest completed packet (dx/dy are cleared; buttons persist).
 /// Public so the position-reporting task in main.rs can observe raw events.
 pub fn read_packet() -> (i16, i16, bool, bool) {
-    x86_64::instructions::interrupts::disable();
+    // M9.8-(d): KSL instead of disable()/enable(). The old pair was wrong on
+    // two counts: it re-enabled interrupts unconditionally (destroying an
+    // outer IF=0 section such as a syscall), and IF=0 only excludes IRQs on
+    // *this* CPU — the mouse IRQ may be delivered elsewhere. The guard
+    // restores the caller's interrupt state and serializes against the IRQ.
+    let _ksl = crate::ksl::lock();
     let p = unsafe { PACKET };
     unsafe {
         PACKET.dx = 0;
         PACKET.dy = 0;
     }
-    x86_64::instructions::interrupts::enable();
     (p.dx, p.dy, p.left, p.right)
 }
 

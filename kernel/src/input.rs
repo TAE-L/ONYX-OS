@@ -27,7 +27,7 @@
 //! exercises the full path end-to-end from QEMU's monitor to a ring-3 program.
 
 use crate::time;
-use x86_64::instructions::interrupts::without_interrupts;
+use core::sync::atomic::Ordering;
 
 /// Key event (kind = EV_KIND_KEY).
 pub const EV_KIND_KEY: u8 = 1;
@@ -84,9 +84,12 @@ static mut TOTAL: usize = 0;
 /// Count of events dropped because the ring was full.
 static mut DROPPED: usize = 0;
 
-/// Producer entry — called from IRQ contexts (IF=0) only.
+/// Producer entry — called from IRQ contexts (IF=0) and from task contexts on
+/// other CPUs (M9.8-d: input-key injection syscalls), so the ring is
+/// serialized by the kernel-service lock rather than by IF=0.
 fn push(e: InputEvent) {
-    without_interrupts(|| unsafe {
+    let _ksl = crate::ksl::lock();
+    unsafe {
         // Full-ring check must use COUNT alone: when the ring is full,
         // HEAD == TAIL (indistinguishable from empty by pointers), and when
         // one slot is free, (HEAD + 1) % LEN == TAIL — a `next == TAIL` guard
@@ -100,7 +103,7 @@ fn push(e: InputEvent) {
         HEAD = (HEAD + 1) % RING_LEN;
         COUNT += 1;
         TOTAL += 1;
-    });
+    }
 }
 
 /// Raw key event: `code` is a pc_keyboard `KeyCode` discriminant; `down` is
@@ -156,39 +159,45 @@ fn encode(dst: &mut [u8], e: &InputEvent) {
 
 /// Copy as many full 24-byte events as fit into `dst` (each event is one
 /// `EV_SIZE` chunk). Returns the number of bytes copied (a multiple of
-/// EV_SIZE). IF-safe (`without_interrupts`): the producer is an IRQ handler.
+/// EV_SIZE). KSL-serialized (M9.8-d): the producer is a device IRQ, possibly
+/// on another CPU.
 pub fn drain(dst: &mut [u8]) -> usize {
     let mut copied = 0usize;
-    without_interrupts(|| unsafe {
+    let _ksl = crate::ksl::lock();
+    unsafe {
         while COUNT > 0 && copied + EV_SIZE <= dst.len() {
             encode(&mut dst[copied..copied + EV_SIZE], &RING[TAIL]);
             copied += EV_SIZE;
             TAIL = (TAIL + 1) % RING_LEN;
             COUNT -= 1;
         }
-    });
+    }
     copied
 }
 
 /// Drop every pending event (test/consumer "arm" helper: discard whatever was
 /// queued before we started caring). Returns how many events were dropped.
 pub fn clear() -> usize {
-    without_interrupts(|| unsafe {
+    let _ksl = crate::ksl::lock();
+    unsafe {
         let n = COUNT;
         TAIL = HEAD;
         COUNT = 0;
         n
-    })
+    }
 }
 
 /// True when at least one event is waiting. Called by the scheduler's wake
-/// pass (IF=0) to resume a task blocked in SYS_INPUT_READ.
+/// pass (which already holds the scheduler lock with IF=0) to resume a task
+/// blocked in SYS_INPUT_READ — hence no KSL here: it must not be taken from
+/// inside a scheduler-critical section that may itself run under the KSL.
 pub fn pending() -> bool {
     unsafe { COUNT > 0 }
 }
 
 /// Number of pending events (tests / observability).
 pub fn count() -> usize {
+    let _ksl = crate::ksl::lock();
     unsafe { COUNT }
 }
 

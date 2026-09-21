@@ -1,3 +1,5 @@
 /target
 /.toolchain
-*.loguser/linuxtest/tcore/
+*.log
+user/linuxtest/tcore/
+

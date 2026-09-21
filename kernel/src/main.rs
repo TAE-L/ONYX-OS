@@ -20,6 +20,7 @@ mod gdt;
 mod input;
 mod interrupts;
 mod keyboard;
+mod ksl;
 mod memory;
 mod mouse;
 mod pci;
@@ -29,6 +30,7 @@ mod pit;
 mod rtc;
 mod scheduler;
 mod serial;
+mod smp;
 mod syscall;
 mod time;
 mod userspace;
@@ -109,6 +111,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     rtc::init();
 
     // --- M1: interrupts, exceptions, GDT/TSS ---
+    // M9.8: the BSP's per-CPU state (GS base + idle stack) comes first — the
+    // per-CPU TSS inside `gdt::init` takes its idle RSP0 from there.
+    smp::init_bsp();
     gdt::init();
     interrupts::init();
     pic::init();
@@ -134,6 +139,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         core::mem::transmute(regions)
     };
     let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(mem_regions) };
+    // M9.8: reserve ONE frame below 1 MiB for the AP trampoline (SIPI can only
+    // start a CPU at a real-mode page). Done here, before the heap claims any
+    // frame, so the page is guaranteed untouched and never handed out again.
+    match unsafe { frame_allocator.reserve_low_frame() } {
+        Some(addr) => smp::set_low_page(addr),
+        None => serial_writeln!("[smp] no usable frame below 1 MiB - SMP will stay off"),
+    }
     // Set up paging: mapper over the active level-4 page table.
     // Capture the RSDP pointer NOW: `memory::init(boot_info)` below MOVES the
     // boot_info reference (it cannot be re-read afterwards). Read-only ACPI
@@ -175,6 +187,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     pic::enable_irq(1); // PS/2 keyboard
     pic::enable_irq(12); // PS/2 mouse
     serial_writeln!("M3: spawning tasks...");
+    // M9.8: the SMP bring-up task rides along with the M3 spawns so it is
+    // already scheduled when the APIC stack goes live (see `smp::bringup_task`).
+    smp::spawn_bringup_task();
+    // M9.8: the interrupt-liveness heartbeat is a task too — the boot context
+    // stops being scheduled once the timer drives preemption, so anything that
+    // must keep reporting has to be a task.
+    scheduler::spawn(diag_task);
 
     // Spawn kernel threads. Interrupts are still disabled here, which is the
     // only reason it is safe to build the task list.
@@ -192,6 +211,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_writeln!("spawned fpu-test A");
     scheduler::spawn(fpu_test_b);
     serial_writeln!("spawned fpu-test B");
+    // M9.8-f: AVX/YMM regression — only when boot enabled XCR0.YMM, so the
+    // task's VEX-encoded code can never execute on a CPU without AVX.
+    if fpu::avx_enabled() {
+        scheduler::spawn(fpu::avx_test_task);
+        serial_writeln!("spawned fpu-avx test (XCR0={:#x})", fpu::xcr0());
+    } else {
+        serial_writeln!("fpu-avx test not spawned (AVX unavailable)");
+    }
     // A3 scheduler tests: a Normal-priority sleeper (proves sleep+wake on a
     // 500 ms cadence) and an RT burst task (proves RT holds the CPU against
     // Normal tasks for its burst — no normal-task lines may interleave).
@@ -295,32 +322,44 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // calibrates only now (counts 10 PIT ticks against the TSC).
     time::init();
 
+    // --- M9.6-B4: raw input ring init (size self-check — the encode/decode
+    // and the ring-3 E2E test both assume the 24-byte wire layout).
+    // M9.8: this runs BEFORE `apic::init`, because the moment the periodic
+    // LAPIC timer is armed the boot context stops being scheduled while any
+    // task is Ready (pre-existing behavior) — boot-time work after that point
+    // silently never ran.
+    input::init();
+
     // --- M9.6-A2: APIC interrupt architecture. Moves IRQ delivery from the
     // legacy 8259 PIC to LAPIC+IOAPIC (EOI = one MMIO write, no mutex) and
     // preemption to a 1000 Hz LAPIC timer. The PIT keeps counting uptime
-    // ticks for rtc.rs/the ticker; the PIC ends up fully masked.
+    // ticks for rtc.rs/the ticker; the PIC ends up fully masked. The
+    // closed-loop interval correction is handed to a kernel task by `init`
+    // (it needs to keep running after the boot context loses the CPU).
     apic::init();
 
-// --- M9.6-B4: raw input ring init (size self-check — the encode/decode
-    // and the ring-3 E2E test both assume the 24-byte wire layout).
-    input::init();
-    // The boot context becomes the idle loop (part of the round robin).
-    // Diagnostic heartbeat: proves interrupt delivery liveness from MAIN —
-    // ms = LAPIC timer ticks (preemption alive), pit = PIT ticks through the
-    // IOAPIC (uptime clock alive), esr = LAPIC error status.
-    let mut diag_wakes: u64 = 0;
+    // Boot work is done: park the boot context as a scheduler idle context.
+    // It is picked whenever no task is Ready, and the diagnostic heartbeat
+    // that proves interrupt liveness lives in `diag_task` (a real task) for
+    // exactly the reason above.
+    scheduler::idle_forever()
+}
+
+/// Diagnostic heartbeat (M9.8: kept as a task so it is always scheduled).
+/// Proves interrupt delivery liveness: `ms` = LAPIC timer ticks (preemption
+/// alive), `pit` = PIT ticks through the IOAPIC (uptime clock alive), `esr` =
+/// LAPIC error status.
+fn diag_task() {
     loop {
-        x86_64::instructions::hlt();
-        diag_wakes += 1;
-        if diag_wakes % 2000 == 0 {
-            serial_writeln!(
-                "[diag] ms={} pit={} task={} esr={:#x}",
-                apic::ms_since_boot(),
-                pit::ticks(),
-                scheduler::current_task_id(),
-                apic::error_status()
-            );
-        }
+        serial_writeln!(
+            "[diag] ms={} pit={} task={} cpu={} esr={:#x}",
+            apic::ms_since_boot(),
+            pit::ticks(),
+            scheduler::current_task_id(),
+            crate::smp::cpu_index(),
+            apic::error_status()
+        );
+        scheduler::sleep_kernel(2000);
     }
 }
 

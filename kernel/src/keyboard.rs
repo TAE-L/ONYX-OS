@@ -12,6 +12,8 @@
 //! decoder emits no event for releases of non-toggle keys, so only
 //! presses/toggles are reported.
 
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
 use crate::serial_writeln;
 use pc_keyboard::layouts::Us104Key;
 use pc_keyboard::{DecodedKey, HandleControl, KeyCode, KeyState, PS2Keyboard, ScancodeSet1};
@@ -48,32 +50,41 @@ static PORT: Mutex<Port<u8>> = Mutex::new(Port::new(DATA_PORT));
 
 const RING_LEN: usize = 256;
 
-/// Fixed ring of pending key events. Producer: ISR (interrupts off).
-/// Consumer: reader task (turns interrupts off while popping). Never touched
-/// concurrently, so no lock is needed.
-static mut RING: [u64; RING_LEN] = [0; RING_LEN];
-static mut HEAD: usize = 0;
-static mut TAIL: usize = 0;
+/// Fixed ring of pending key events (SPSC).
+///
+/// M9.8-(d): the slots, HEAD and TAIL are atomics now. The "producer is an IRQ,
+/// consumer is a task, never concurrent" argument died with CPU affinity —
+/// with task migration the consumer can run on another CPU while the keyboard
+/// IRQ is delivered *here*, so plain `static mut` fields would be a real data
+/// race (stale HEAD/TAIL, lost or duplicated events). Release/Acquire ordering
+/// is all that is needed and keeps the producer lock-free: the IRQ path must
+/// never spin on a lock a task can hold.
+static RING: [AtomicU64; RING_LEN] = [const { AtomicU64::new(0) }; RING_LEN];
+/// Next write slot (producer-owned).
+static HEAD: AtomicUsize = AtomicUsize::new(0);
+/// Next read slot (consumer-owned).
+static TAIL: AtomicUsize = AtomicUsize::new(0);
 
 fn ring_push(value: u64) {
-    unsafe {
-        let next = (HEAD + 1) % RING_LEN;
-        if next != TAIL {
-            RING[HEAD] = value;
-            HEAD = next;
-        }
+    let head = HEAD.load(Ordering::Relaxed);
+    let next = (head + 1) % RING_LEN;
+    // The consumer may have advanced TAIL since we last looked; a *stale*
+    // TAIL only makes this check stricter (drop instead of overwrite), which
+    // is the safe direction for a ring this size.
+    if next != TAIL.load(Ordering::Acquire) {
+        RING[head].store(value, Ordering::Relaxed);
+        HEAD.store(next, Ordering::Release); // publish after the slot write
     }
 }
 
 fn ring_pop() -> Option<u64> {
-    unsafe {
-        if HEAD == TAIL {
-            None
-        } else {
-            let v = RING[TAIL];
-            TAIL = (TAIL + 1) % RING_LEN;
-            Some(v)
-        }
+    let tail = TAIL.load(Ordering::Relaxed);
+    if tail == HEAD.load(Ordering::Acquire) {
+        None
+    } else {
+        let v = RING[tail].load(Ordering::Relaxed);
+        TAIL.store((tail + 1) % RING_LEN, Ordering::Release);
+        Some(v)
     }
 }
 
@@ -125,10 +136,24 @@ fn numpad_alias(k: KeyCode) -> Option<&'static str> {
 }
 
 /// Line buffer for `take_line`: characters typed since the last Enter.
-/// Accessed only with interrupts disabled inside `take_line` (the producer
-/// ring holds IRQ events; this holds assembled input).
+///
+/// M9.8-(d): guarded by [`LINE_LOCK`] instead of IF=0. IF=0 only serializes
+/// against interrupts on the *same* CPU, while the line discipline is a single
+/// shared terminal that any task on any CPU may read (SYS_READ(0)) once tasks
+/// can migrate — two CPUs assembling the same line buffer would interleave
+/// characters and corrupt `LINE_LEN`.
 static mut LINE: [u8; 128] = [0; 128];
 static mut LINE_LEN: usize = 0;
+
+/// Serializes `take_line` bodies (the only writer of `LINE`/`LINE_LEN`).
+///
+/// A dedicated lock, deliberately *not* the KSL: `take_line` echoes each
+/// consumed key to serial + console, which takes the framebuffer lock, and a
+/// mouse IRQ needs the KSL to push into the input ring — holding the KSL for
+/// the duration of an echo would make that IRQ spin for milliseconds. With
+/// this lock the only losers of a contended acquisition are concurrent line
+/// readers, which are rare and short.
+static LINE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 /// M8 line discipline: drain pending key events into the line buffer. On an
 /// Enter ('\n' or '\r') copies one completed line (newline stripped) into
@@ -146,6 +171,7 @@ static mut LINE_LEN: usize = 0;
 pub fn take_line(out: &mut [u8]) -> usize {
     let mut completed: Option<usize> = None;
     x86_64::instructions::interrupts::without_interrupts(|| {
+        let _line = LINE_LOCK.lock();
         while completed.is_none() {
             let Some(v) = ring_pop() else { break };
             // Named keys (Shift, F1, arrows, ...) are not line input yet.
@@ -195,27 +221,26 @@ pub fn take_line(out: &mut [u8]) -> usize {
 
 /// True if a complete line ('\n' or '\r') is waiting in the ring, WITHOUT
 /// consuming anything. The scheduler polls this (every 1 ms, from inside the
-/// timer handler) to wake tasks blocked in SYS_READ(0). Runs with interrupts
-/// PRESERVED (`without_interrupts`): the producer is the keyboard IRQ, and a
-/// blind `enable()` here would re-enable interrupts inside the timer handler
-/// / syscall dispatch — both of which require IF=0 (observed as random
-/// scheduler hangs).
+/// timer handler) to wake tasks blocked in SYS_READ(0).
+///
+/// M9.8-(d): lock-free — it only *reads* the SPSC ring (the producer publishes
+/// slots before advancing HEAD, and this walks with Acquire loads), so it can
+/// be called from the scheduler's wake pass on any CPU without taking a lock
+/// that the scheduled tasks might hold.
 pub fn line_pending() -> bool {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut i = unsafe { TAIL };
-        while i != unsafe { HEAD } {
-            let v = unsafe { RING[i] };
-            if v & FLAG_RAW == 0 {
-                if let Some(c) = char::from_u32(v as u32) {
-                    if c == '\n' || c == '\r' {
-                        return true;
-                    }
+    let mut i = TAIL.load(Ordering::Relaxed);
+    while i != HEAD.load(Ordering::Acquire) {
+        let v = RING[i].load(Ordering::Relaxed);
+        if v & FLAG_RAW == 0 {
+            if let Some(c) = char::from_u32(v as u32) {
+                if c == '\n' || c == '\r' {
+                    return true;
                 }
             }
-            i = (i + 1) % RING_LEN;
         }
-        false
-    })
+        i = (i + 1) % RING_LEN;
+    }
+    false
 }
 
 /// Reader task body: print any keyboard events waiting in the ring.

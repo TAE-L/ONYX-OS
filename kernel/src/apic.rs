@@ -18,7 +18,7 @@
 //! LAPIC timer owns preemption at 1000 Hz — 10x finer slices, one MMIO EOI
 //! per IRQ, no lock in the hot path.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use x86_64::registers::model_specific::Msr;
 
 use crate::{memory, pic, serial_writeln};
@@ -32,10 +32,18 @@ const LAPIC_PHYS: u64 = 0xFEE0_0000;
 const IOAPIC_PHYS: u64 = 0xFEC0_0000;
 /// Vector of the LAPIC-timer preemption interrupt.
 pub const APIC_TIMER_VECTOR: u8 = 0x30;
+/// M9.8: reschedule IPI (sent by the scheduler when a task becomes Ready on
+/// another CPU). Delivery: fixed, physical destination, edge-triggered.
+pub const RESCHED_VECTOR: u8 = 0x31;
 /// Spurious interrupt vector (programmed into SIVR).
 const SPURIOUS_VECTOR: u8 = 0xFF;
 /// Target preemption frequency.
 const TIMER_HZ: u64 = 1000;
+
+/// The calibrated periodic timer interval (LAPIC ticks per 1 ms), published by
+/// `init` and reused verbatim by every AP so all CPUs preempt at the same
+/// rate without re-running the closed-loop calibration.
+static TIMER_INTERVAL: AtomicU32 = AtomicU32::new(0);
 
 /// LAPIC register offsets (32-bit, from the LAPIC base; Intel SDM Table 11-6
 /// "Local APIC Register Address Map" — note the EOI at 0x0B0 and SIVR at
@@ -50,6 +58,9 @@ const OFF_LVT_ERROR: usize = 0x370;
 const OFF_TIMER_ICR: usize = 0x380; // initial count
 const OFF_TIMER_CCR: usize = 0x390; // current count
 const OFF_TIMER_DIV: usize = 0x3E0; // divide configuration
+/// M9.8: Interrupt Command Register (low = control/vector, high = destination).
+const OFF_ICR_LO: usize = 0x300;
+const OFF_ICR_HI: usize = 0x310;
 
 /// True once the LAPIC/IOAPIC path is live (EOI goes to the LAPIC).
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -88,8 +99,19 @@ pub fn ms_since_boot() -> u64 {
     MS.load(Ordering::Relaxed)
 }
 
-/// Called by the LAPIC-timer IRQ handler (1000 Hz).
+/// Called by the LAPIC-timer IRQ handler (1000 Hz). Only the BSP advances the
+/// global millisecond clock: with SMP every CPU's timer fires, and a shared
+/// counter advanced twice per millisecond would run sleep deadlines ~2x fast.
 pub fn tick_ms() {
+    // Every CPU counts its own LAPIC ticks (per-CPU observability); only the
+    // BSP advances the global millisecond clock, because a shared counter
+    // advanced once per millisecond *per CPU* would run sleep deadlines fast.
+    unsafe {
+        (*crate::smp::this_cpu()).timer_ticks.fetch_add(1, Ordering::Relaxed);
+    }
+    if !crate::smp::is_bsp() {
+        return;
+    }
     let n = MS.fetch_add(1, Ordering::Relaxed);
     // Bring-up heartbeat: if these stop while the PIT diag keeps printing,
     // the LAPIC timer itself died; if they continue but sleepers stay
@@ -103,6 +125,91 @@ pub fn tick_ms() {
 /// no lock, unlike the legacy PIC path.
 pub fn eoi() {
     unsafe { lapic_write(OFF_EOI, 0) };
+}
+
+/// This CPU's xAPIC id (0 if the LAPIC window is not live yet).
+pub fn lapic_id() -> u32 {
+    if LAPIC_VIRT.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    unsafe { (lapic_read(OFF_ID) >> 24) & 0xFF }
+}
+
+/// Write the Interrupt Command Register: send `icr_lo` (delivery mode, level,
+/// vector) to the LAPIC `dest_id`, then wait for delivery to be accepted.
+///
+/// Used for AP bring-up (INIT/SIPI) and the reschedule IPI. The ICR is written
+/// by the *sender*, so this touches no per-CPU state of the target.
+pub fn send_icr(dest_id: u32, icr_lo: u32) {
+    if LAPIC_VIRT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    unsafe {
+        lapic_write(OFF_ICR_HI, dest_id << 24); // physical destination
+        lapic_write(OFF_ICR_LO, icr_lo);
+        // Wait for "delivery status: idle" (bit 12) — bounded, since a dead
+        // destination only delays acceptance, never blocks it forever.
+        let mut guard = 0u32;
+        while (lapic_read(OFF_ICR_LO) & (1 << 12)) != 0 && guard < 1_000_000 {
+            guard += 1;
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// The published LAPIC timer interval (LAPIC ticks per 1 ms), 0 until
+/// `init` programs the BSP timer. APs arm their timers from this value.
+pub fn timer_interval() -> u32 {
+    TIMER_INTERVAL.load(Ordering::Relaxed)
+}
+
+/// Bring up the LAPIC on an AP (M9.8): enable the local unit, mask the LVTs
+/// (an AP runs no device drivers), program the same periodic interval the BSP
+/// calibrated, and leave interrupts to the caller's `sti`.
+///
+/// Called from `smp::ap_entry` on the AP itself. If the BSP has not published
+/// an interval yet the timer is left MASKED on purpose: programming a
+/// near-zero count would storm this core with interrupts (a livelock), while
+/// the AP still gets scheduled work through the reschedule IPI and the
+/// `preempt` in its idle loop.
+pub fn init_ap() {
+    if LAPIC_VIRT.load(Ordering::Relaxed) == 0 {
+        crate::serial_writeln!("[apic] AP: LAPIC window not live - timer not armed");
+        return;
+    }
+    let interval = TIMER_INTERVAL.load(Ordering::Relaxed);
+    unsafe {
+        // Software-enable the local APIC (bit 8) + spurious vector.
+        lapic_write(OFF_SIVR, (1 << 8) | u32::from(SPURIOUS_VECTOR));
+        // No ExtINT/NMI/error interrupts on an AP.
+        lapic_write(OFF_LVT_LINT0, 1 << 16);
+        lapic_write(OFF_LVT_LINT1, 1 << 16);
+        lapic_write(OFF_LVT_ERROR, 1 << 16);
+        // Mask the timer until the interval is known, so it cannot fire
+        // mid-setup (or with a bogus count).
+        lapic_write(OFF_LVT_TIMER, 1 << 16);
+        if interval == 0 {
+            crate::serial_writeln!(
+                "[apic] cpu {}: BSP timer interval not published - AP timer left masked (IPI-driven scheduling)",
+                crate::smp::cpu_index()
+            );
+            return;
+        }
+        lapic_write(OFF_TIMER_DIV, 0xB); // divide by 1 (matches the BSP)
+        lapic_write(OFF_TIMER_ICR, interval.max(16));
+        lapic_write(OFF_LVT_TIMER, u32::from(APIC_TIMER_VECTOR) | (1 << 17));
+        // Record what this CPU armed so `maybe_rearm_timer` can pick up the
+        // closed-loop correction later.
+        (*crate::smp::this_cpu())
+            .armed_interval
+            .store(interval.max(16), Ordering::Relaxed);
+    }
+    crate::serial_writeln!(
+        "[apic] cpu {} LAPIC enabled (id {:#x}), timer interval {} (1000 Hz)",
+        crate::smp::cpu_index(),
+        lapic_id(),
+        interval
+    );
 }
 
 /// Route one IOAPIC redirection entry: `gsi` -> `vector`, edge-triggered,
@@ -263,40 +370,92 @@ pub fn init() {
         lapic_write(OFF_TIMER_ICR, interval);
         // Periodic mode (bit 17), vector 0x30, unmasked.
         lapic_write(OFF_LVT_TIMER, u32::from(APIC_TIMER_VECTOR) | (1 << 17));
+        // Remember what this CPU armed, so `maybe_rearm_timer` can detect a
+        // later interval correction.
+        (*crate::smp::this_cpu()).armed_interval.store(interval, Ordering::Relaxed);
         interval
     });
+    // Publish the first guess IMMEDIATELY: the APs arm their own timers from
+    // this value, and the correction below is asynchronous.
+    TIMER_INTERVAL.store(first_guess, Ordering::Relaxed);
 
-    // Measure with interrupts ENABLED (the PIT and LAPIC must both fire to
-    // be compared): count how many LAPIC ticks actually fire in 50 PIT
-    // ticks (= 500 virtual ms). ~3.4x domain skew observed under TCG.
+    // The closed-loop correction runs from a KERNEL TASK, not from here. This
+    // is the boot context, and once the periodic timer is live the boot context
+    // stops being scheduled while any task is Ready — so the spin loop that
+    // used to live here never finished, which meant the correction (and every
+    // statement after `apic::init` in `kernel_main`) never ran. A task is
+    // always scheduled, and each CPU re-arms its own timer when the published
+    // interval changes (`maybe_rearm_timer`), so the correction reaches every
+    // core wherever the task happens to run.
+    crate::scheduler::spawn(calibrate_task);
+    serial_writeln!(
+        "apic: timer armed with first guess {first_guess}; closed-loop correction handed to a kernel task"
+    );
+}
+
+/// Closed-loop timer correction (the M9.6-A2 logic, moved into a task by M9.8):
+/// count how many LAPIC ticks actually fire per 50 PIT ticks (= 500 virtual ms)
+/// and rescale the interval by the measured ratio. The one-shot calibration in
+/// `init` can land in a different clock domain than QEMU's periodic-LAPIC
+/// delivery (~3.4x skew observed under TCG); on real hardware the ratio is
+/// ~1.0 and the interval barely moves.
+///
+/// It *sleeps* between checks instead of spinning, so it never burns a core
+/// for half a second, and it publishes the result rather than writing MMIO:
+/// every CPU picks the correction up in its own timer handler.
+fn calibrate_task() {
+    let first_guess = TIMER_INTERVAL.load(Ordering::Relaxed);
+    if first_guess == 0 {
+        crate::scheduler::exit_current();
+    }
     let p0 = crate::pit::ticks();
     let m0 = ms_since_boot();
     let mut guard = 0u64;
-    while crate::pit::ticks() - p0 < 50 {
+    while crate::pit::ticks().wrapping_sub(p0) < 50 {
         guard += 1;
-        if guard > 4_000_000_000 {
-            break;
+        if guard > 200 {
+            break; // PIT dead - fall through, the sanity check below catches it
         }
-        core::hint::spin_loop();
+        crate::scheduler::sleep_kernel(25); // 50 ticks = 500 ms total
     }
-    let dm = ms_since_boot() - m0;
-    let interval = if dm > 10 && dm != 50 {
+    let dm = ms_since_boot().wrapping_sub(m0);
+    let corrected = if dm > 10 && dm != 50 {
         // fired `dm` ticks where we wanted 50: rescale proportionally
         // (guarded against a zero/absurd measurement).
         (((first_guess as u64) * dm) / 50).max(16) as u32
     } else {
         first_guess
     };
-
-    // Reprogram with the corrected interval atomically (IF=0): an interrupt
-    // arriving between the ICR and LVT writes would fire the timer mid-setup.
-    serial_writeln!("apic: closed-loop B dm={}", dm);
-    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-        lapic_write(OFF_LVT_TIMER, 1 << 16); // mask while reprogramming
-        lapic_write(OFF_TIMER_ICR, interval);
-        lapic_write(OFF_LVT_TIMER, u32::from(APIC_TIMER_VECTOR) | (1 << 17));
-    });
+    TIMER_INTERVAL.store(corrected, Ordering::Relaxed);
     serial_writeln!(
-        "apic: periodic closed-loop: {dm} ticks/500ms -> interval {interval} (1000 Hz)"
+        "apic: periodic closed-loop: {dm} ticks/500ms -> interval {corrected} (first guess {first_guess}); CPUs re-arm on mismatch"
+    );
+    crate::scheduler::exit_current();
+}
+
+/// Re-arm THIS CPU's periodic timer if the published interval changed since it
+/// was armed (the closed-loop correction landing). One atomic load and compare
+/// in the common case; called at the top of the LAPIC timer handler.
+pub fn maybe_rearm_timer() {
+    let want = TIMER_INTERVAL.load(Ordering::Relaxed);
+    if want == 0 || LAPIC_VIRT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let p = crate::smp::this_cpu();
+    let armed = unsafe { (*p).armed_interval.load(Ordering::Relaxed) };
+    if armed == want {
+        return;
+    }
+    unsafe {
+        lapic_write(OFF_LVT_TIMER, 1 << 16); // mask while reprogramming
+        lapic_write(OFF_TIMER_DIV, 0xB); // divide by 1 (matches the BSP)
+        lapic_write(OFF_TIMER_ICR, want);
+        lapic_write(OFF_LVT_TIMER, u32::from(APIC_TIMER_VECTOR) | (1 << 17));
+        (*p).armed_interval.store(want, Ordering::Relaxed);
+    }
+    crate::serial_writeln!(
+        "apic: cpu {} re-armed timer: interval {} (was {armed})",
+        crate::smp::cpu_index(),
+        want
     );
 }

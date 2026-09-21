@@ -157,6 +157,52 @@ fn split2(b: &[u8]) -> (&[u8], &[u8]) {
     (a, &rest[start..])
 }
 
+/// A small output builder: the shell composes multi-part lines (path + size +
+/// type) and each `say()` is its own SYS_WRITE, so a preemption between the
+/// parts used to interleave another task's output *inside* the line (the
+/// `stat:` marker check in test-fs.ps1 is sensitive to exactly that). Building
+/// the line first and writing it once makes every line atomic.
+struct LineBuf {
+    buf: [u8; 160],
+    len: usize,
+}
+
+impl LineBuf {
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 160],
+            len: 0,
+        }
+    }
+    fn push(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+    /// Append `v` in decimal.
+    fn push_dec(&mut self, v: u64) {
+        let mut digits = [0u8; 20];
+        let mut i = digits.len();
+        let mut v = v;
+        if v == 0 {
+            digits[19] = b'0';
+            i = 19;
+        }
+        while v > 0 {
+            i -= 1;
+            digits[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        self.push(&digits[i..]);
+    }
+    fn flush(&self) {
+        say(&self.buf[..self.len]);
+    }
+}
+
 /// stat: print size + directory flag for `path` (SYS_STAT -> 16-byte record).
 fn stat_path(path: &[u8]) {
     let mut st = [0u8; 16];
@@ -168,22 +214,24 @@ fn stat_path(path: &[u8]) {
             st.as_mut_ptr() as u64,
         )
     };
+    let mut line = LineBuf::new();
+    line.push(b"stat: ");
+    line.push(path);
     if is_err(r) {
-        say(b"stat: ");
-        say(path);
         if r == (0u64).wrapping_sub(ENOENT) {
-            sayln(b": no such file");
+            line.push(b": no such file\n");
         } else {
-            sayln(b": failed");
+            line.push(b": failed\n");
         }
+        line.flush();
         return;
     }
-    say(b"stat: ");
-    say(path);
-    say(b" size=");
-    say_dec(u64::from_le_bytes([st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]]));
-    say(if st[8] != 0 { b" dir" } else { b" file" });
-    say(b"\n");
+    line.push(b" size=");
+    line.push_dec(u64::from_le_bytes([
+        st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7],
+    ]));
+    line.push(if st[8] != 0 { b" dir\n" } else { b" file\n" });
+    line.flush();
 }
 
 /// rm: remove the file at `path` (directories are rejected).
