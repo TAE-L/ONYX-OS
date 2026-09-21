@@ -8,6 +8,14 @@ use std::path::{Path, PathBuf};
 fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
+    // Rerun triggers: the kernel artifact is tracked by cargo's artifact
+    // dependency, but everything else this script consumes lives outside the
+    // package's implicit watch set — declare it explicitly or edits under
+    // user/ (program sources, mkfat seeds, linuxtest) silently don't rebuild
+    // the disk image.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=user");
+
     // Set by cargo's artifact-dependency feature for `kernel = { artifact = "bin" }`.
     let kernel = PathBuf::from(env::var_os("CARGO_BIN_FILE_KERNEL_kernel").unwrap());
 
@@ -95,6 +103,202 @@ fn strip_kernel(path: PathBuf) -> PathBuf {
     out
 }
 
+/// M9.7: build the Linux-ABI regression binary (ET_DYN static-PIE ELF).
+///
+/// `user/linuxtest` can't be a normal workspace crate: it must target
+/// `x86_64-unknown-linux-gnu` (raw Linux syscall table) and link as a static
+/// shared object (preferred vaddrs of 0 + R_X86_64_RELATIVE relocations),
+/// which exercises the loader's PIE path end to end. `core` for that target
+/// is built from `rust-src` (`-Z build-std=core`) into a nested target dir —
+/// same deadlock-avoidance pattern as `mkfat` — then the test is compiled with
+/// `rustc` and linked with `rust-lld` (`-shared -static`, no libc, entry
+/// `_start`).
+fn build_linuxtest(out_dir: &Path) -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = root.join("user").join("linuxtest").join("src").join("main.rs");
+    let elf = out_dir.join("LNXTEST.ELF");
+
+    // Skip when fresh (the nested std build is several seconds).
+    let src_time = std::fs::metadata(&src).and_then(|m| m.modified()).ok();
+    let out_time = std::fs::metadata(&elf).and_then(|m| m.modified()).ok();
+    if let (Some(s), Some(o)) = (src_time, out_time) {
+        if o > s {
+            return elf;
+        }
+    }
+
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .expect("RUSTUP_HOME must be set (portable toolchain)");
+    let toolchains = PathBuf::from(&rustup_home).join("toolchains");
+    // The pinned windows-gnu toolchain hosts both rustc and rust-lld (its
+    // rustlib dir ships the linker drivers).
+    let mut tc = None;
+    let mut toolchain_dirs: Vec<PathBuf> = std::fs::read_dir(&toolchains)
+        .expect("toolchains dir missing")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    toolchain_dirs.sort();
+    for dir in &toolchain_dirs {
+        if dir.to_string_lossy().ends_with("windows-gnu")
+            && dir.join("bin").join("rustc.exe").exists()
+        {
+            tc = Some(dir.clone());
+            break;
+        }
+    }
+    let tc = tc.expect("windows-gnu toolchain with rustc not found");
+    let rustc = tc.join("bin").join("rustc.exe");
+    let lld = tc
+        .join("lib")
+        .join("rustlib")
+        .join("x86_64-pc-windows-gnu")
+        .join("bin")
+        .join("rust-lld.exe");
+
+    // 1) `core` + `compiler_builtins` for linux-gnu from rust-src. Their out
+    // dirs are hash-suffixed; glob for the rlib/rmeta dirs after building.
+    let core_target = root.join("target").join("lnxstdcore-build");
+    let dummy = root.join("user").join("linuxtest");
+    let build = std::process::Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .args([
+            "build",
+            "--release",
+            "-Z",
+            "build-std=core",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--target-dir",
+        ])
+        .arg(&core_target)
+        .current_dir(&dummy)
+        .output()
+        .expect("failed to run cargo (build-std core for linux-gnu)");
+    assert!(
+        build.status.success(),
+        "cargo build-std core (linux-gnu) failed:\n{}{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let std_deps = core_target
+        .join("x86_64-unknown-linux-gnu")
+        .join("release")
+        .join("build");
+    let find_out = |crate_dir: &str| -> PathBuf {
+        let base = std_deps.join(crate_dir);
+        std::fs::read_dir(&base)
+            .expect("build-std out dir missing")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path().join("out"))
+            // A hash dir can hold a stale/aborted build's fingerprint with an
+            // EMPTY out dir — require actual artifacts before using it.
+            .find(|p| {
+                p.is_dir()
+                    && std::fs::read_dir(p).map(|rd| {
+                        rd.filter_map(|e| e.ok()).any(|e| {
+                            let n = e.file_name().to_string_lossy().to_string();
+                            n.ends_with(".rlib") || n.ends_with(".rmeta")
+                        })
+                    }).unwrap_or(false)
+            })
+            .expect("crate out dir missing")
+    };
+    let core_dir = find_out("core");
+    let cb_dir = find_out("compiler_builtins");
+
+    // 2) compile the test to a PIC object (panic=abort, no std).
+    let obj = out_dir.join("lnxtest.o");
+    let comp = std::process::Command::new(&rustc)
+        .args([
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--edition",
+            "2024",
+            "-C",
+            "relocation-model=pic",
+            "-C",
+            "panic=abort",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "debuginfo=0",
+            "--emit=obj",
+            "-L",
+        ])
+        .arg(&core_dir)
+        .arg("-L")
+        .arg(&cb_dir)
+        .arg("-o")
+        .arg(&obj)
+        .arg(&src)
+        .output()
+        .expect("failed to run rustc (linuxtest)");
+    assert!(
+        comp.status.success(),
+        "rustc linuxtest failed:\n{}{}",
+        String::from_utf8_lossy(&comp.stdout),
+        String::from_utf8_lossy(&comp.stderr)
+    );
+
+    // 3) link as a static ET_DYN: -shared makes the vaddrs *preferred* (the
+    // loader relocates them), -static keeps libc out, RELA relocs stay in.
+    // compiler_builtins is linked explicitly — a shared object does not pull
+    // archive members for undefined symbols the way an executable link does,
+    // so intrinsics (memcpy & co) would otherwise remain undefined imports.
+    let mut cb_rlib = None;
+    if let Ok(rd) = std::fs::read_dir(&cb_dir) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.starts_with("libcompiler_builtins") && n.ends_with(".rlib") {
+                cb_rlib = Some(e.path());
+                break;
+            }
+        }
+    }
+    let mut link_args: Vec<String> = vec![
+        "-flavor",
+        "gnu",
+        "-m",
+        "elf_x86_64",
+        "-shared",
+        "-static",
+        // Bind references to the image's own definitions directly: a
+        // static-PIE has no dynamic linker to preempt symbols, and this
+        // keeps the GOT minimal (the kernel still resolves GLOB_DAT /
+        // JUMP_SLOT through .dynsym when they do appear).
+        "-Bsymbolic",
+        "-e",
+        "_start",
+        "-z",
+        "norelro",
+        "-z",
+        "noexecstack",
+        "--build-id=none",
+        "-o",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    link_args.push(elf.to_string_lossy().into_owned());
+    link_args.push(obj.to_string_lossy().into_owned());
+    if let Some(rl) = &cb_rlib {
+        link_args.push(rl.to_string_lossy().into_owned());
+    }
+    let link = std::process::Command::new(&lld)
+        .args(&link_args)
+        .output()
+        .expect("failed to run rust-lld (linuxtest)");
+    assert!(
+        link.status.success(),
+        "rust-lld linuxtest failed:\n{}{}",
+        String::from_utf8_lossy(&link.stdout),
+        String::from_utf8_lossy(&link.stderr)
+    );
+    elf
+}
+
 /// Append a guaranteed-FAT32 filesystem as MBR partition 3 of the boot image.
 ///
 /// The bootloader only creates its own tiny internal FAT (kernel file) for
@@ -146,6 +350,9 @@ fn append_fat32_partition(image_path: &Path, out_dir: &Path) {
     let fstest_seed = copy_seed(&fstest_elf, out_dir, "FSTEST.ELF");
     let evtest_seed = copy_seed(&evtest_elf, out_dir, "EVTEST.ELF");
     let argtest_seed = copy_seed(&argtest_elf, out_dir, "ARGTEST.ELF");
+    // M9.7: a REAL Linux-ABI binary (ET_DYN static-PIE) exercised through the
+    // syscall shim — built by build_linuxtest above.
+    let lnxtest_seed = copy_seed(&build_linuxtest(out_dir), out_dir, "LNXTEST.ELF");
     let autoexec_seed = out_dir.join("AUTOEXEC.TXT");
     std::fs::write(
         &autoexec_seed,
@@ -163,6 +370,8 @@ fn append_fat32_partition(image_path: &Path, out_dir: &Path) {
             // M9.6-C1: proves the kernel tokenizes the command line and
             // builds the System V process-start stack (argc/argv/auxv).
             "run /ARGTEST.ELF alpha beta gamma\n",
+            // M9.7: raw Linux-ABI static-PIE via the syscall shim.
+            "run /LNXTEST.ELF\n",
             "echo autoexec done - entering interactive mode\n",
         ),
     )
@@ -179,6 +388,7 @@ fn append_fat32_partition(image_path: &Path, out_dir: &Path) {
         .arg(&fstest_seed)
         .arg(&evtest_seed)
         .arg(&argtest_seed)
+        .arg(&lnxtest_seed)
         .arg(&autoexec_seed)
         .output()
         .expect("failed to run mkfat");
@@ -304,7 +514,27 @@ fn append_ext2_partition(image_path: &Path, out_dir: &Path) {
 /// then stores it as a pure short-name entry the kernel FAT driver can see).
 fn copy_seed(src: &Path, out_dir: &Path, name: &str) -> PathBuf {
     let dst = out_dir.join(name);
-    std::fs::copy(src, &dst).unwrap_or_else(|e| panic!("failed to copy seed {name}: {e}"));
+    // build_linuxtest already produces its ELF in `out_dir`; copying a file
+    // onto itself fails on Windows (sharing violation), so no-op instead.
+    if src == dst {
+        return dst;
+    }
+    // Defender briefly locks freshly-written binaries (ELFs especially);
+    // retry a few times instead of failing the build on a scan window.
+    let mut last = None;
+    for _ in 0..10 {
+        match std::fs::copy(src, &dst) {
+            Ok(_) => {
+                last = None;
+                break;
+            }
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if let Some(e) = last {
+        panic!("failed to copy seed {name}: {e}");
+    }
     dst
 }
 

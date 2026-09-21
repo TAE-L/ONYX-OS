@@ -1,0 +1,10 @@
+[package]
+name = "linuxtest-stdcore"
+version = "0.0.0"
+edition = "2021"
+autobins = false
+
+[lib]
+path = "lib.rs"
+
+[workspace]
