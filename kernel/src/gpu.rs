@@ -398,6 +398,30 @@ pub fn init() {
     log(&line);
 
     // ---- 2. dispi probe: is the bochs VBE interface there? ----------------
+    // M10b first: if this is a modern virtio-gpu (virtio-vga shell), probe its
+    // capability list now — the probe result decides which backend M10b builds
+    // the command path on. The dispi path below stays the live console this
+    // increment either way; the virtio backend takes over once its command
+    // path exists.
+    if crate::virtio::is_virtio_gpu(&dev) {
+        match crate::virtio::init(&dev) {
+            Some(info) => {
+                crate::serial_writeln!(
+                    "[vgpu] backend note: virtio-gpu transport probed: {} - {} queue(s), {} scanout(s), features {:#010x}; M10b command path pending - dispi console stays live for now",
+                    info.transport(),
+                    info.num_queues,
+                    info.num_scanouts,
+                    info.device_features
+                );
+            }
+            None => {
+                crate::serial_writeln!(
+                    "[vgpu] backend note: virtio probe failed - dispi console stays \
+                     the only path (graceful)"
+                );
+            }
+        }
+    }
     let (id, revision, vram_64k) = unsafe {
         (
             dispi_read(IDX_ID),
@@ -791,6 +815,26 @@ fn task() {
         crate::serial_writeln!(
             "[gpu] task: LFB probe byte @{mid:#014x} row {row} = {probe:#04x} - mapping translates"
         );
+    }
+    // M10b transport visibility: report the virtio probe result from task
+    // context too (what the display backend will build on next).
+    match crate::virtio::device() {
+        Some(v) => crate::serial_writeln!(
+            "[vgpu] task: virtio-gpu transport: {} - queues {} scanouts {} \
+             features {:#010x} isr {}",
+            v.transport(),
+            v.num_queues,
+            v.num_scanouts,
+            v.device_features,
+            match v.caps.isr {
+                Some((b, o, l)) => alloc::format!("bar{b}/{o:#x}/{l}"),
+                None => alloc::string::String::from("none"),
+            }
+        ),
+        None if crate::virtio::probe_ok() => {
+            crate::serial_writeln!("[vgpu] task: probe ok but no device recorded")
+        }
+        None => {}
     }
     crate::serial_writeln!(
         "[gpu] task: mode {}x{}x{} on {:04x}:{:04x}, BAR{} {:#010x} (LFB {:#010x}), \

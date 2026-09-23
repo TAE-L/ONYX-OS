@@ -54,7 +54,7 @@ Two signature goals beyond "a working hobby OS":
 | **M9.6** | **Core hardening + missing subsystems** — A: upgrades (TSC ns timekeeping ✅, APIC/IOAPIC + LAPIC timer ✅, scheduler v2 ✅, FPU/SIMD save-restore ✅, block cache ✅, frame alloc v2 ✅) · B: missing subsystems (PCI ✅, ACPI ✅, process lifecycle ✅, raw input ring ✅, `perf` instrumentation ✅) · C: ABI/file-API foundation (argv/envp/auxv ✅, user-pointer validation ✅, errno ✅, mount table) | **done** — A1–A6, B1–B5, C1–C3 all complete; M9.6 regressions pass on BIOS + UEFI (test-fs, test-sched, test-proc, test-block, test-memory, test-pci, test-acpi, test-raw, test-input, test-fpu, test-time, test-args). |
 | **M9.7** | **Linux ABI compat — run static Linux ELFs**: syscall-number shim, argv/envp/auxv, `arch_prctl` TLS, mmap/brk, PIE/relocations | ✅ done |
 | **M9.8** | **SMP — multi-core** (its own stage, per decision): MADT-driven AP startup, per-CPU data, per-CPU run queues + IPIs | ✅ done — GS-base per-CPU blocks, INIT-SIPI-SIPI AP bring-up through a hand-assembled low-page trampoline, per-CPU GDT/TSS + IDT + LAPIC timers, reschedule IPI, per-CPU RSP/syscall slots, boot context restored as a task, kernel-service lock (`ksl`) + input/keyboard/mouse locking, **task migration with work stealing**, stall diagnostic re-based on provable starvation, and the `xsave64`/`xrstor64` EDX:EAX mask bug fixed (AVX/YMM now survives switches under migration); `test-smp.ps1` passes at `-smp 1/2/4`, `test-avx.ps1` at `-smp 4 -cpu max` (200+ rounds, zero failures), all 25 suites green |
-| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b/c direction updated: **virtio-gpu becomes the primary backend** (modern paravirtual GPU: DMA resources, command virtqueues, host-GPU 3D via virgl), the dispi driver stays as the legacy fallback backend |
+| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b stage 1 ✅ **done** (virtio-gpu transport probe: four capability regions, VERSION_1 negotiated, 2 queues/1 scanout, `virgl=1 ctx=1` on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green); M10b/c direction: **virtio-gpu is the primary backend** (DMA resources, command virtqueues, host-GPU 3D via virgl), the dispi driver stays as the legacy fallback backend |
 | M11 | NTFS read-only + multi-drive mounting | extra Windows compat |
 | **M12** | **PE foundation**: parse `.exe` / `.dll` (PE/COFF), relocations, DLL imports groundwork | solid foundation only |
 | M13 | GUI: window manager + compositor + built-in apps (terminal, file manager) | apps on the M9.5 base |
@@ -559,7 +559,15 @@ leaves the single-CPU path untouched.
   1024x768) verified exactly.
 - Fallback rehearsal: bogus 16bpp write caught by the read-back check and
   restored + re-verified, every boot (`fallbacks=0 rehearsals=1`).
-- External confirmation: QEMU `screendump` geometry follows the kernel-chosen
+- External confirmation: QEMU `screendump` geometry follows the *kernel's*
+  mode, not the firmware's (1920x1080 after the resize-capable runs; 1024x768
+  in the earlier 3 MiB run) — read straight off the monitor socket.
+- Scheduler-task probe: the dispi registers still read `1920x1080x32 enable=1`
+  from a real scheduled task (on which CPU does not matter), and the LFB byte
+  probe translates — the modeset survives the boot→scheduler hand-over.
+- Suites: `test-gpu.ps1` ×2 (QEMU default 16 MiB VRAM + `vgamem_mb=128`) green;
+  `test-smp`, `test-avx`, `test-fs`, `test-shell`, `test-pci` all green after
+  the kernel changes.
 
 ### M10a — bugs found in my own logic and how each was solved
 
@@ -608,15 +616,83 @@ mode from a scheduler task, run the fallback rehearsal (bogus mode caught,
 good mode restored), complete the full boot flow (fstest PASSED, interactive
 shell) with no actual fallback and no unexpected exception.
 
+## M10b stage 1 — virtio-gpu transport probe (done)
 
-  mode (1920x1080 after the resize-capable runs).
-- Scheduler-task probe: dispi registers still `1920x1080x32 enable=1` from a
-  scheduled task; LFB byte probe translates.
-- Suites: `test-gpu.ps1` ×2 (default VRAM + 128 MiB) green;
-  `test-smp`, `test-avx`, `test-fs`, `test-shell`, `test-pci` all green after
-  the kernel changes.
+**Scope:** the first increment of the M10b redefinition (M9.8 bug 5): decode
+the virtio-gpu PCI device *before* touching its queues, so every later
+increment (virtqueues, GEM-lite resources, damage-rect present, virgl 3D) lands
+on a verified transport. Kernel code:
 
+- `pci.rs`: multi-function display scan (function 0 *and* 1 — virtio-vga and
+  virtio-gpu-pci present as 00:02.0 + 00:02.1), `find_virtio()` by vendor 1af4
+  device 1050/1052, `virtio_caps()` walking the PCI capability list through the
+  *config-port* path (IF=0-safe, same discipline as the BAR sizing probe).
+- `virtio.rs` (new): modern-transport probe — status machine
+  (ACK|DRIVER → VERSION_1 → FEATURES_OK), the four capability regions (common /
+  notify with its multiplier / ISR / device config) located and MMIO-mapped,
+  the virtio-gpu control virtqueue size/alignment recorded (queue not yet
+  started — stage 2), device feature bits decoded with named GPU bits
+  (virgl / edid / blob / context_init).
+- `gpu.rs`: the scheduler task re-reports the probe result (`[vgpu] task:`
+  line) — transport state survives the boot→scheduler hand-over.
 
+**Measured** (`test-gpu.ps1`, four boots, run twice — exit 0 both times):
+
+| boot | device | result |
+|------|--------|--------|
+| 1 | std-VGA, `-global VGA.vgamem_mb=128` | M10a assertions green: 1920x1080x32 dispi modeset, canary, task re-verify |
+| 2 | std-VGA, default 16 MiB | identical — the mode does not depend on extra VRAM |
+| 3 | `-vga virtio` (1af4:1050) | all four capability regions decoded (`common bar2+0x1000/2048 → notify bar2+0x3000/4096 (mul 4) → isr bar2+0x1800/2048 → device bar2+0x2000/4096`), VERSION_1 negotiated, 2 queues / 1 scanout, feature bits decoded — and the full M10a set green on the modern device too |
+| 4 | `-vga none -device virtio-vga-gl` + `egl-headless,gl=on` | same probe **and `virgl=1 ctx=1`** — the host-GPU 3D path exists on the emulated device (M10c/M10d foundation) |
+
+Suites after the kernel changes: `test-gpu.ps1` ×2, `test-smp.ps1`,
+`test-avx.ps1`, `test-fs.ps1`, `test-shell.ps1` — all exit 0. `build.ps1`
+clean (image rebuilt before every run).
+
+### M10b stage 1 — bugs found and how each was solved
+
+1. **`-like` treats `[gpu]` as a character class.** Every marker assertion of
+   the form `'*[gpu] scan: ...*'` matched nothing: in a PowerShell wildcard
+   `[gpu]` means "one character from {g,p,u}", so a pattern containing its own
+   brackets can never match the literal marker. Fix: assertions now use
+   substring `.Contains()` on plain ASCII fragments — which also immunizes them
+   against the second hazard: the kernel's UTF-8 log separators (`→`) decode as
+   replacement glyphs when PowerShell reads the serial log in ANSI mode.
+2. **`$fail +=` inside a function silently drops the failures.** PowerShell
+   scoping: the `+=` reads the parent's array but assigns to a *local*
+   variable, so the top level never sees what `Check-Boot` found — the suite
+   would have "passed" with every boot broken. Fix: `$script:fail` for every
+   append made from inside a function.
+3. **`test-gpu.ps1` got structurally scrambled during multi-region edits.**
+   Patching three regions in one pass left `Has-Line`'s closing brace missing
+   and spliced the four boots *inside* `Check-Boot`'s body, nesting
+   `Check-Boot` inside `Has-Line` — it parsed only by luck and ran the boots in
+   the wrong scope with failures going nowhere. Fix: deleted the file, rewrote
+   it whole, and required `[Parser]::ParseFile` to report zero errors before
+   any run. Rule: structural edits to test scripts get an AST parse check
+   before execution.
+4. **Running a suite in the live shell kills the session / loses output.**
+   The scripts' top-level `Exit` terminates the *interactive* shell, and
+   `Write-Host` bypasses stdout redirection so `*>` captures nothing. Fix:
+   suites run as a child `powershell -NoProfile -ExecutionPolicy Bypass
+   -File ... *> file`, and the rewritten script emits `Write-Output` only.
+5. **Boot 4 needed `-vga none` to actually expose the *gl* device.** With
+   QEMU's default VGA also instantiated, the legacy/virtio instance is primary
+   and the virgl-capable configuration is never the one asserted — yet bare
+   `-vga none` is unbootable (M10a bug 4). `-vga none -device virtio-vga-gl`
+   *is* bootable because virtio-vga provides its own scanout + BIOS path.
+   Fix: `Invoke-Boot` takes the `-vga` value and the extra `-device` as
+   independent parameters.
+
+### M10b stage 1 success criteria
+
+Four boots in `test-gpu.ps1` (the two M10a boots plus virtio-vga and
+virtio-vga-gl): every M10a assertion green on all four; the four virtio
+capability regions decoded on the virtio boots; VERSION_1 negotiated with
+2 queues + 1 scanout reported; `virgl=1 ctx=1` on the gl boot; the transport
+probe re-reported from the scheduler task; full boot flow (fstest PASSED,
+interactive shell) complete with no unexpected exception — suite exits 0
+twice in a row.
 
 ## M9.5 — Graphical desktop userspace (DEFERRED)
 

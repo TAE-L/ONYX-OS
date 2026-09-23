@@ -37,6 +37,7 @@ mod syscall;
 mod time;
 mod userspace;
 mod vfs;
+mod virtio;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;

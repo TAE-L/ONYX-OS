@@ -6,12 +6,12 @@
 //! function by class/subclass with a small vendor/device name table.
 //!
 //! The device list is kept for the shell's `lspci` command (SYS_LSPCI) and
-//! for the M10 GPU track ??? the VGA controller's BARs are the framebuffer's
-//! next address source once the full GPU driver lands.
+//! for the M10 GPU track: the display controller's BARs are the framebuffer's
+//! next address source, and M10a probes the display function's MEM BARs so the
+//! driver knows the linear framebuffer's real size.
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
@@ -23,19 +23,6 @@ const VENDOR_NONE: u16 = 0xFFFF;
 /// Base class code of a display controller (VGA compatible subclass 0x00).
 /// M10a drives the first function of this class found on the bus.
 pub const CLASS_DISPLAY: u8 = 0x03;
-
-/// Set when the config-space scan found no display-class function, so the boot
-/// path can put a visible `[gpu]` line on the *framebuffer console* as well as
-/// on serial. Without this, a machine with no display controller (`-vga none`)
-/// would leave the screen frozen on the bootloader's last write — the log line
-/// alone is not discoverable by someone looking at the monitor.
-pub static NO_DISPLAY: AtomicBool = AtomicBool::new(true);
-
-/// Whether the boot scan saw a display-class function. `true` before `pci::init`
-/// finishes scanning (optimistic: "assume there is one").
-pub fn display_seen() -> bool {
-    !NO_DISPLAY.load(Ordering::Relaxed)
-}
 
 /// One PCI function found on the bus.
 #[derive(Clone, Copy)]
@@ -115,6 +102,35 @@ fn config_read_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
         a.write(addr);
         d.read()
     }
+}
+
+/// Byte-granular config read — the virtio capability list (M10b) has
+/// unaligned fields (cap type at +3, BAR index at +4, 32-bit offsets at
+/// +5/+9), which the 4-byte-aligned `config_read_u32` cannot address.
+#[inline]
+fn config_read_u8(bus: u8, device: u8, function: u8, offset: u8) -> u8 {
+    let addr = 0x8000_0000u32
+        | (u32::from(bus) << 16)
+        | (u32::from(device) << 11)
+        | (u32::from(function) << 8)
+        | u32::from(offset & 0xFC);
+    let mut a = Port::new(CONFIG_ADDR);
+    let mut d = Port::new(CONFIG_DATA);
+    unsafe {
+        a.write(addr);
+        let v: u32 = d.read();
+        (v >> (8 * u32::from(offset & 3))) as u8
+    }
+}
+
+/// The byte-granular config reads M10b's virtio capability walk needs.
+/// (M10a only needed BAR bases and the header/regs above, which are aligned.)
+pub(crate) fn config_byte(f: &PciFunction, offset: u8) -> u8 {
+    debug_assert!(
+        !x86_64::instructions::interrupts::are_enabled(),
+        "PCI config access with interrupts enabled (see M9.6-B1)"
+    );
+    config_read_u8(f.bus, f.device, f.function, offset)
 }
 
 #[inline]
@@ -307,10 +323,10 @@ pub fn init() {
     crate::framebuffer::console_bytes(
         alloc::format!("[pci] {} pci functions found\n", count).as_bytes(),
     );
-    // M10a: remember whether this machine has a display controller *at all*, so
-    // the GPU track can tell "no device" (nothing to do) from "device present but
-    // modesetting failed" (a real bug) — and so the absence is visible on screen.
-    NO_DISPLAY.store(!devices.iter().any(|d| d.class == CLASS_DISPLAY), Ordering::Relaxed);
+    // M10a: the GPU track asks the registry for the display function itself
+    // (`find_display`); a machine with no display controller is the "*no device*"
+    // case there, which reads very differently from "device present but
+    // modesetting failed" (a real bug) — the M10a bug log has that story.
     *DEVICES.lock() = devices;
 }
 
