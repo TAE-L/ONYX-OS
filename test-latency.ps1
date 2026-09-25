@@ -103,8 +103,12 @@ try {
     if ($mon) { $mon.Close() }
 }
 
-# Give the flusher time to close at least one latency window and print it.
-Start-Sleep -Seconds 7
+# Give the flusher time to close at least one latency window, and the
+# kernel-local probe time to fire. The probe waits ~8s after present, then
+# needs the console IDLE for a full second before each sample, so a busy
+# console can delay its first sample well past the injection phase. Wait
+# generously so the probe assertion is not timing-flaky.
+Start-Sleep -Seconds 20
 if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 Start-Sleep -Milliseconds 500
 
@@ -159,6 +163,11 @@ if (-not (Has-Line $content @('[vgpu] present: flusher scheduled', 'adaptive cad
 }
 if (-not (Has-Line $content @('[vgpu] pacing:', 'presents', 'interval'))) {
     $script:fail += 'latency: no frame-interval (pacing) stats reported (M10b 4)'
+}
+# M10b 7: the kernel-local probe isolates PURE present-path latency (no
+# ring-3 shell/input in the loop). Require at least one probe sample.
+if (-not (Has-Line $content @('[vgpu] probe: kernel-local draw->present', 'n=', 'avg='))) {
+    $script:fail += 'latency: no kernel-local probe sample (pure present latency not measured)'
 }
 if ($content | Where-Object { $_ -match 'EXCEPTION' -and $_ -notmatch 'Breakpoint' }) {
     $script:fail += 'latency: unexpected exception occurred'

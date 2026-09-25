@@ -1426,6 +1426,9 @@ pub fn present_bringup(width: usize, height: usize) -> bool {
     // the software cursor is the fallback. Enabling the cursor must never be
     // able to block the console from being scheduled.
     hardware_cursor_enable();
+    // M10b 7: spawn the kernel-local present-latency probe once the present
+    // path is live. Pure measurement task; failure to spawn is harmless.
+    spawn_present_probe();
     true
 }
 
@@ -1490,6 +1493,45 @@ static PRESENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 /// How many times the damage path woke the flusher (M10b 6). Reported so the
 /// event-driven path's contribution is visible.
 static PRESENT_WAKEUPS: AtomicU64 = AtomicU64::new(0);
+
+/// M10b 7: a KERNEL-LOCAL single-rect draw task, used to measure PURE present
+/// latency with no ring-3 shell / echo / input in the loop.
+///
+/// The `sendkey` workload (stage 5/6) drives a draw through the ring-3 shell,
+/// whose task scheduling sits UPSTREAM of the damage mark and inflates the
+/// measured response. This task instead stamps a small marker rect straight
+/// into the console surface (exactly one glyph-sized box, marked via the same
+/// `console_bytes`/`draw` damage path the flusher watches), waits for the
+/// console to be idle, and does it again — so the only thing between the draw
+/// and the present is the present path itself.
+///
+/// It draws an invisible one-pixel-tall marker at the very bottom of the
+/// console region, far from any text, so it does not disturb the visible
+/// screen or the boot-flow assertions.
+fn present_probe_task() {
+    // Let the boot/autoexec console burst finish first: the probe must not
+    // compete with the boot flow (waking the RT flusher every couple of seconds
+    // during boot IS a regression, measured). A fixed post-boot delay is the
+    // whole gate: gating on "console idle" deadlocked, because the flusher's own
+    // present traffic keeps the damage generation changing.
+    crate::scheduler::sleep_kernel(8000);
+    loop {
+        // Draw ONE isolated marker rect through the framebuffer surface
+        // (bypassing the ring-3 console text path, which is what inflated the
+        // stage-6 numbers). This is the start of one draw->present sample.
+        crate::framebuffer::draw_probe_marker();
+        // Pace the probe well below the flusher cadence so a sample is never
+        // riding on top of the previous one's present.
+        crate::scheduler::sleep_kernel(1000);
+    }
+}
+
+/// Spawn the kernel-local present-latency probe (M10b 7). Only on the virtio
+/// present path (there is nothing to measure on the dispi backend). Best-effort:
+/// a failure to spawn just means the probe metric stays empty.
+pub fn spawn_present_probe() {
+    crate::scheduler::spawn(present_probe_task);
+}
 
 /// M10b 6 (event-driven present): called by the damage path on an empty ->
 /// non-empty damage transition. Wakes the flusher task so a drawn change is
@@ -1711,6 +1753,14 @@ pub fn flush_loop() {
             Ok(()) => {
                 FLUSH_BYTES.fetch_add((w * h * 4) as u64, Ordering::Relaxed);
                 failures = 0;
+                // M10b 7: kernel-local probe sample (draw -> present) - the pure
+                // present-path latency with no shell/input in the loop.
+                if let Some(probe_ns) = crate::framebuffer::latency::take_probe_pending() {
+                    let now_ns = crate::time::now_ns();
+                    if now_ns > probe_ns {
+                        crate::framebuffer::latency::record_probe(now_ns - probe_ns);
+                    }
+                }
                 // M10b 5: attribute the wait. `damage_marked -> wake_ns` is how
                 // long the change sat before the flusher was even running
                 // again (scheduling), which the quantum does not control.
@@ -1851,6 +1901,17 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
     if wakeups > 0 {
         log(&alloc::format!(
             "[vgpu] response: event-driven wakeups={wakeups} (damage woke the flusher directly)"
+        ));
+    }
+    // M10b 7: the KERNEL-LOCAL probe - pure present latency, no shell/input.
+    let pr = crate::framebuffer::latency::reset_window_probe();
+    if pr.samples > 0 {
+        log(&alloc::format!(
+            "[vgpu] probe: kernel-local draw->present n={} avg={} us min={} us max={} us",
+            pr.samples,
+            pr.sum_us / pr.samples,
+            if pr.min_us == u64::MAX { 0 } else { pr.min_us },
+            pr.max_us
         ));
     }
     if lat.samples == 0 && hw.samples == 0 {

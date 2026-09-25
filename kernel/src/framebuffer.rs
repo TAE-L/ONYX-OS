@@ -316,6 +316,55 @@ pub mod latency {
     static HW_MAX_US: AtomicU64 = AtomicU64::new(0);
     static HW_SUM_US: AtomicU64 = AtomicU64::new(0);
 
+    /// M10b 7: probe accounting — a KERNEL-LOCAL single-rect draw, issued from
+    /// a dedicated task with NO ring-3 shell, ring-3 echo, or input in the
+    /// loop. This is the only measurement of pure present-path latency, because
+    /// the `sendkey` workload routes through the ring-3 shell whose scheduling
+    /// sits UPSTREAM of the damage mark and inflates the number (stage 6).
+    static PROBE_PENDING_NS: AtomicU64 = AtomicU64::new(0);
+    static PROBE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    static PROBE_SUM_US: AtomicU64 = AtomicU64::new(0);
+    static PROBE_MIN_US: AtomicU64 = AtomicU64::new(u64::MAX);
+    static PROBE_MAX_US: AtomicU64 = AtomicU64::new(0);
+
+    /// Stamp that a probe draw is about to happen (kernel-local).
+    #[inline]
+    pub fn note_probe(now_ns: u64) {
+        PROBE_PENDING_NS.store(now_ns, AtomicOrdering::Relaxed);
+    }
+
+    /// Take the pending probe stamp, if a probe draw is waiting to be shown.
+    #[inline]
+    pub fn take_probe_pending() -> Option<u64> {
+        let ns = PROBE_PENDING_NS.swap(0, AtomicOrdering::Relaxed);
+        if ns == 0 { None } else { Some(ns) }
+    }
+
+    /// Record one kernel-local probe sample (draw -> present).
+    pub fn record_probe(delta_ns: u64) {
+        let us = delta_ns / 1_000;
+        PROBE_SAMPLES.fetch_add(1, AtomicOrdering::Relaxed);
+        PROBE_SUM_US.fetch_add(us, AtomicOrdering::Relaxed);
+        let mut cur = PROBE_MIN_US.load(AtomicOrdering::Relaxed);
+        while us < cur {
+            match PROBE_MIN_US.compare_exchange_weak(cur, us, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed) {
+                Ok(_) => break,
+                Err(a) => cur = a,
+            }
+        }
+        PROBE_MAX_US.fetch_max(us, AtomicOrdering::Relaxed);
+    }
+
+    /// Reset the probe window and return its summary.
+    pub fn reset_window_probe() -> Snapshot {
+        Snapshot {
+            samples: PROBE_SAMPLES.swap(0, AtomicOrdering::Relaxed),
+            min_us: PROBE_MIN_US.swap(u64::MAX, AtomicOrdering::Relaxed),
+            max_us: PROBE_MAX_US.swap(0, AtomicOrdering::Relaxed),
+            sum_us: PROBE_SUM_US.swap(0, AtomicOrdering::Relaxed),
+        }
+    }
+
     /// Monotonic nanosecond stamp of the most recent cursor move, or 0 if the
     /// current dirty rect did not come from a cursor move. Read (and cleared)
     /// by the flusher when it presents.
@@ -1190,6 +1239,47 @@ impl TextConsole {
 /// so `refresh_cursor_save` must also stay inside the IF=0 window. The
 /// window is one line of glyphs (~sub-millisecond); the LAPIC periodic timer
 /// coalesces the ticks landing in it, matching the observed apic_ms drift.
+/// Draw one isolated, kernel-local marker rect and mark exactly it dirty
+/// (M10b 7).
+///
+/// This is the *pure* present-latency probe: it writes a single small block
+/// straight into the framebuffer surface (not through the ring-3 console text
+/// path, whose scheduling sat upstream of the damage mark and inflated the
+/// stage-5/6 numbers), so nothing but the present path stands between the
+/// write and the device. The probe instant is stamped here so the flusher can
+/// compute draw->present. The marker is background slate at the bottom-left,
+/// far from any text, so it is visually a no-op.
+pub fn draw_probe_marker() {
+    latency::note_probe(crate::time::now_ns());
+    // A 4x4 block is a single tiny damage rect, well clear of text/header.
+    const P: usize = 4;
+    // Hold FB with interrupts OFF, the same discipline every other console
+    // draw uses: the mouse IRQ handler (move_cursor) also takes FB, so a spin
+    // lock taken here with interrupts ON could be preempted by that handler,
+    // which would then spin forever on a lock nobody can release.
+    let (x0, y0) = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut slot = FB.lock();
+        let Some(w) = slot.as_mut() else {
+            return (0, 0);
+        };
+        let x0 = 2usize;
+        let y0 = w.info.height.saturating_sub(P + 2);
+        for y in y0..(y0 + P).min(w.info.height) {
+            for x in x0..(x0 + P).min(w.info.width) {
+                w.set_pixel(x, y, 0x0E1420); // background slate: a visual no-op
+            }
+        }
+        (x0, y0)
+    });
+    if x0 == 0 && y0 == 0 {
+        return; // no writer installed
+    }
+    // Mark exactly this rect (the writer path does not auto-mark damage).
+    // Outside the IF=0 window: the damage lock must never be held across a
+    // preemption, and this only takes a mutex briefly.
+    mark_dirty_rect(x0, y0, x0 + P - 1, y0 + P - 1);
+}
+
 pub fn console_bytes(data: &[u8]) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         {
