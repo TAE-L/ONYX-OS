@@ -129,6 +129,42 @@ impl BootInfoFrameAllocator {
         None
     }
 
+    /// M10b stage 2: allocate `count` physically contiguous frames from the
+    /// bump cursor ONLY — the free list is single-frame and may be fragmented,
+    /// so it is deliberately ignored (and never mixed in: the returned range
+    /// must be one unbroken physical span for the virtio-gpu's scanout
+    /// backing, which the device DMAs from a single address).
+    ///
+    /// O(usable regions) per call, same scan shape as `allocate_frame`.
+    /// Returns `None` (counting `oom`) when no region holds the span.
+    ///
+    /// # Safety contract (callers): same as any allocation — the returned
+    /// frame range is now owned by the caller and must never be freed; it was
+    /// never on the free list, so `deallocate_frame` must not see it.
+    pub fn allocate_contiguous(&mut self, count: u64) -> Option<PhysFrame<Size4KiB>> {
+        if count == 0 {
+            return None;
+        }
+        let size = Size4KiB::SIZE;
+        let bytes = count.checked_mul(size)?;
+        for r in self.memory_regions {
+            if r.kind != MemoryRegionKind::Usable {
+                continue;
+            }
+            let r_start = r.start as u64;
+            let r_end = r.end as u64;
+            let aligned_start = (r_start + size - 1) / size * size;
+            let cand = aligned_start.max(self.bump_next);
+            if cand <= r_end && bytes <= r_end - cand {
+                self.bump_next = cand + bytes;
+                self.used += count;
+                return Some(PhysFrame::containing_address(PhysAddr::new(cand)));
+            }
+        }
+        self.oom += 1;
+        None
+    }
+
     /// Return a frame to the free list (A6 v2 — the x86_64 `FrameAllocator`
     /// trait has no deallocation, so this is an inherent extension). O(1):
     /// the frame becomes the new free-list head, its first 8 bytes now hold
@@ -252,6 +288,15 @@ pub fn with_global_frames<R>(f: impl FnOnce(&mut BootInfoFrameAllocator) -> R) -
 /// oom)`. `None` before `init_global_frames` (boot phase still owns it).
 pub fn frame_stats() -> Option<(u64, u64, u64, u64)> {
     with_global_frames(|f| f.stats())
+}
+
+/// M10b stage 2: allocate `count` physically contiguous frames (bump-only —
+/// see [`BootInfoFrameAllocator::allocate_contiguous`]). Returns the first
+/// frame's physical address; `None` on OOM, `count == 0`, or before
+/// `init_global_frames` (boot phase still owns the allocator).
+pub fn alloc_contiguous(count: u64) -> Option<u64> {
+    with_global_frames(|f| f.allocate_contiguous(count))?
+        .map(|frame| frame.start_address().as_u64())
 }
 
 

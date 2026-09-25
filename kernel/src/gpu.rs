@@ -720,7 +720,7 @@ const CANARY_TAG: u32 = 0xA500_0000;
 ///
 /// All three regions stay inside the mode's own 3 MiB surface, so the writes
 /// are inside the BAR even if the (probed) BAR size were wrong.
-fn canary_points(w: usize, h: usize) -> Vec<(usize, usize)> {
+pub(crate) fn canary_points(w: usize, h: usize) -> Vec<(usize, usize)> {
     let mut pts = Vec::with_capacity(3 * CANARY_PER_REGION);
     for dy in 0..8 {
         for dx in 0..8 {
@@ -743,7 +743,7 @@ fn canary_value(x: usize, y: usize) -> u32 {
 ///
 /// Byte-wise, little-endian: independent of the pixel format, so it works the
 /// same for the 32bpp dispi surface and any other layout.
-fn canary_roundtrip(fb: &mut [u8], w: usize, points: &[(usize, usize)]) -> (u32, u32) {
+pub(crate) fn canary_roundtrip(fb: &mut [u8], w: usize, points: &[(usize, usize)]) -> (u32, u32) {
     let stride = w * MODE_BPP;
     let mut expected = 0u32;
     for &(x, y) in points {
@@ -861,6 +861,14 @@ fn task() {
         },
         m.enable
     );
+    // M10b stage 2: hand the console to the virtio-gpu scanout when the
+    // transport is there, and become its flusher. On a non-virtio machine
+    // `present_bringup` returns false after one honest log line and the task
+    // exits exactly as before — the graceful path, asserted by test-gpu boots
+    // 1/2. On success this does NOT return: the flusher owns this task.
+    if crate::virtio::present_bringup(m.width, m.height) {
+        crate::virtio::flush_loop();
+    }
     crate::scheduler::exit_current();
 }
 

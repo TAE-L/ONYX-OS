@@ -54,7 +54,7 @@ Two signature goals beyond "a working hobby OS":
 | **M9.6** | **Core hardening + missing subsystems** — A: upgrades (TSC ns timekeeping ✅, APIC/IOAPIC + LAPIC timer ✅, scheduler v2 ✅, FPU/SIMD save-restore ✅, block cache ✅, frame alloc v2 ✅) · B: missing subsystems (PCI ✅, ACPI ✅, process lifecycle ✅, raw input ring ✅, `perf` instrumentation ✅) · C: ABI/file-API foundation (argv/envp/auxv ✅, user-pointer validation ✅, errno ✅, mount table) | **done** — A1–A6, B1–B5, C1–C3 all complete; M9.6 regressions pass on BIOS + UEFI (test-fs, test-sched, test-proc, test-block, test-memory, test-pci, test-acpi, test-raw, test-input, test-fpu, test-time, test-args). |
 | **M9.7** | **Linux ABI compat — run static Linux ELFs**: syscall-number shim, argv/envp/auxv, `arch_prctl` TLS, mmap/brk, PIE/relocations | ✅ done |
 | **M9.8** | **SMP — multi-core** (its own stage, per decision): MADT-driven AP startup, per-CPU data, per-CPU run queues + IPIs | ✅ done — GS-base per-CPU blocks, INIT-SIPI-SIPI AP bring-up through a hand-assembled low-page trampoline, per-CPU GDT/TSS + IDT + LAPIC timers, reschedule IPI, per-CPU RSP/syscall slots, boot context restored as a task, kernel-service lock (`ksl`) + input/keyboard/mouse locking, **task migration with work stealing**, stall diagnostic re-based on provable starvation, and the `xsave64`/`xrstor64` EDX:EAX mask bug fixed (AVX/YMM now survives switches under migration); `test-smp.ps1` passes at `-smp 1/2/4`, `test-avx.ps1` at `-smp 4 -cpu max` (200+ rounds, zero failures), all 25 suites green |
-| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b stage 1 ✅ **done** (virtio-gpu transport probe: four capability regions, VERSION_1 negotiated, 2 queues/1 scanout, `virgl=1 ctx=1` on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green); M10b/c direction: **virtio-gpu is the primary backend** (DMA resources, command virtqueues, host-GPU 3D via virgl), the dispi driver stays as the legacy fallback backend |
+| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b stage 1 ✅ **done** (virtio-gpu transport probe: four capability regions, VERSION_1 negotiated, 2 queues/1 scanout, `virgl=1 ctx=1` on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green); M10b stage 2 ✅ **done** (control virtqueue engine + GEM-lite resource: queue → DRIVER_OK → CREATE_2D/ATTACH_BACKING → canary → SET_SCANOUT/TRANSFER+FLUSH → console adopt + 100 ms flusher on `-vga virtio`; graceful no-transport fallback on std-VGA, documented virgl 2D-skip on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green, QEMU `guest_errors` empty); M10b stage 3 (next): damage-rect flush tracking, scatter-gather backing, cursor queue, virgl/3D; M10b/c direction: **virtio-gpu is the primary backend** (DMA resources, command virtqueues, host-GPU 3D via virgl), the dispi driver stays as the legacy fallback backend |
 | M11 | NTFS read-only + multi-drive mounting | extra Windows compat |
 | **M12** | **PE foundation**: parse `.exe` / `.dll` (PE/COFF), relocations, DLL imports groundwork | solid foundation only |
 | M13 | GUI: window manager + compositor + built-in apps (terminal, file manager) | apps on the M9.5 base |
@@ -693,6 +693,122 @@ capability regions decoded on the virtio boots; VERSION_1 negotiated with
 probe re-reported from the scheduler task; full boot flow (fstest PASSED,
 interactive shell) complete with no unexpected exception — suite exits 0
 twice in a row.
+
+## M10b stage 2 — control virtqueue + GEM-lite resource + present path (done)
+
+**Scope:** the second increment. Stage 1 decoded the transport and left the
+device at `FEATURES_OK` with no queues; stage 2 gives it ONE queue (the
+controlq) and uses it to draw a scanout out of ordinary guest RAM, take the
+display over from dispi, and adopt the console onto it. Kernel code:
+
+- `pci.rs`: `config_or_u16(f, offset, mask)` — a 16-bit read-modify-write of a
+  config register through the aligned u32 path. Used once, for the PCI
+  *command* register: the driver sets IO|MEM|**bus master** itself, because
+  without bit 2 the device may not DMA the rings and every doorbell is
+  silently ignored.
+- `memory.rs`: `allocate_contiguous(count)` (bump-cursor only — the free list
+  is single-frame and may be fragmented) + the `alloc_contiguous` wrapper.
+  The scanout backing must be one unbroken physical span; scatter-gather
+  multi-entry backing is stage 3.
+- `virtio.rs`: the controlq engine. One 4 KiB frame holds the whole split ring
+  (desc @0x000, avail @0x400, used @0x800, size ≤ 64); a second frame holds
+  the command request/response pair. Every ring byte is reached through the
+  bootloader's physical-memory window, so the device DMAs exactly the
+  addresses programmed into the common config — no page-table edits on the
+  device-DMA path. `queue_init` programs the queue, computes the doorbell
+  (`notify_base + notify_off_multiplier × queue_notify_off`) and latches
+  `DRIVER_OK` only after the read-backs verify. `submit` publishes two chained
+  descriptors, rings the doorbell (value = queue index, since
+  NOTIFICATION_DATA was not negotiated) and polls the used ring.
+- `virtio.rs`: the 2D command set — `RESOURCE_CREATE_2D` →
+  `RESOURCE_ATTACH_BACKING` → `SET_SCANOUT` → `TRANSFER_TO_HOST_2D` →
+  `RESOURCE_FLUSH`, each a 24-byte control header plus its verified payload
+  (exact lengths, padding fields included). `present_bringup` runs the whole
+  sequence with a canary on the backing *before* the scanout moves, and adopts
+  the console onto the virtio surface **last**. `flush_loop` re-pushes the full
+  rect every 100 ms and is the GPU task's permanent job.
+- `gpu.rs`: the task hook — `present_bringup(m.width, m.height)`, and on
+  success the task becomes the flusher instead of exiting.
+
+**Measured** (`test-gpu.ps1`, four boots, run twice — exit 0 both times):
+
+| boot | device | result |
+|------|--------|--------|
+| 1 | std-VGA, `-global VGA.vgamem_mb=128` | stage 2 declines gracefully: `[vgpu] present: no virtio-gpu transport`, dispi console stays live (all M10a assertions green) |
+| 2 | std-VGA, default 16 MiB | same graceful decline — no transport, no risk |
+| 3 | `-vga virtio` (1af4:1050) | **full present path**: controlq `size=64`, `DRIVER_OK (status=0x0f)`; `resource: created 1920x1080 B8G8R8X8 id=1, backing 8100 KiB`; backing canary round-trips (`0xc6593ea0`); `scanout: set_scanout ok, transfer+flush ok`; `console adopted the virtio surface`; 100 ms flusher scheduled |
+| 4 | `-vga none -device virtio-vga-gl` + `egl-headless,gl=on` | transport + controlq live (`virgl=1 ctx=1` from stage 1), and the documented virgl skip: the 2D scanout belongs to the 3D path (stage 3), so the dispi console is kept on purpose |
+
+Suites after the kernel changes: `test-gpu.ps1` ×2, `test-smp.ps1`,
+`test-avx.ps1`, `test-fs.ps1`, `test-shell.ps1` — all exit 0. `build.ps1`
+clean.
+
+### M10b stage 2 — bugs found and how each was solved
+
+1. **The 2D command codes in the task brief were wrong (and the failure hid
+   behind a plausible error).** The brief listed
+   `TRANSFER_TO_HOST_2D=0x0102 … ATTACH_BACKING=0x0105 … FLUSH=0x0106`, but the
+   2D block is a *contiguous enum* starting at `0x0100`
+   (`GET_DISPLAY_INFO=0x0100`), so the real values are `CREATE_2D=0x0101,
+   UNREF=0x0102, SET_SCANOUT=0x0103, FLUSH=0x0104, TRANSFER_TO_HOST_2D=0x0105,
+   ATTACH_BACKING=0x0106`. The tell: with the brief's codes `ATTACH_BACKING`
+   was answered `0x1205` (`ERR_INVALID_PARAMETER`) *and* QEMU's own
+   guest-error log said `virtio_gpu_transfer_to_host_2d: command size incorrect
+   48 vs 56` — the device had dispatched the "attach" to the *transfer*
+   handler. Fix: every code is transcribed from
+   `include/uapi/linux/virtio_gpu.h`, and the enum is quoted next to the
+   constants so the next reader cannot re-derive it from memory.
+2. **`0x1205` is `ERR_INVALID_PARAMETER`, not "bad format".** The first guess
+   was that the pixel format was wrong, which sent the debugging into the
+   backing size and the format enum. The authoritative enum is `0x1200 UNSPEC,
+   0x1201 OUT_OF_MEMORY, 0x1202 INVALID_SCANOUT_ID, 0x1203
+   INVALID_RESOURCE_ID, 0x1204 INVALID_CONTEXT_ID, 0x1205 INVALID_PARAMETER`.
+   Fix: the refusal line now prints the real code, and reading
+   `INVALID_PARAMETER` as "some *parameter* of this command" is what pointed
+   at the dispatch (bug 1).
+3. **The format enum was also off by one.** The brief said `B8G8R8X8 = 1`; the
+   spec's "simple formats" block is `B8G8R8A8=1, B8G8R8X8=2, A8R8G8B8=3,
+   X8R8G8B8=4`. Sending 1 asks the device for BGRA-*with alpha* — a different
+   layout from the console's Bgr 32bpp surface. Fix: `GPU_FMT_B8G8R8X8 = 2`,
+   with the enum spelled out in the source.
+4. **Request lengths must include the trailing `padding` fields.** The device
+   checks the descriptor length against the full C struct
+   (`VIRTIO_GPU_FILL_CMD` → `iov_to_buf(...) != sizeof(struct)`), so a request
+   that stops at the last real field is a short read and returns
+   `INVALID_PARAMETER`. `RESOURCE_FLUSH` is 48 bytes (not 44) and
+   `TRANSFER_TO_HOST_2D` is 56 (not 52); each length is now derived from the
+   UAPI struct field by field and written as a comment beside it.
+5. **A virgl-capable device routes `SET_SCANOUT` to the 3D path.** On
+   `virtio-vga-gl` the virgl renderer owns the scanout and resolves resources
+   in the 3D namespace; a plain 2D resource (`RESOURCE_CREATE_2D`) is
+   invisible there and the device answers `virgl_cmd_set_scanout: illegal
+   resource specified 1` — the display silently stays on dispi. Since the 2D
+   present path is stage 2 and virgl 3D is stage 3, the driver now *detects*
+   the VIRGL feature and takes the graceful path on purpose, logging why.
+   `test-gpu.ps1` asserts that documented skip on boot 4 rather than the 2D
+   present markers.
+6. **`core::hint::pause()` is not in this `core`.** The used-ring poll used
+   `core::hint::pause()`, which the pinned toolchain does not provide, and the
+   build failed. Fix: `core::hint::spin_loop()`.
+7. **The physical-memory window made the DMA path free of page-table work.**
+   Worth recording as the *positive* measurement of this increment: the rings,
+   the command buffers and the scanout backing are all reached through the
+   bootloader's 1:1 RAM window, so the guest never edits a page table on the
+   device-DMA path and the addresses handed to the common config are exactly
+   the bytes the CPU draws into. The one asymmetry — the console is a
+   `&'static mut [u8]` over that same window, so `adopt` is the hand-over, and
+   it runs with interrupts disabled.
+
+### M10b stage 2 success criteria
+
+`test-gpu.ps1` four boots, twice, exit 0: boots 1/2 report the graceful
+no-transport fallback with every M10a assertion still green; boot 3 brings the
+controlq up (`DRIVER_OK`), creates and backs a 1920x1080 B8G8R8X8 resource,
+canary-verifies the backing, sets the scanout with a transfer+flush, adopts
+the console onto the virtio surface and schedules the 100 ms flusher; boot 4
+brings the queue up and takes the documented virgl 2D-skip. QEMU's
+`guest_errors` log is empty on the virtio boot (every command the device
+rejected would be named there). The four regression suites stay at exit 0.
 
 ## M9.5 — Graphical desktop userspace (DEFERRED)
 

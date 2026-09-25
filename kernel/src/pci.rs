@@ -154,6 +154,38 @@ fn config_read_u16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
     ((v >> (u32::from(offset & 2) * 8)) & 0xFFFF) as u16
 }
 
+/// M10b stage 2: read-modify-write OR `mask` into the 16-bit register at
+/// `offset` (the PCI *command* register at +0x04 for bus-master enable) and
+/// return the value read back after the write.
+///
+/// The RMW goes through the aligned u32 at `offset & 0xFC`, so for the command
+/// register this dword also contains the *status* register — writing its
+/// RW1C bits back is harmless (a 1 to an already-clear RW1C bit does nothing;
+/// same benign side-effect class as `size_bar`'s own RMW).
+///
+/// # Safety contract (callers): interrupts MUST be disabled — the config port
+/// is the two-step CF8h/CFCh handshake (M9.6-B1). Hard guard below, like
+/// `config_byte`: the caller loses the write instead of the machine.
+pub(crate) fn config_or_u16(f: &PciFunction, offset: u8, mask: u16) -> u16 {
+    assert!(
+        offset & 2 == 0,
+        "config_or_u16 expects a 2-byte-aligned register offset"
+    );
+    if x86_64::instructions::interrupts::are_enabled() {
+        let msg = alloc::format!(
+            "[pci] refused command |= {mask:#06x} with interrupts enabled \\\n             (two-step config access) - see M9.6-B1\n"
+        );
+        crate::serial_writeln!("{}", msg.trim_end());
+        crate::framebuffer::console_bytes(msg.as_bytes());
+        return 0;
+    }
+    let base = offset & 0xFC;
+    let raw = config_read_u32(f.bus, f.device, f.function, base);
+    let new = raw | u32::from(mask);
+    config_write_u32(f.bus, f.device, f.function, base, new);
+    (config_read_u32(f.bus, f.device, f.function, base) & 0xFFFF) as u16
+}
+
 /// Size a 32-bit MEM BAR: write all-ones, read back, restore.
 /// Returns (base, size) ??? size 0 for an absent/unavailable BAR.
 ///

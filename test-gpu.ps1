@@ -122,15 +122,57 @@ function Check-Boot([pscustomobject]$boot, [string]$label, [string]$devPattern) 
     }
 }
 
+# M10b stage 2: the kernel-drawn present path. Split from Check-Boot because
+# only boots 3/4 have a virtio transport; boots 1/2 assert the opposite (the
+# graceful no-transport fallback) at the call sites.
+#
+# Boot 4 is virtio-vga-gl: virgl-capable, so its SET_SCANOUT is owned by the 3D
+# path and a 2D resource is deliberately NOT handed the scanout (M10b stage 3).
+# It therefore asserts the transport, the queue and the virgl-aware graceful
+# skip - not the 2D present markers. `Check-Present` takes that as a switch.
+function Check-Present($log, [string]$label, [bool]$expect2D = $true) {
+    if (-not (Has-Line $log @('[vgpu] queue: controlq size=', 'DRIVER_OK'))) {
+        $script:fail += "$label`: stage 2 control queue not brought up (no DRIVER_OK)"
+    }
+    if (-not $expect2D) {
+        # virgl device: the 2D scanout is stage 3's job; assert the honest skip.
+        if (-not (Has-Line $log @('[vgpu] present: device is virgl-capable'))) {
+            $script:fail += "$label`: virgl device did not take the documented 2D-scanout skip"
+        }
+        return
+    }
+    if (-not (Has-Line $log @('[vgpu] resource: created 1920x1080', 'backing'))) {
+        $script:fail += "$label`: stage 2 resource not created/backed (GEM-lite attach missing)"
+    }
+    if (-not (Has-Line $log @('[vgpu] canary:', 'backing verified'))) {
+        $script:fail += "$label`: resource-backing canary did not read back"
+    }
+    if (-not (Has-Line $log @('[vgpu] scanout:', 'set_scanout ok', 'transfer+flush ok'))) {
+        $script:fail += "$label`: scanout set / transfer+flush not confirmed"
+    }
+    if (-not (Has-Line $log @('[vgpu] present: console adopted'))) {
+        $script:fail += "$label`: console was not adopted onto the virtio surface"
+    }
+    if (-not (Has-Line $log @('[vgpu] present: flusher scheduled'))) {
+        $script:fail += "$label`: 100 ms flusher not scheduled"
+    }
+}
+
 Write-Output '=== boot 1: std VGA, 128 MiB VRAM ==='
 $b1 = Invoke-Boot 'v128' '-global VGA.vgamem_mb=128'
 Write-Output ($b1.Log | Where-Object { $_.Contains('[gpu]') } | ForEach-Object { "  $_" } | Select-Object -First 12)
 Check-Boot $b1 'vram128' '1234:1111'
+if (-not (Has-Line $b1.Log @('[vgpu] present: no virtio-gpu transport'))) {
+    $script:fail += 'vram128: stage 2 did not report the graceful no-transport fallback'
+}
 
 Write-Output '=== boot 2: std VGA, default 16 MiB VRAM ==='
 $b2 = Invoke-Boot 'v16' ''
 Write-Output ($b2.Log | Where-Object { $_.Contains('[gpu]') } | ForEach-Object { "  $_" } | Select-Object -First 12)
 Check-Boot $b2 'vram16' '1234:1111'
+if (-not (Has-Line $b2.Log @('[vgpu] present: no virtio-gpu transport'))) {
+    $script:fail += 'vram16: stage 2 did not report the graceful no-transport fallback'
+}
 
 # Boot 3: the modern device (virtio-vga, 1af4:1050). The M10a path must stay
 # correct on it AND the M10b transport probe must decode its capability list.
@@ -150,6 +192,7 @@ if (-not (Has-Line $b3.Log @('[vgpu] probe: features lo=', 'GPU bits(want):'))) 
 if (-not (Has-Line $b3.Log @('[vgpu] task: virtio-gpu transport: modern', 'queues 2 scanouts 1'))) {
     $fail += 'virtio-vga: M10b transport probe did not survive the hand-over to the scheduler task'
 }
+Check-Present $b3.Log 'virtio-vga'
 
 # Boot 4: the *3D* path. `-vga none` so QEMU does not also instantiate the
 # legacy std-VGA (which would shadow the virtio device as primary display);
@@ -166,6 +209,7 @@ if (-not (Has-Line $b4.Log @('[vgpu] probe: features lo=', 'virgl=1', 'ctx=1')))
 if (-not (Has-Line $b4.Log @('[vgpu] task: virtio-gpu transport: modern', 'queues 2 scanouts 1'))) {
     $fail += 'virtio-vga-gl: M10b task-context transport report missing on the 3D-capable device'
 }
+Check-Present $b4.Log 'virtio-vga-gl' $false
 
 if ($fail.Count -eq 0) {
     Write-Output 'RESULT: M10 GPU TESTS PASSED'
