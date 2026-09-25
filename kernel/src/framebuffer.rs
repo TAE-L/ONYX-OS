@@ -231,6 +231,106 @@ pub fn mark_dirty_public(x: usize, y: usize, w: usize, h: usize) {
     mark_dirty_rect(x, y, x + w - 1, y + h - 1);
 }
 
+/// Latency probe (M10b 3b): how long from "the mouse moved" to "those pixels
+/// were pushed to the display".
+///
+/// This is the number a latency-driven OS is actually judged by, and it is
+/// measurable *today* without a real GPU: the mouse IRQ stamps the moment the
+/// move is applied, the flusher stamps the moment the damage-rect containing
+/// that cursor move is transferred, and the delta is the input->present
+/// latency including the damage-rect, the device round trip and the 100 ms
+/// flush cadence.
+///
+/// Recorded as a small histogram, not an average: a low average hides the
+/// tails that make a game feel unresponsive. Buckets are powers of two in
+/// microseconds, so the report reads as "how often was it under 256 us / 1 ms
+/// / 4 ms ...".
+pub mod latency {
+    use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    /// `LAT_BUCKETS[i]` counts samples whose latency fell in
+    /// `(2^(i-1) us, 2^i us]`. Index 0 is "under 2 us" and the last is the
+    /// overflow bucket.
+    pub const BUCKETS: usize = 24;
+    static HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
+    static SAMPLES: AtomicU64 = AtomicU64::new(0);
+    static MIN_US: AtomicU64 = AtomicU64::new(u64::MAX);
+    static MAX_US: AtomicU64 = AtomicU64::new(0);
+    static SUM_US: AtomicU64 = AtomicU64::new(0);
+
+    /// Monotonic nanosecond stamp of the most recent cursor move, or 0 if the
+    /// current dirty rect did not come from a cursor move. Read (and cleared)
+    /// by the flusher when it presents.
+    static PENDING_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Record that a cursor move was applied at `now_ns` (called from the
+    /// mouse IRQ, so it must stay allocation-free and O(1)).
+    #[inline]
+    pub fn note_input(now_ns: u64) {
+        PENDING_NS.store(now_ns, AtomicOrdering::Relaxed);
+    }
+
+    /// Take the pending input stamp, if a cursor move is waiting to be shown.
+    #[inline]
+    pub fn take_pending() -> Option<u64> {
+        let ns = PENDING_NS.swap(0, AtomicOrdering::Relaxed);
+        if ns == 0 {
+            None
+        } else {
+            Some(ns)
+        }
+    }
+
+    /// Record one completed input->present sample.
+    pub fn record(delta_ns: u64) {
+        let us = delta_ns / 1_000;
+        let mut b = (64 - us.max(1).leading_zeros()) as usize; // ceil(log2(us+1))
+        if b >= BUCKETS {
+            b = BUCKETS - 1;
+        }
+        HIST[b].fetch_add(1, AtomicOrdering::Relaxed);
+        SAMPLES.fetch_add(1, AtomicOrdering::Relaxed);
+        SUM_US.fetch_add(us, AtomicOrdering::Relaxed);
+        // Relaxed min via a compare-exchange loop (AtomicU64 has no fetch_min).
+        let mut cur = MIN_US.load(AtomicOrdering::Relaxed);
+        while us < cur {
+            match MIN_US.compare_exchange_weak(
+                cur,
+                us,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        MAX_US.fetch_max(us, AtomicOrdering::Relaxed);
+    }
+
+    /// Reset the histogram (used by the periodic report so each line covers
+    /// one window rather than the whole boot).
+    pub fn reset_window() -> Snapshot {
+        let s = Snapshot {
+            samples: SAMPLES.swap(0, AtomicOrdering::Relaxed),
+            min_us: MIN_US.swap(u64::MAX, AtomicOrdering::Relaxed),
+            max_us: MAX_US.swap(0, AtomicOrdering::Relaxed),
+            sum_us: SUM_US.swap(0, AtomicOrdering::Relaxed),
+        };
+        for h in HIST.iter() {
+            h.store(0, AtomicOrdering::Relaxed);
+        }
+        s
+    }
+
+    /// A window/point-in-time summary of the latency histogram.
+    pub struct Snapshot {
+        pub samples: u64,
+        pub min_us: u64,
+        pub max_us: u64,
+        pub sum_us: u64,
+    }
+}
+
 /// Current cursor position (top-left of the sprite).
 static CUR_X: AtomicUsize = AtomicUsize::new(0);
 static CUR_Y: AtomicUsize = AtomicUsize::new(0);
@@ -408,6 +508,11 @@ pub fn current_geometry() -> (usize, usize, usize) {
 /// Apply a mouse delta and redraw. Called from IRQ 12 — keep it allocation-
 /// free and fast (it is ~500 byte writes for a full-sprite move).
 pub fn move_cursor(dx: i32, dy: i32) {
+    // Stamp the input instant (M10b 3b latency probe) BEFORE any early return,
+    // so the measurement reflects when the IRQ fired rather than whether this
+    // particular move changed the sprite. The flusher turns this into an
+    // input->present delta. O(1), allocation-free, safe in IRQ context.
+    latency::note_input(crate::time::now_ns());
     let mut slot = FB.lock();
     let w = match slot.as_mut() {
         Some(w) => w,

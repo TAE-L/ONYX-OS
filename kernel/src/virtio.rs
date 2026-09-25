@@ -1510,6 +1510,17 @@ pub fn flush_loop() {
             Ok(()) => {
                 FLUSH_BYTES.fetch_add((w * h * 4) as u64, Ordering::Relaxed);
                 failures = 0;
+                // M10b 3b latency probe: this damage-rect carried a cursor
+                // move from the input IRQ; the delta from that stamp to now
+                // (just after the device acknowledged both commands) is the
+                // end-to-end input->present latency. If no move is pending
+                // the take returns None and nothing is recorded.
+                if let Some(input_ns) = crate::framebuffer::latency::take_pending() {
+                    let now_ns = crate::time::now_ns();
+                    if now_ns > input_ns {
+                        crate::framebuffer::latency::record(now_ns - input_ns);
+                    }
+                }
             }
             Err(e) => {
                 // Re-arm the damage: this rect was NOT presented, so if we
@@ -1562,4 +1573,21 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
     ));
     *last_bytes = bytes_now;
     *last_skipped = skipped_now;
+    // Latency (M10b 3b): the number a latency-driven OS is judged by. Emitted
+    // alongside the DMA line so the two are read together - a flush policy
+    // that saves bandwidth but inflates input->present is a bad trade for a
+    // game, and only a side-by-side line makes that visible.
+    let lat = crate::framebuffer::latency::reset_window();
+    if lat.samples == 0 {
+        log("[vgpu] latency: no input samples this window (idle console)");
+    } else {
+        let avg = lat.sum_us / lat.samples;
+        log(&alloc::format!(
+            "[vgpu] latency: input->present n={} avg={} us min={} us max={} us",
+            lat.samples,
+            avg,
+            if lat.min_us == u64::MAX { 0 } else { lat.min_us },
+            lat.max_us
+        ));
+    }
 }
