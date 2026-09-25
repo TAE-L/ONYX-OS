@@ -145,10 +145,9 @@ const GPU_FMT_B8G8R8X8: u32 = 2;
 const GPU_CMD_UPDATE_CURSOR: u32 = 0x0300;
 const GPU_CMD_MOVE_CURSOR: u32 = 0x0301;
 
-/// `struct virtio_gpu_cursor_pos` is 16 bytes: scanout_id, x, y, padding.
-const CURSOR_POS_LEN: usize = 16;
-/// `struct virtio_gpu_update_cursor` = 24 (ctrl_hdr) + 16 (pos) + 4
-/// (resource_id) + 4 (hot_x) + 4 (hot_y) + 4 (padding) = 56.
+/// `struct virtio_gpu_update_cursor` = 24 (ctrl_hdr) + 16 (pos: scanout_id,
+/// x, y, padding) + 4 (resource_id) + 4 (hot_x) + 4 (hot_y) + 4 (padding)
+/// = 56.
 ///
 /// The trailing `__le32 padding` is part of the struct: QEMU's
 /// `virtio_gpu_handle_cursor` copies exactly `sizeof(cursor_info)` and logs
@@ -1419,8 +1418,8 @@ pub fn present_bringup(width: usize, height: usize) -> bool {
 
     PRESENT.store(true, Ordering::Release);
     *RESOURCE.lock() = Some(res);
-    log("[vgpu] present: flusher scheduled - damage-rect transfer+flush every 100 ms \
-          (only what the console drew since the last push)");
+    log("[vgpu] present: flusher scheduled - damage-rect present, adaptive cadence \
+          (1 ms quantum while active, 16 ms when idle)");
     // M10b 3c: hand the cursor to the device (queue 1) LAST, and only as a
     // best-effort extra. The flusher is already live at this point, so even if
     // the cursor bring-up fails or stalls, the present path keeps working and
@@ -1435,14 +1434,9 @@ pub fn present_bringup(width: usize, height: usize) -> bool {
 // The flusher: the GPU task BECOMES the present loop (no spawn)
 // ---------------------------------------------------------------------------
 
-/// Period between full-rect `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH` pairs.
-///
-/// 100 ms = 10 fps of full-frame pushes at 8.1 MiB, which is plenty for a
-/// text console and cheap enough not to starve the other tasks under TCG.
-/// Damage rects (push only what changed) are the next increment - until then
-/// correctness wins: every frame is complete, and the cost is visible only in
-/// the `flush:` failure counters.
-const FLUSH_PERIOD_MS: u64 = 100;
+/// (The former fixed `FLUSH_PERIOD_MS = 100` is gone: M10b 4 replaced it with the
+/// adaptive cadence below, `FLUSH_LATENCY_QUANTUM_MS` / `FLUSH_IDLE_SLEEP_MS`,
+/// because a fixed period was the dominant source of present latency.)
 
 /// Consecutive failures after which the flusher gives up. The display is
 /// frozen by then, but the KERNEL is not: the console keeps accepting input
@@ -1457,6 +1451,29 @@ const FLUSH_GIVE_UP: u32 = 50;
 /// line every 5 s.
 const FLUSH_REPORT_EVERY: u64 = 50;
 
+/// M10b 4 (frame pacing): the flusher no longer sleeps on a fixed 100 ms
+/// period. A fixed period is a *latency* decision disguised as a DMA decision:
+/// a glyph drawn just after a tick waits a full period to appear, which is
+/// where the ~57 ms input->present average actually came from (avg wait ≈
+/// period/2, not transfer time).
+///
+/// The flusher instead runs an ADAPTIVE cadence: while the console is
+/// changing it sleeps a short **latency quantum** so a change is picked up
+/// quickly; after enough consecutive idle quanta it backs off to a long sleep
+/// so a quiet machine costs almost nothing. Response latency is decoupled from
+/// CPU/DMA cost instead of trading one for the other.
+const FLUSH_LATENCY_QUANTUM_MS: u64 = 1;
+/// M10b 4: the idle sleep. Kept SHORT (16 ms, not 50) on purpose: a change
+/// that arrives while the flusher is backing off waits up to one idle sleep, so
+/// the idle sleep IS the worst-case response for a late-arriving change.
+/// A long backoff (the earlier 50 ms) is cheap in CPU but costs latency on the
+/// first keystroke after a quiet period — measured as ~46 ms min response. At
+/// 16 ms the CPU cost of an idle console is still negligible (one wakeup per
+/// 16 ms doing a single relaxed load) while bounding worst-case response.
+const FLUSH_IDLE_SLEEP_MS: u64 = 16;
+/// Consecutive idle quanta before backing off to the long idle sleep.
+const FLUSH_IDLE_BACKOFF: u32 = 25;
+
 /// Bytes pushed to the device since boot (guest→host transfers only), and how
 /// many of those pushes were skipped because nothing was dirty.
 ///
@@ -1466,21 +1483,98 @@ const FLUSH_REPORT_EVERY: u64 = 50;
 static FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
 static FLUSH_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+/// M10b 4 (frame pacing) — present-interval accounting. The interval between
+/// consecutive DAMAGE-driven pushes is the frame cadence the user actually
+/// experiences; tracking min/avg/max makes jitter (which is what causes
+/// perceived stutter) visible rather than guessed at.
+static PRESENT_INTERVALS: AtomicU64 = AtomicU64::new(0);
+static PRESENT_SUM_US: AtomicU64 = AtomicU64::new(0);
+static PRESENT_MIN_US: AtomicU64 = AtomicU64::new(u64::MAX);
+static PRESENT_MAX_US: AtomicU64 = AtomicU64::new(0);
+/// Last present time (ns), 0 = none yet this boot.
+static LAST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// M10b 4: response accounting. Damage->present is the DIRECT measure of how
+/// long from "something was drawn" to "the device was told", independent of
+/// input — the number the adaptive cadence improves, and the one the 3b
+/// input->present probe could not isolate (a mouse move with a hardware cursor
+/// produces no framebuffer damage at all).
+static RESPONSE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_SUM_US: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_MAX_US: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_MIN_US: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Record the response time for one damage->present cycle: `since_mark_ns` is
+/// when the newest damage was drawn (generation change), `now_ns` when the
+/// device acknowledged the present.
+fn note_response(since_mark_ns: u64, now_ns: u64) {
+    if now_ns > since_mark_ns {
+        let us = (now_ns - since_mark_ns) / 1_000;
+        RESPONSE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        RESPONSE_SUM_US.fetch_add(us, Ordering::Relaxed);
+        let mut cur = RESPONSE_MIN_US.load(Ordering::Relaxed);
+        while us < cur {
+            match RESPONSE_MIN_US.compare_exchange_weak(
+                cur,
+                us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        RESPONSE_MAX_US.fetch_max(us, Ordering::Relaxed);
+    }
+}
+
+/// Record one present instant and the interval since the previous present.
+fn note_present(now_ns: u64) {
+    let prev = LAST_PRESENT_NS.swap(now_ns, Ordering::Relaxed);
+    if prev != 0 && now_ns > prev {
+        let us = (now_ns - prev) / 1_000;
+        PRESENT_INTERVALS.fetch_add(1, Ordering::Relaxed);
+        PRESENT_SUM_US.fetch_add(us, Ordering::Relaxed);
+        let mut cur = PRESENT_MIN_US.load(Ordering::Relaxed);
+        while us < cur {
+            match PRESENT_MIN_US.compare_exchange_weak(
+                cur,
+                us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        PRESENT_MAX_US.fetch_max(us, Ordering::Relaxed);
+    }
+}
+
 /// The flusher loop. Called by the GPU task after a successful
 /// `present_bringup`, and it never returns on the happy path.
 ///
 /// This task does NOT exit while the console lives on the virtio surface: it
 /// is the present loop. Spawning a second task would need its own lock
 /// ordering story (queue lock vs. console lock) for no benefit - one task
-/// alternating between "copy what the console drew" and "wait 100 ms" is the
-/// whole job.
+/// alternating between "copy what the console drew" and "wait for the next
+/// quantum" is the whole job.
 ///
 /// Only the *dirty* rectangle is pushed. The console accumulator is a
 /// bounding box, so a burst of text between two flushes collapses into one
-/// rect; an idle console produces no rect at all and the loop does nothing
-/// but sleep. No per-flush logging: a 10 Hz success line would drown the
-/// serial log, and a failure is logged ONCE (plus once more at the give-up
-/// threshold).
+/// rect; an idle console produces no rect at all.
+///
+/// **M10b 4 — adaptive pacing.** The cadence is NOT a fixed 100 ms period.
+/// A fixed period is a latency decision disguised as a DMA decision: a glyph
+/// drawn just after a tick waits a whole period to appear (avg ≈ period/2),
+/// which is exactly where the ~57 ms input→present average came from. Here
+/// the loop sleeps a short *latency quantum* while the console is changing
+/// (so a change is picked up in ~quantum, not ~period) and backs off to a
+/// long idle sleep once it has seen enough consecutive idle quanta (so a
+/// quiet machine costs almost nothing). Response latency and CPU/DMA cost are
+/// decoupled instead of traded. `framebuffer::damage_generation()` is the
+/// change signal: it is a single relaxed load and does NOT consume the box,
+/// so a quantum that finds nothing new does no work at all.
 pub fn flush_loop() {
     let mut failures: u32 = 0;
     let mut since_report: u64 = 0;
@@ -1488,10 +1582,21 @@ pub fn flush_loop() {
     // describes only its own window.
     let mut last_bytes: u64 = FLUSH_BYTES.load(Ordering::Relaxed);
     let mut last_skipped: u64 = FLUSH_SKIPPED.load(Ordering::Relaxed);
+    // Adaptive pacing state: consecutive idle quanta, and the damage
+    // generation we last acted on.
+    let mut idle_quanta: u32 = 0;
+    let mut last_gen: u64 = crate::framebuffer::damage_generation();
     loop {
-        // Sleep first, flush second: the initial frame was already pushed by
-        // `present_bringup`, so there is nothing to send right now.
-        crate::scheduler::sleep_kernel(FLUSH_PERIOD_MS);
+        // Sleep on the ADAPTIVE quantum, not a fixed period: short while the
+        // console is active, long once it is idle. The initial frame was
+        // already pushed by `present_bringup`, so there is nothing to send on
+        // the very first pass either way.
+        let sleep_ms = if idle_quanta >= FLUSH_IDLE_BACKOFF {
+            FLUSH_IDLE_SLEEP_MS
+        } else {
+            FLUSH_LATENCY_QUANTUM_MS
+        };
+        crate::scheduler::sleep_kernel(sleep_ms);
         if !PRESENT.load(Ordering::Acquire) {
             continue;
         }
@@ -1504,15 +1609,31 @@ pub fn flush_loop() {
         // is only meaningful against the ticks it covers.
         since_report += 1;
 
-        // Nothing drawn since the last push: skip both commands entirely.
-        // This is the whole point of the damage rect - an idle console costs
-        // zero DMA instead of a full 8.1 MiB surface.
-        let Some((x0, y0, x1, y1)) = crate::framebuffer::take_dirty_rect() else {
+        // M10b 4 (adaptive pacing): the change signal is the damage GENERATION,
+        // not the box. If nothing was drawn since we last acted, do nothing —
+        // this avoids the `take_dirty_rect` lock entirely on the common idle
+        // path, and keeps the box intact for the tick that does have damage.
+        let gen = crate::framebuffer::damage_generation();
+        if gen == last_gen {
+            idle_quanta = idle_quanta.saturating_add(1);
             FLUSH_SKIPPED.fetch_add(1, Ordering::Relaxed);
             if since_report >= FLUSH_REPORT_EVERY {
                 report_flush(&res, since_report, &mut last_bytes, &mut last_skipped);
                 since_report = 0;
             }
+            continue;
+        }
+        last_gen = gen;
+        idle_quanta = 0; // activity resets the back-off
+        // Snapshot when this damage first appeared, so the present path can
+        // report how long the change waited (the direct damage->present
+        // response — what the adaptive cadence is measured on).
+        let damage_marked = crate::framebuffer::damage_marked_ns();
+
+        // There IS new damage: consume the box and present exactly it.
+        let Some((x0, y0, x1, y1)) = crate::framebuffer::take_dirty_rect() else {
+            // The generation moved but the box was empty (a mark that was
+            // already taken, e.g. a failed flush re-arm race). Nothing to do.
             continue;
         };
         // Inclusive pixel bounds -> device rect dimensions, clamped to the
@@ -1534,6 +1655,16 @@ pub fn flush_loop() {
             Ok(()) => {
                 FLUSH_BYTES.fetch_add((w * h * 4) as u64, Ordering::Relaxed);
                 failures = 0;
+                // M10b 4: the direct damage->present response (how long this
+                // change waited to be pushed) — the number the adaptive cadence
+                // improves, measured independently of input.
+                if damage_marked != 0 {
+                    note_response(damage_marked, crate::time::now_ns());
+                }
+                // M10b 4: record the present instant for the frame-interval
+                // (pacing) statistics — the interval between consecutive
+                // damage-driven presents is the cadence the user feels.
+                note_present(crate::time::now_ns());
                 // M10b 3b latency probe: this damage-rect carried a cursor
                 // move from the input IRQ; the delta from that stamp to now
                 // (just after the device acknowledged both commands) is the
@@ -1603,6 +1734,37 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
     // game, and only a side-by-side line makes that visible.
     let lat = crate::framebuffer::latency::reset_window();
     let hw = crate::framebuffer::latency::reset_window_hw();
+    // M10b 4: frame-interval (pacing) stats for this window — the interval
+    // between consecutive damage-driven presents. Jitter (max vs min) is what
+    // reads as stutter, so min/avg/max together are the honest picture.
+    let n_int = PRESENT_INTERVALS.swap(0, Ordering::Relaxed);
+    let sum_int = PRESENT_SUM_US.swap(0, Ordering::Relaxed);
+    let min_int = PRESENT_MIN_US.swap(u64::MAX, Ordering::Relaxed);
+    let max_int = PRESENT_MAX_US.swap(0, Ordering::Relaxed);
+    if n_int > 0 {
+        log(&alloc::format!(
+            "[vgpu] pacing: {n_int} presents, interval avg={} us min={} us max={} us",
+            sum_int / n_int,
+            if min_int == u64::MAX { 0 } else { min_int },
+            max_int
+        ));
+    }
+    // M10b 4: the direct damage->present response — how long a drawn change
+    // waited to be pushed. This is the number the adaptive cadence (2 ms
+    // quantum) is measured on; it is independent of input.
+    let n_resp = RESPONSE_SAMPLES.swap(0, Ordering::Relaxed);
+    let sum_resp = RESPONSE_SUM_US.swap(0, Ordering::Relaxed);
+    let min_resp = RESPONSE_MIN_US.swap(u64::MAX, Ordering::Relaxed);
+    let max_resp = RESPONSE_MAX_US.swap(0, Ordering::Relaxed);
+    if n_resp > 0 {
+        log(&alloc::format!(
+            "[vgpu] response: damage->present n={} avg={} us min={} us max={} us",
+            n_resp,
+            sum_resp / n_resp,
+            if min_resp == u64::MAX { 0 } else { min_resp },
+            max_resp
+        ));
+    }
     if lat.samples == 0 && hw.samples == 0 {
         log("[vgpu] latency: no input samples this window (idle console)");
     } else {

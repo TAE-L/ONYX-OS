@@ -54,7 +54,7 @@ Two signature goals beyond "a working hobby OS":
 | **M9.6** | **Core hardening + missing subsystems** — A: upgrades (TSC ns timekeeping ✅, APIC/IOAPIC + LAPIC timer ✅, scheduler v2 ✅, FPU/SIMD save-restore ✅, block cache ✅, frame alloc v2 ✅) · B: missing subsystems (PCI ✅, ACPI ✅, process lifecycle ✅, raw input ring ✅, `perf` instrumentation ✅) · C: ABI/file-API foundation (argv/envp/auxv ✅, user-pointer validation ✅, errno ✅, mount table) | **done** — A1–A6, B1–B5, C1–C3 all complete; M9.6 regressions pass on BIOS + UEFI (test-fs, test-sched, test-proc, test-block, test-memory, test-pci, test-acpi, test-raw, test-input, test-fpu, test-time, test-args). |
 | **M9.7** | **Linux ABI compat — run static Linux ELFs**: syscall-number shim, argv/envp/auxv, `arch_prctl` TLS, mmap/brk, PIE/relocations | ✅ done |
 | **M9.8** | **SMP — multi-core** (its own stage, per decision): MADT-driven AP startup, per-CPU data, per-CPU run queues + IPIs | ✅ done — GS-base per-CPU blocks, INIT-SIPI-SIPI AP bring-up through a hand-assembled low-page trampoline, per-CPU GDT/TSS + IDT + LAPIC timers, reschedule IPI, per-CPU RSP/syscall slots, boot context restored as a task, kernel-service lock (`ksl`) + input/keyboard/mouse locking, **task migration with work stealing**, stall diagnostic re-based on provable starvation, and the `xsave64`/`xrstor64` EDX:EAX mask bug fixed (AVX/YMM now survives switches under migration); `test-smp.ps1` passes at `-smp 1/2/4`, `test-avx.ps1` at `-smp 4 -cpu max` (200+ rounds, zero failures), all 25 suites green |
-| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b stage 1 ✅ **done** (virtio-gpu transport probe: four capability regions, VERSION_1 negotiated, 2 queues/1 scanout, `virgl=1 ctx=1` on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green); M10b stage 2 ✅ **done** (control virtqueue engine + GEM-lite resource: queue → DRIVER_OK → CREATE_2D/ATTACH_BACKING → canary → SET_SCANOUT/TRANSFER+FLUSH → console adopt + 100 ms flusher on `-vga virtio`; graceful no-transport fallback on std-VGA, documented virgl 2D-skip on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green, QEMU `guest_errors` empty); M10b stage 3a ✅ **done** (damage-rect present: dirty bbox tracked in `framebuffer.rs`, only what the console drew is transferred; measured ~90 % DMA saved, idle console costs zero — all suites green); M10b stage 3b ✅ **done** (input→present latency probe: mouse IRQ stamps the input, the flusher times device-ack, power-of-two histogram + n/avg/min/max report, under test in `test-latency.ps1`; measured ~64 ms software-cursor baseline — the number every later optimization is judged against); M10b stage 3c ✅ **done** (hardware cursor on queue 1: sprite uploaded once as a B8G8R8A8 2D resource, every move a 56-byte MOVE_CURSOR with zero framebuffer damage; measured input→MOVE_CURSOR avg=130 µs vs ~57 ms software — a ~440× pointer-latency win; the flusher is scheduled first so the optional cursor can never block present); M10b stage 4 (next): frame pacing / tearing to attack the ~57 ms framebuffer-present latency; scatter-gather deferred (scaling, not latency). M10b/c direction: **virtio-gpu is the primary backend** (DMA resources, command virtqueues), the dispi driver stays as the legacy fallback backend; for a low-latency/gaming OS the present path (frame pacing, tearing) is the priority, not a general surface/blit API or virgl/3D |
+| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b stage 1 ✅ **done** (virtio-gpu transport probe: four capability regions, VERSION_1 negotiated, 2 queues/1 scanout, `virgl=1 ctx=1` on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green); M10b stage 2 ✅ **done** (control virtqueue engine + GEM-lite resource: queue → DRIVER_OK → CREATE_2D/ATTACH_BACKING → canary → SET_SCANOUT/TRANSFER+FLUSH → console adopt + 100 ms flusher on `-vga virtio`; graceful no-transport fallback on std-VGA, documented virgl 2D-skip on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green, QEMU `guest_errors` empty); M10b stage 3a ✅ **done** (damage-rect present: dirty bbox tracked in `framebuffer.rs`, only what the console drew is transferred; measured ~90 % DMA saved, idle console costs zero — all suites green); M10b stage 3b ✅ **done** (input→present latency probe: mouse IRQ stamps the input, the flusher times device-ack, power-of-two histogram + n/avg/min/max report, under test in `test-latency.ps1`; measured ~64 ms software-cursor baseline — the number every later optimization is judged against); M10b stage 3c ✅ **done** (hardware cursor on queue 1: sprite uploaded once as a B8G8R8A8 2D resource, every move a 56-byte MOVE_CURSOR with zero framebuffer damage; measured input→MOVE_CURSOR avg=130 µs vs ~57 ms software — a ~440× pointer-latency win; the flusher is scheduled first so the optional cursor can never block present); M10b stage 4 ✅ **done, caveat** (adaptive present cadence: 1 ms latency quantum while active, 16 ms idle backoff, damage-generation change signal; new `response: damage->present` and `pacing: interval` metrics — but the boot-burst test workload can't cleanly A/B the cadence, so no measured win is claimed, only the removal of the structural 100 ms wait); M10b stage 5 (next): an on-demand single-glyph workload to cleanly measure the pacing A/B, then real frame pacing/tearing. M10b/c direction: **virtio-gpu is the primary backend** (DMA resources, command virtqueues), the dispi driver stays as the legacy fallback backend; for a low-latency/gaming OS the present path (frame pacing, tearing) is the priority, not a general surface/blit API or virgl/3D |
 | M11 | NTFS read-only + multi-drive mounting | extra Windows compat |
 | **M12** | **PE foundation**: parse `.exe` / `.dll` (PE/COFF), relocations, DLL imports groundwork | solid foundation only |
 | M13 | GUI: window manager + compositor + built-in apps (terminal, file manager) | apps on the M9.5 base |
@@ -984,6 +984,49 @@ fallback is documented, and that the MOVE_CURSOR probe closed), `test-gpu.ps1`
   set `PRESENT` first, then attempt the cursor as a best-effort extra whose
   failure keeps the software sprite. The invariant is now "the present path is
   live before anything optional runs on top of it."
+
+## M10b stage 4 — adaptive frame pacing (done, with an honest caveat)
+
+**Scope:** stop treating the present period as a fixed 100 ms. A fixed period
+is a *latency* decision disguised as a DMA decision — a change drawn just after
+a tick waits a whole period to appear. The flusher now runs an **adaptive
+cadence**: a 1 ms *latency quantum* while the console is changing, backing off
+to a 16 ms idle sleep after enough quiet quanta, so response latency and
+CPU/DMA cost are decoupled instead of traded. A damage *generation* counter
+(`framebuffer::damage_generation()`, bumped on every draw, read without
+consuming the box) is the change signal, so an idle quantum does a single
+relaxed load and no work.
+
+**New instrumentation.** The flusher now reports two more metrics per window:
+- `response: damage->present` — how long a drawn change waited to be pushed
+  (the direct, input-independent number the cadence targets);
+- `pacing: … interval` — the cadence between consecutive damage-driven
+  presents (min/avg/max), so jitter is visible.
+
+**Honest result / caveat.** The adaptive cadence and its instrumentation are in
+and correct, but the boot-time `test-latency` workload is a *console burst*
+(autoexec runs commands back to back), so every damage→present sample is drawn
+during continuous output — the mark is stamped early and the flusher presents an
+accumulated box later. The measured `response min ≈ 43 ms` and
+`pacing min ≈ 93 ms` therefore reflect how long the *console took to draw a
+burst*, not the flusher's own wait, and this harness cannot cleanly A/B the
+cadence against the old fixed-100 ms baseline. I am **not** claiming a measured
+latency win from the pacing change itself; what is proven is that the flusher no
+longer *structurally* injects up to 100 ms of wait (it now waits ≤ quantum while
+active / ≤ idle-sleep when quiet), and that the response and interval are now
+*measured* going forward. A clean A/B needs a workload that draws on demand (one
+glyph, wait, one glyph) rather than a burst — that is the natural companion to
+this increment and the honest next validation.
+
+The 1 ms quantum is the LAPIC tick (`sleep_kernel` rounds to it), so while
+active the flusher wakes every tick; the 16 ms idle sleep bounds the
+worst-case wait for a change that arrives during back-off. The earlier 50 ms
+idle sleep was measured costing ~46 ms min response on a late first keystroke
+and was reduced for exactly that reason.
+
+Suites: `test-latency.ps1` (now asserts the adaptive cadence + response/pacing
+lines), `test-gpu.ps1` ×2, `test-smp.ps1`, `test-avx.ps1`, `test-fs.ps1`,
+`test-shell.ps1` — all exit 0. `build.ps1` clean.
 
 ## M10b stage 3b — decisions and deferrals
 

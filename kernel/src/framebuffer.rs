@@ -5,7 +5,7 @@
 //! and draw 8x8 bitmap glyphs from the `font8x8` crate's legacy glyph table.
 
 use bootloader_api::info::{FrameBufferInfo, PixelFormat};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
 /// `font8x8::legacy::BASIC_LEGACY` holds raw glyphs for ASCII 0..=127.
@@ -175,6 +175,31 @@ static CONSOLE_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// already inside a CONSOLE lock for every console write.
 static DIRTY: Mutex<Option<(usize, usize, usize, usize)>> = Mutex::new(None);
 
+/// Bumped on every `mark_dirty_rect`. The present path samples this to decide
+/// "is there anything new since I last pushed?" WITHOUT consuming the box
+/// (which `take_dirty_rect` does). This is what lets the flusher sleep on a
+/// short latency quantum and still skip idle work, instead of either polling
+/// slowly (high latency) or spinning (high CPU).
+static DIRTY_GEN: AtomicU64 = AtomicU64::new(0);
+/// When the current (unconsumed) damage was first marked (ns). Reset when the
+/// box is taken, so the present path can measure "how long was this change
+/// waiting?" — the direct damage->present response time (M10b 4).
+static DIRTY_MARK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Current damage generation — monotonically increases whenever anything is
+/// drawn. Wrap is irrelevant (u64); only equality is compared.
+#[inline]
+pub fn damage_generation() -> u64 {
+    DIRTY_GEN.load(Ordering::Acquire)
+}
+
+/// When the current damage was first drawn (ns), 0 if none pending. Paired
+/// with `damage_generation` so the present path can time the wait.
+#[inline]
+pub fn damage_marked_ns() -> u64 {
+    DIRTY_MARK_NS.load(Ordering::Acquire)
+}
+
 /// Widen the dirty box by one pixel.
 #[inline]
 fn mark_dirty(x: usize, y: usize) {
@@ -194,6 +219,16 @@ fn mark_dirty_rect(x0: usize, y0: usize, x1: usize, y1: usize) {
         ),
         None => (x0, y0, x1, y1),
     });
+    drop(slot);
+    // Bump the generation AFTER releasing the lock: the present path only
+    // reads it, and bumping inside the lock would add an atomic RMW to the
+    // per-pixel hot path for no benefit.
+    DIRTY_GEN.fetch_add(1, Ordering::Relaxed);
+    // Stamp when this damage FIRST appeared (a burst keeps the earliest
+    // stamp), so the present path can measure how long the change waited.
+    if DIRTY_MARK_NS.load(Ordering::Acquire) == 0 {
+        DIRTY_MARK_NS.store(crate::time::now_ns(), Ordering::Release);
+    }
 }
 
 /// Take the accumulated dirty rectangle, clearing the accumulator.
@@ -209,7 +244,10 @@ fn mark_dirty_rect(x0: usize, y0: usize, x1: usize, y1: usize) {
 /// recorded but never presented — the one failure a present path must not
 /// have, which is stale pixels that nothing will ever redraw.
 pub fn take_dirty_rect() -> Option<(usize, usize, usize, usize)> {
-    DIRTY.lock().take()
+    let r = DIRTY.lock().take();
+    // The damage has been consumed; the next mark re-stamps the wait clock.
+    DIRTY_MARK_NS.store(0, Ordering::Release);
+    r
 }
 
 /// Mark the whole surface dirty — used by the present path's own first frame
@@ -473,11 +511,6 @@ pub fn set_hardware_cursor(active: bool) {
     HW_CURSOR.store(active, Ordering::Release);
 }
 
-/// True when the display owns the cursor.
-pub fn hardware_cursor_active() -> bool {
-    HW_CURSOR.load(Ordering::Acquire)
-}
-
 /// The cursor sprite as raw `B8G8R8A8` pixels, scaled to the active scale,
 /// for the hardware cursor's backing resource.
 ///
@@ -641,7 +674,7 @@ pub fn move_cursor(dx: i32, dy: i32) {
     // `apply_sensitivity` has SIDE EFFECTS (it accumulates sub-pixel motion in
     // ACC_X8/ACC_Y8), so it is called exactly ONCE here and the old position is
     // carried out alongside the new one for the software-sprite diff.
-    let (width, height, old_x, old_y, nx, ny) = {
+    let (old_x, old_y, nx, ny) = {
         // Bind the guard to a local: `FB.lock().as_ref()` inline would create a
         // temporary MutexGuard that is dropped (and thus unlocks) at the end of
         // the `let-else` expression while `w` still borrows it.
@@ -661,7 +694,7 @@ pub fn move_cursor(dx: i32, dy: i32) {
         let max_y = height.saturating_sub(CURSOR_H * cs) as i64;
         let nx = ((old_x as i64 + mdx as i64).clamp(0, max_x)) as usize;
         let ny = ((old_y as i64 + mdy as i64).clamp(0, max_y)) as usize;
-        (width, height, old_x, old_y, nx, ny)
+        (old_x, old_y, nx, ny)
     };
     if nx == old_x && ny == old_y {
         return; // pinned at an edge

@@ -126,15 +126,26 @@ if (-not (Has-Line $content @('[mouse] pos=('))) {
 #     MOVE_CURSOR command), so input->present may legitimately be empty and
 #     input->MOVE_CURSOR is the signal to require instead.
 $hwLive = Has-Line $content @('[vgpu] cursor: hardware cursor live')
-if (Has-Line $content @('[vgpu] latency: no input samples')) {
-    $script:fail += 'latency: every window reported "no input samples" despite mouse injection'
-}
+# "no input samples" is NOT a failure on its own: with the hardware cursor live
+# a mouse move produces no framebuffer damage, so the present probe correctly
+# sees nothing, and a quiet window legitimately reports zero. It is only a
+# problem if EVERY window is empty while input was definitely injected, which
+# is checked below by requiring a real sample from the correct probe.
 if ($hwLive) {
     if (-not (Has-Line $content @('[vgpu] latency: input->MOVE_CURSOR', 'n=', 'avg='))) {
         $script:fail += 'latency: hardware cursor is live but no input->MOVE_CURSOR latency was reported'
     }
 } elseif (-not (Has-Line $content @('[vgpu] latency: input->present', 'n=', 'avg='))) {
     $script:fail += 'latency: no input->present sample reported (probe did not close the loop)'
+}
+# M10b 4: the adaptive present must be reported with its cadence, and the
+# frame-interval (pacing) stats must appear once the console has presented
+# more than once.
+if (-not (Has-Line $content @('[vgpu] present: flusher scheduled', 'adaptive cadence'))) {
+    $script:fail += 'latency: flusher did not report the adaptive cadence (M10b 4 pacing)'
+}
+if (-not (Has-Line $content @('[vgpu] pacing:', 'presents', 'interval'))) {
+    $script:fail += 'latency: no frame-interval (pacing) stats reported (M10b 4)'
 }
 if ($content | Where-Object { $_ -match 'EXCEPTION' -and $_ -notmatch 'Breakpoint' }) {
     $script:fail += 'latency: unexpected exception occurred'
