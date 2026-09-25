@@ -819,56 +819,91 @@ a text console that changes a few hundred bytes per keystroke. Stage 3a
 tracks what the console actually drew and pushes only that.
 
 **Design.** `framebuffer.rs` grows a **dirty-rectangle accumulator**: an
-inclusive bounding box (`DIRTY_X0/Y0/X1/Y1`) widened by every pixel write.
-It is marked at the single chokepoint every console draw flows through —
-`TextConsole::set_pixel` — plus the two paths that write bytes directly
-(`clear_row`, `scroll_up`). Merging is a lock-free CAS loop (X0 is the
-serialization point) because `set_pixel` runs once per lit glyph pixel,
-including from IRQ-adjacent and IF=0 paths, so it must never block. The
-present side calls `take_dirty_rect()` each 100 ms tick: `None` means nothing
-was drawn and **both** device commands are skipped; `Some((x0,y0,x1,y1))`
-becomes the device rect (clamped to the resource so a stale box can never
-address outside the backing). A rect whose flush *fails* is re-armed
-(`mark_dirty_public`) so its pixels are retried instead of being lost. The
-first present after `adopt` marks the whole surface dirty explicitly — the
-new buffer is entirely undisplayed regardless of what the console happened to
-draw.
+inclusive bounding box widened by every pixel write. It is marked at the
+single chokepoint every console draw flows through — `TextConsole::set_pixel`
+— plus the two paths that write bytes directly (`clear_row`, `scroll_up`).
+It lives behind one `spin::Mutex`, and `take_dirty_rect()` takes-and-clears in
+a single acquisition (see bug 1 below for why that specific discipline is
+required). The present side calls `take_dirty_rect()` each 100 ms tick:
+`None` means nothing was drawn and **both** device commands are skipped;
+`Some((x0,y0,x1,y1))` becomes the device rect (clamped to the resource so a
+stale box can never address outside the backing). A rect whose flush *fails*
+is re-armed (`mark_dirty_public`) so its pixels are retried instead of being
+lost. The first present after `adopt` marks the whole surface dirty
+explicitly — the new buffer is entirely undisplayed regardless of what the
+console happened to draw.
 
 **Why a bounding box, not a rect list:** the device takes one rect per flush,
 so a single box is exactly the API's shape. A keystroke's glyph (8×8, or
 16 px at scale 2) is tiny, and a burst of text between ticks collapses into
 one box — the win is the box being small, not the draw count.
 
-**Measured** (`-vga virtio`, 40 s boot, live serial, counter built in):
+**Measured** (`-vga virtio`, ~40 s boot, live serial, counter built in). The
+first window is boot-time console output; later windows are the settled
+console:
 
 ```
-[vgpu] flush: 50 ticks, 41 idle-skips, 40545 KiB pushed
-             (full-rect would be 405000 KiB, saved 364454 KiB)
+[vgpu] flush: 50 ticks, 41 idle-skips, 40297 KiB pushed
+             (full-rect would be 405000 KiB, saved 364702 KiB)
+[vgpu] flush: 50 ticks, 49 idle-skips, 7680 KiB pushed
+             (full-rect would be 405000 KiB, saved 397320 KiB)
 ```
 
-**~90 % of the DMA eliminated** on this boot, and the counters are printed so
-the saving is auditable rather than estimated (the earlier "~160 MiB/s" was a
-back-of-envelope figure; this is the measured one). The 41 idle-skips are the
-point: an idle console now costs *zero* DMA where it previously cost a full
-8.1 MiB surface ten times a second. The ~9 active ticks are real boot-time
-console output (shell/fstest echo), not waste.
+**The 49/50 idle-skips are the headline:** once the console is quiet, 49 of
+every 50 ticks push *nothing at all* (zero DMA), where the old full-rect
+flusher pushed 8.1 MiB on every one of them. When work does happen it is
+~7680 KiB per 50-tick window vs 405000 KiB full-rect — a **~98 % reduction**
+in active windows. The counters are printed so the saving is auditable rather
+than estimated (the earlier "~160 MiB/s" was a back-of-envelope figure).
+These are the numbers *after* the race fix (bug 1); the pre-fix CAS version
+measured worse (41/50 skips) precisely because it was losing rects.
 
 Suites: `test-gpu.ps1` ×2, `test-smp.ps1`, `test-avx.ps1`, `test-fs.ps1`,
 `test-shell.ps1` — all exit 0. `build.ps1` clean. QEMU `guest_errors` empty on
 the virtio boot.
 
-### M10b stage 3a — bug found and solved
+### M10b stage 3a — bugs found and solved
 
-- **Concurrent suites kill each other's QEMU and read as kernel failures.**
-  `test-*.ps1` all call `Get-Process qemu-system-x86_64 | Stop-Process -Force`
-  in `Invoke-Boot`, so two suites run even slightly overlapped produce
-  `QEMU self-exited` on boots that were merely cut short (a boot truncated
-  mid-way misses later markers like `fpu-test: task A PASSED`, which then
-  reports as an SMP regression even though the SMP path is fine — the
-  affected boot in one run reached `bring-up complete` and produced a normal
-  432-line log, just not the tail). Fix: run the suites strictly one at a
-  time, each as its own child `powershell`, and treat a `QEMU self-exited` or
-  a missing tail-marker with a re-run before believing it.
+1. **The dirty-rect accumulator could LOSE a rect (the one failure a present
+   path must not have).** The first version made the four box edges
+   lock-free, with a `compare_exchange` on `DIRTY_X0` as a claimed ownership
+   token and three plain stores for the other edges. That is wrong in two
+   distinct ways, both found by re-reading the code rather than by a failing
+   test:
+   - A marker that widened *only* the other three edges (i.e. its `x0` was
+     already the box minimum) would CAS `DIRTY_X0` to **the same value**, so
+     the CAS did not actually exclude a concurrent taker — the "ownership"
+     was a fiction and a rect could still be lost.
+   - A taker that read the box with four independent operations could observe
+     a half-updated box, and a marker landing between its read and its clear
+     had its damage discarded.
+
+   Lost damage means pixels that are never presented and never redrawn — stale
+   garbage on screen, the exact failure the present path exists to prevent.
+   Fix: a single `spin::Mutex<Option<(x0,y0,x1,y1)>>`; the mark widens under
+   the lock and `take_dirty_rect()` takes-and-clears in ONE acquisition, so a
+   concurrent marker either merges into the rect we are returning (and is
+   included in this flush) or lands after the clear (and waits for the next
+   tick). No window exists. The lock is uncontended and never blocks inside
+   (pure arithmetic, microseconds), and every console write already runs under
+   the `CONSOLE` lock, so the added cost is a few instructions.
+2. **Concurrent suites kill each other's QEMU and read as kernel failures.**
+   `test-*.ps1` all call `Get-Process qemu-system-x86_64 | Stop-Process -Force`
+   in `Invoke-Boot`, so two suites run even slightly overlapped produce
+   `QEMU self-exited` on boots that were merely cut short (a boot truncated
+   mid-way misses later markers like `fpu-test: task A PASSED`, which then
+   reports as an SMP regression even though the SMP path is fine — the
+   affected boot in one run reached `bring-up complete` and produced a normal
+   432-line log, just not the tail). Fix: run the suites strictly one at a
+   time, each as its own child `powershell`, and treat a `QEMU self-exited` or
+   a missing tail-marker with a re-run before believing it.
+3. **A busy host makes a 30 s boot window flaky.** `Invoke-Boot` samples the
+   serial log after a fixed `Start-Sleep` and then asserts `fstest: PASSED` +
+   `autoexec done`; on a loaded machine the boot can miss the window and the
+   suite reports a boot-flow failure that has nothing to do with the change
+   under test. Observed once on boot 1 (std-VGA, no virtio involved); the
+   immediate re-run was clean. Fix: same discipline as (2) — re-run before
+   believing a boot-flow-only failure, and never run two boots concurrently.
 
 ## M9.5 — Graphical desktop userspace (DEFERRED)
 

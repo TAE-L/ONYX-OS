@@ -154,25 +154,26 @@ static CONSOLE: Mutex<Option<TextConsole>> = Mutex::new(None);
 /// Bytes mirrored to the console (observable on serial: proves the path lives).
 static CONSOLE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-/// Bounding box of everything drawn since the last [`take_dirty_rect`], in
-/// pixels, with the `usize::MAX` sentinel meaning "nothing dirty yet".
+/// The damaged region since the last [`take_dirty_rect`]: an inclusive
+/// bounding box, or `None` for "nothing dirty".
 ///
 /// Why a bounding box and not a list of rects: the present path pushes one
 /// `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH` pair per flush, so a single
 /// rectangle is exactly what the device API wants. A keystroke touches one
-/// glyph (~8x8 at scale 1, or a 16px row at scale 2), so the box is tiny even
-/// when a burst of text arrives — the win comes from the box being small, not
-/// from the count of draws inside it.
+/// glyph (8x8 at scale 1, 16 px at scale 2), so the box stays tiny even when
+/// a burst of text arrives — the win comes from the box being small, not from
+/// the count of draws inside it.
 ///
-/// The merge is a CAS loop rather than a lock: this is called from
-/// `set_pixel`, i.e. once per lit glyph pixel, including from IRQ-adjacent
-/// and IF=0 paths. It must never block. A lost race only costs precision (one
-/// rect's edges computed from a stale snapshot), never correctness, because
-/// every update re-reads and widens.
-static DIRTY_X0: AtomicUsize = AtomicUsize::new(usize::MAX);
-static DIRTY_Y0: AtomicUsize = AtomicUsize::new(usize::MAX);
-static DIRTY_X1: AtomicUsize = AtomicUsize::new(0);
-static DIRTY_Y1: AtomicUsize = AtomicUsize::new(0);
+/// Why a lock and not a lock-free CAS: an earlier version tried to make the
+/// four edges lock-free with a CAS on X0 as an ownership token. That is
+/// subtly wrong — when a marker widens only the *other* three edges (x0 is
+/// already the minimum), its CAS writes the same value and does not actually
+/// exclude a concurrent taker, so a rect can still be lost. A spin mutex is
+/// a few instructions uncontended, the critical sections are pure arithmetic
+/// with no blocking, and it is *provably* mutually exclusive. Correctness of
+/// the present path outranks shaving nanoseconds off `set_pixel`, which is
+/// already inside a CONSOLE lock for every console write.
+static DIRTY: Mutex<Option<(usize, usize, usize, usize)>> = Mutex::new(None);
 
 /// Widen the dirty box by one pixel.
 #[inline]
@@ -183,35 +184,16 @@ fn mark_dirty(x: usize, y: usize) {
 /// Widen the dirty box by a rectangle (inclusive bounds).
 #[inline]
 fn mark_dirty_rect(x0: usize, y0: usize, x1: usize, y1: usize) {
-    loop {
-        let cur_x0 = DIRTY_X0.load(Ordering::Relaxed);
-        // Already covered? A single acquire load is enough for the common
-        // "inside the existing box" case, which is most calls once a glyph is
-        // being drawn pixel by pixel.
-        if cur_x0 != usize::MAX
-            && x0 >= DIRTY_X0.load(Ordering::Relaxed)
-            && y0 >= DIRTY_Y0.load(Ordering::Relaxed)
-            && x1 <= DIRTY_X1.load(Ordering::Relaxed)
-            && y1 <= DIRTY_Y1.load(Ordering::Relaxed)
-        {
-            return;
-        }
-        let nx0 = if cur_x0 == usize::MAX { x0 } else { cur_x0.min(x0) };
-        let ny0 = if cur_x0 == usize::MAX { y0 } else { DIRTY_Y0.load(Ordering::Relaxed).min(y0) };
-        let nx1 = if cur_x0 == usize::MAX { x1 } else { DIRTY_X1.load(Ordering::Relaxed).max(x1) };
-        let ny1 = if cur_x0 == usize::MAX { y1 } else { DIRTY_Y1.load(Ordering::Relaxed).max(y1) };
-        // Claim the box with X0 as the serialization point: whoever wins this
-        // CAS owns the write, and the others retry against the wider box.
-        if DIRTY_X0
-            .compare_exchange_weak(cur_x0, nx0, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            DIRTY_Y0.store(ny0, Ordering::Relaxed);
-            DIRTY_X1.store(nx1, Ordering::Relaxed);
-            DIRTY_Y1.store(ny1, Ordering::Relaxed);
-            return;
-        }
-    }
+    let mut slot = DIRTY.lock();
+    *slot = Some(match *slot {
+        Some((ax0, ay0, ax1, ay1)) => (
+            ax0.min(x0),
+            ay0.min(y0),
+            ax1.max(x1),
+            ay1.max(y1),
+        ),
+        None => (x0, y0, x1, y1),
+    });
 }
 
 /// Take the accumulated dirty rectangle, clearing the accumulator.
@@ -220,25 +202,14 @@ fn mark_dirty_rect(x0: usize, y0: usize, x1: usize, y1: usize) {
 /// cue to skip the transfer entirely. On `Some`, the box is inclusive in both
 /// axes and the accumulator is re-armed empty.
 ///
-/// The clear-then-read order is deliberate: a draw racing this function may
-/// widen the box *after* we read it, and that rect simply waits for the next
-/// call. The alternative (read, then clear) can lose a concurrent draw
-/// entirely — a dropped frame that never gets redrawn.
+/// Taking the box and re-arming it under ONE lock acquisition is what makes
+/// this safe: a marker either merges into the box we are about to return (and
+/// is therefore included in the transfer), or lands after we have cleared it
+/// (and waits for the next tick). There is no window in which damage is
+/// recorded but never presented — the one failure a present path must not
+/// have, which is stale pixels that nothing will ever redraw.
 pub fn take_dirty_rect() -> Option<(usize, usize, usize, usize)> {
-    let x0 = DIRTY_X0.swap(usize::MAX, Ordering::AcqRel);
-    if x0 == usize::MAX {
-        return None;
-    }
-    let y0 = DIRTY_Y0.swap(usize::MAX, Ordering::AcqRel);
-    let x1 = DIRTY_X1.swap(0, Ordering::AcqRel);
-    let y1 = DIRTY_Y1.swap(0, Ordering::AcqRel);
-    // Ignore any partial accumulation (x1 < x0) left by a writer that claimed
-    // X0 but had not yet stored the other edges: it is still mid-update and
-    // will re-mark on its next pixel.
-    if x1 < x0 || y1 < y0 {
-        return None;
-    }
-    Some((x0, y0, x1, y1))
+    DIRTY.lock().take()
 }
 
 /// Mark the whole surface dirty — used by the present path's own first frame
