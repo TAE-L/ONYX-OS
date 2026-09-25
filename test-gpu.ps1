@@ -156,6 +156,9 @@ function Check-Present($log, [string]$label, [bool]$expect2D = $true) {
     if (-not (Has-Line $log @('[vgpu] present: flusher scheduled'))) {
         $script:fail += "$label`: 100 ms flusher not scheduled"
     }
+    if (-not (Has-Line $log @('[vgpu] flush:', 'idle-skips', 'saved'))) {
+        $script:fail += "$label`: damage-rect flush report missing (no 'ticks/idle-skips/saved' line within 5 s)"
+    }
 }
 
 Write-Output '=== boot 1: std VGA, 128 MiB VRAM ==='

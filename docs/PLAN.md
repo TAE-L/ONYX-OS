@@ -54,7 +54,7 @@ Two signature goals beyond "a working hobby OS":
 | **M9.6** | **Core hardening + missing subsystems** — A: upgrades (TSC ns timekeeping ✅, APIC/IOAPIC + LAPIC timer ✅, scheduler v2 ✅, FPU/SIMD save-restore ✅, block cache ✅, frame alloc v2 ✅) · B: missing subsystems (PCI ✅, ACPI ✅, process lifecycle ✅, raw input ring ✅, `perf` instrumentation ✅) · C: ABI/file-API foundation (argv/envp/auxv ✅, user-pointer validation ✅, errno ✅, mount table) | **done** — A1–A6, B1–B5, C1–C3 all complete; M9.6 regressions pass on BIOS + UEFI (test-fs, test-sched, test-proc, test-block, test-memory, test-pci, test-acpi, test-raw, test-input, test-fpu, test-time, test-args). |
 | **M9.7** | **Linux ABI compat — run static Linux ELFs**: syscall-number shim, argv/envp/auxv, `arch_prctl` TLS, mmap/brk, PIE/relocations | ✅ done |
 | **M9.8** | **SMP — multi-core** (its own stage, per decision): MADT-driven AP startup, per-CPU data, per-CPU run queues + IPIs | ✅ done — GS-base per-CPU blocks, INIT-SIPI-SIPI AP bring-up through a hand-assembled low-page trampoline, per-CPU GDT/TSS + IDT + LAPIC timers, reschedule IPI, per-CPU RSP/syscall slots, boot context restored as a task, kernel-service lock (`ksl`) + input/keyboard/mouse locking, **task migration with work stealing**, stall diagnostic re-based on provable starvation, and the `xsave64`/`xrstor64` EDX:EAX mask bug fixed (AVX/YMM now survives switches under migration); `test-smp.ps1` passes at `-smp 1/2/4`, `test-avx.ps1` at `-smp 4 -cpu max` (200+ rounds, zero failures), all 25 suites green |
-| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b stage 1 ✅ **done** (virtio-gpu transport probe: four capability regions, VERSION_1 negotiated, 2 queues/1 scanout, `virgl=1 ctx=1` on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green); M10b stage 2 ✅ **done** (control virtqueue engine + GEM-lite resource: queue → DRIVER_OK → CREATE_2D/ATTACH_BACKING → canary → SET_SCANOUT/TRANSFER+FLUSH → console adopt + 100 ms flusher on `-vga virtio`; graceful no-transport fallback on std-VGA, documented virgl 2D-skip on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green, QEMU `guest_errors` empty); M10b stage 3 (next): damage-rect flush tracking, scatter-gather backing, cursor queue, virgl/3D; M10b/c direction: **virtio-gpu is the primary backend** (DMA resources, command virtqueues, host-GPU 3D via virgl), the dispi driver stays as the legacy fallback backend |
+| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b stage 1 ✅ **done** (virtio-gpu transport probe: four capability regions, VERSION_1 negotiated, 2 queues/1 scanout, `virgl=1 ctx=1` on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green); M10b stage 2 ✅ **done** (control virtqueue engine + GEM-lite resource: queue → DRIVER_OK → CREATE_2D/ATTACH_BACKING → canary → SET_SCANOUT/TRANSFER+FLUSH → console adopt + 100 ms flusher on `-vga virtio`; graceful no-transport fallback on std-VGA, documented virgl 2D-skip on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green, QEMU `guest_errors` empty); M10b stage 3a ✅ **done** (damage-rect present: dirty bbox tracked in `framebuffer.rs`, only what the console drew is transferred; measured ~90 % DMA saved, idle console costs zero — all suites green); M10b stage 3b (next): scatter-gather backing + cursor queue, then the surface/blit API or virgl/3D; M10b/c direction: **virtio-gpu is the primary backend** (DMA resources, command virtqueues, host-GPU 3D via virgl), the dispi driver stays as the legacy fallback backend |
 | M11 | NTFS read-only + multi-drive mounting | extra Windows compat |
 | **M12** | **PE foundation**: parse `.exe` / `.dll` (PE/COFF), relocations, DLL imports groundwork | solid foundation only |
 | M13 | GUI: window manager + compositor + built-in apps (terminal, file manager) | apps on the M9.5 base |
@@ -809,6 +809,66 @@ the console onto the virtio surface and schedules the 100 ms flusher; boot 4
 brings the queue up and takes the documented virgl 2D-skip. QEMU's
 `guest_errors` log is empty on the virtio boot (every command the device
 rejected would be named there). The four regression suites stay at exit 0.
+
+## M10b stage 3a — damage-rect present (done)
+
+**Scope:** the increment that turns the present path from *correct* into
+*cheap*. Stage 2 flushed the **whole** 8294400-byte surface every 100 ms —
+a full `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH` pair, ~160 MiB/s of DMA, for
+a text console that changes a few hundred bytes per keystroke. Stage 3a
+tracks what the console actually drew and pushes only that.
+
+**Design.** `framebuffer.rs` grows a **dirty-rectangle accumulator**: an
+inclusive bounding box (`DIRTY_X0/Y0/X1/Y1`) widened by every pixel write.
+It is marked at the single chokepoint every console draw flows through —
+`TextConsole::set_pixel` — plus the two paths that write bytes directly
+(`clear_row`, `scroll_up`). Merging is a lock-free CAS loop (X0 is the
+serialization point) because `set_pixel` runs once per lit glyph pixel,
+including from IRQ-adjacent and IF=0 paths, so it must never block. The
+present side calls `take_dirty_rect()` each 100 ms tick: `None` means nothing
+was drawn and **both** device commands are skipped; `Some((x0,y0,x1,y1))`
+becomes the device rect (clamped to the resource so a stale box can never
+address outside the backing). A rect whose flush *fails* is re-armed
+(`mark_dirty_public`) so its pixels are retried instead of being lost. The
+first present after `adopt` marks the whole surface dirty explicitly — the
+new buffer is entirely undisplayed regardless of what the console happened to
+draw.
+
+**Why a bounding box, not a rect list:** the device takes one rect per flush,
+so a single box is exactly the API's shape. A keystroke's glyph (8×8, or
+16 px at scale 2) is tiny, and a burst of text between ticks collapses into
+one box — the win is the box being small, not the draw count.
+
+**Measured** (`-vga virtio`, 40 s boot, live serial, counter built in):
+
+```
+[vgpu] flush: 50 ticks, 41 idle-skips, 40545 KiB pushed
+             (full-rect would be 405000 KiB, saved 364454 KiB)
+```
+
+**~90 % of the DMA eliminated** on this boot, and the counters are printed so
+the saving is auditable rather than estimated (the earlier "~160 MiB/s" was a
+back-of-envelope figure; this is the measured one). The 41 idle-skips are the
+point: an idle console now costs *zero* DMA where it previously cost a full
+8.1 MiB surface ten times a second. The ~9 active ticks are real boot-time
+console output (shell/fstest echo), not waste.
+
+Suites: `test-gpu.ps1` ×2, `test-smp.ps1`, `test-avx.ps1`, `test-fs.ps1`,
+`test-shell.ps1` — all exit 0. `build.ps1` clean. QEMU `guest_errors` empty on
+the virtio boot.
+
+### M10b stage 3a — bug found and solved
+
+- **Concurrent suites kill each other's QEMU and read as kernel failures.**
+  `test-*.ps1` all call `Get-Process qemu-system-x86_64 | Stop-Process -Force`
+  in `Invoke-Boot`, so two suites run even slightly overlapped produce
+  `QEMU self-exited` on boots that were merely cut short (a boot truncated
+  mid-way misses later markers like `fpu-test: task A PASSED`, which then
+  reports as an SMP regression even though the SMP path is fine — the
+  affected boot in one run reached `bring-up complete` and produced a normal
+  432-line log, just not the tail). Fix: run the suites strictly one at a
+  time, each as its own child `powershell`, and treat a `QEMU self-exited` or
+  a missing tail-marker with a re-run before believing it.
 
 ## M9.5 — Graphical desktop userspace (DEFERRED)
 

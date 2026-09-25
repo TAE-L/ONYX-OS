@@ -154,6 +154,112 @@ static CONSOLE: Mutex<Option<TextConsole>> = Mutex::new(None);
 /// Bytes mirrored to the console (observable on serial: proves the path lives).
 static CONSOLE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Bounding box of everything drawn since the last [`take_dirty_rect`], in
+/// pixels, with the `usize::MAX` sentinel meaning "nothing dirty yet".
+///
+/// Why a bounding box and not a list of rects: the present path pushes one
+/// `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH` pair per flush, so a single
+/// rectangle is exactly what the device API wants. A keystroke touches one
+/// glyph (~8x8 at scale 1, or a 16px row at scale 2), so the box is tiny even
+/// when a burst of text arrives — the win comes from the box being small, not
+/// from the count of draws inside it.
+///
+/// The merge is a CAS loop rather than a lock: this is called from
+/// `set_pixel`, i.e. once per lit glyph pixel, including from IRQ-adjacent
+/// and IF=0 paths. It must never block. A lost race only costs precision (one
+/// rect's edges computed from a stale snapshot), never correctness, because
+/// every update re-reads and widens.
+static DIRTY_X0: AtomicUsize = AtomicUsize::new(usize::MAX);
+static DIRTY_Y0: AtomicUsize = AtomicUsize::new(usize::MAX);
+static DIRTY_X1: AtomicUsize = AtomicUsize::new(0);
+static DIRTY_Y1: AtomicUsize = AtomicUsize::new(0);
+
+/// Widen the dirty box by one pixel.
+#[inline]
+fn mark_dirty(x: usize, y: usize) {
+    mark_dirty_rect(x, y, x, y);
+}
+
+/// Widen the dirty box by a rectangle (inclusive bounds).
+#[inline]
+fn mark_dirty_rect(x0: usize, y0: usize, x1: usize, y1: usize) {
+    loop {
+        let cur_x0 = DIRTY_X0.load(Ordering::Relaxed);
+        // Already covered? A single acquire load is enough for the common
+        // "inside the existing box" case, which is most calls once a glyph is
+        // being drawn pixel by pixel.
+        if cur_x0 != usize::MAX
+            && x0 >= DIRTY_X0.load(Ordering::Relaxed)
+            && y0 >= DIRTY_Y0.load(Ordering::Relaxed)
+            && x1 <= DIRTY_X1.load(Ordering::Relaxed)
+            && y1 <= DIRTY_Y1.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let nx0 = if cur_x0 == usize::MAX { x0 } else { cur_x0.min(x0) };
+        let ny0 = if cur_x0 == usize::MAX { y0 } else { DIRTY_Y0.load(Ordering::Relaxed).min(y0) };
+        let nx1 = if cur_x0 == usize::MAX { x1 } else { DIRTY_X1.load(Ordering::Relaxed).max(x1) };
+        let ny1 = if cur_x0 == usize::MAX { y1 } else { DIRTY_Y1.load(Ordering::Relaxed).max(y1) };
+        // Claim the box with X0 as the serialization point: whoever wins this
+        // CAS owns the write, and the others retry against the wider box.
+        if DIRTY_X0
+            .compare_exchange_weak(cur_x0, nx0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            DIRTY_Y0.store(ny0, Ordering::Relaxed);
+            DIRTY_X1.store(nx1, Ordering::Relaxed);
+            DIRTY_Y1.store(ny1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Take the accumulated dirty rectangle, clearing the accumulator.
+///
+/// Returns `None` when nothing was drawn since the last call — the caller's
+/// cue to skip the transfer entirely. On `Some`, the box is inclusive in both
+/// axes and the accumulator is re-armed empty.
+///
+/// The clear-then-read order is deliberate: a draw racing this function may
+/// widen the box *after* we read it, and that rect simply waits for the next
+/// call. The alternative (read, then clear) can lose a concurrent draw
+/// entirely — a dropped frame that never gets redrawn.
+pub fn take_dirty_rect() -> Option<(usize, usize, usize, usize)> {
+    let x0 = DIRTY_X0.swap(usize::MAX, Ordering::AcqRel);
+    if x0 == usize::MAX {
+        return None;
+    }
+    let y0 = DIRTY_Y0.swap(usize::MAX, Ordering::AcqRel);
+    let x1 = DIRTY_X1.swap(0, Ordering::AcqRel);
+    let y1 = DIRTY_Y1.swap(0, Ordering::AcqRel);
+    // Ignore any partial accumulation (x1 < x0) left by a writer that claimed
+    // X0 but had not yet stored the other edges: it is still mid-update and
+    // will re-mark on its next pixel.
+    if x1 < x0 || y1 < y0 {
+        return None;
+    }
+    Some((x0, y0, x1, y1))
+}
+
+/// Mark the whole surface dirty — used by the present path's own first frame
+/// and by anything that rebuilds the console from scratch.
+pub fn mark_all_dirty(width: usize, height: usize) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    mark_dirty_rect(0, 0, width - 1, height - 1);
+}
+
+/// Re-arm a rect that a flush FAILED to present, so the pixels are retried
+/// next tick instead of being lost. Dimensions (not bounds), matching the
+/// device rect the flusher sent.
+pub fn mark_dirty_public(x: usize, y: usize, w: usize, h: usize) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    mark_dirty_rect(x, y, x + w - 1, y + h - 1);
+}
+
 /// Current cursor position (top-left of the sprite).
 static CUR_X: AtomicUsize = AtomicUsize::new(0);
 static CUR_Y: AtomicUsize = AtomicUsize::new(0);
@@ -312,6 +418,11 @@ pub fn adopt(framebuffer: &'static mut [u8], info: FrameBufferInfo) {
     // buffer just handed to the writer, and `CONSOLE` is its only other view.
     let fb: &'static mut [u8] = unsafe { &mut *writable };
     *CONSOLE.lock() = Some(TextConsole::new(fb, info, writer_scale));
+    // The whole new surface has just been cleared, headered and re-armed: the
+    // first present must push ALL of it. (The console's own clear_row already
+    // marked most of it, but relying on that would make correctness depend on
+    // a draw path's internals — this states the invariant outright.)
+    mark_all_dirty(info.width, info.height);
 }
 
 /// `(width, height, bytes_per_pixel)` of the surface the console is drawing
@@ -637,6 +748,12 @@ impl TextConsole {
         if i + 3 > self.framebuffer.len() {
             return;
         }
+        // Every console pixel write flows through here, so this is the ONE
+        // place that has to know about damage. Tracking it at the single
+        // chokepoint is what keeps the invariant true: if a future draw path
+        // forgets to mark itself dirty, it shows up here as a missing rect
+        // rather than as a subtly wrong frame on screen.
+        mark_dirty(x, y);
         let r = ((rgb >> 16) & 0xff) as u8;
         let g = ((rgb >> 8) & 0xff) as u8;
         let b = (rgb & 0xff) as u8;
@@ -661,6 +778,12 @@ impl TextConsole {
     fn clear_row(&mut self, y: usize) {
         if y >= self.bottom {
             return;
+        }
+        // A cleared row is a full-width dirty band; mark it as a whole row so
+        // the flusher still covers it (clear_row writes bytes directly, not
+        // through set_pixel, so it would otherwise leave no trace at all).
+        if y < self.height {
+            mark_dirty_rect(0, y, self.width.saturating_sub(1), y);
         }
         let bpp = self.bytes_per_pixel.max(1);
         let i0 = y * self.stride * bpp;
@@ -691,6 +814,11 @@ impl TextConsole {
         if px == 0 {
             return;
         }
+        // The memmove below rewrites whole rows without going through
+        // set_pixel, so the damaged band is the ENTIRE console region, not just
+        // the vacated rows. Marking only the bottom would leave stale text in
+        // every row that moved - the classic off-by-px scroll bug.
+        mark_dirty_rect(0, self.top, self.width.saturating_sub(1), self.bottom.saturating_sub(1));
         let bpp = self.bytes_per_pixel.max(1);
         let row_bytes = self.stride * bpp;
         if px >= self.bottom - self.top {
