@@ -1524,6 +1524,16 @@ fn frame_clock_task() {
 
 /// Spawn the kernel frame clock (M10b 8). Only on the virtio present path.
 pub fn spawn_frame_clock() {
+    // M10b 9: the frame clock is spawned on the CURRENT cpu (the flusher's cpu),
+    // deliberately. Pinning it to another core (`spawn_on_cpu(..., 1)`) measured
+    // better (5 -> ~10 fps) but crashed with a null-context jump: `spawn_on_cpu`
+    // only sets `owner_cpu` and assumes the target AP is already fully online
+    // with its per-CPU context set up, which is NOT true at present-bringup
+    // time, and `plan_switch` is free to steal an `owner_cpu=1` task onto
+    // CPU-0 (the affinity filter was removed in M9.8-d/e), so its context can
+    // run on the wrong core. Spawning on the current cpu keeps the task's
+    // context self-consistent. Getting true cross-core affinity right is a
+    // scheduler fix, not a present fix - tracked for the scheduler track.
     crate::scheduler::spawn(frame_clock_task);
 }
 

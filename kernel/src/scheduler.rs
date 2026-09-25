@@ -613,16 +613,13 @@ pub fn sleep_kernel(ms: u64) {
     x86_64::instructions::interrupts::enable();
 }
 
-/// M10b 6 (event-driven present): wake a Sleeping task immediately, before its
-/// timer deadline.
+/// M10b 6/9: wake a Sleeping task immediately, before its timer deadline.
 ///
 /// This is the primitive that lets the present path be driven by DAMAGE rather
-/// than by a poll timer. `sleep_kernel` parks a task and the 1 ms timer wakes it
-/// when `now >= sleep_until_ms`; the flusher's response to a drawn change was
-/// therefore bounded below by "how long until the timer tick, and then how long
-/// until the scheduler runs me again" — measured as ~170 ms of scheduling
-/// latency. When the console draws something, this makes the flusher Ready at
-/// once, so it does not have to wait out its remaining back-off.
+/// than by a poll timer (stage 6), extended in stage 9 to also reschedule the
+/// LOCAL cpu on a same-CPU wake, so the woken flusher does not also wait out a
+/// full 1 ms LAPIC tick before the scheduler reaches it (the 150-950 ms
+/// inter-present gap the frame clock measured).
 ///
 /// Safe to call from any context (IRQ or task): it takes the scheduler guard
 /// and only ever promotes Sleeping -> Ready, which is idempotent and cannot
@@ -651,6 +648,15 @@ pub fn wake_task_now(id: u64) -> bool {
     if woke {
         smp::kick_others();
     }
+    // M10b 9: a same-CPU wake is NOT self-IPI'd here. The reschedule IPI reaches
+    // this CPU's handler in arbitrary interrupt state, and a present-latency
+    // micro-optimization is not worth a #GP when it can preempt a task that is
+    // already inside the scheduler lock or mid-context. The local CPU still
+    // re-schedules on its next 1 ms tick; the frame-clock experiment (stage 9)
+    // shows the real win comes from removing CPU CONTENTION (running the load
+    // on a different core), not from shaving the same-CPU tick. Re-visit a safe
+    // local-wake (e.g. a flag the timer honours) only if measurements demand
+    // it.
     woke
 }
 pub fn block_current_on_input() {
