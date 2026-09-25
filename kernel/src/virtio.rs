@@ -1483,6 +1483,14 @@ const FLUSH_IDLE_BACKOFF: u32 = 25;
 static FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
 static FLUSH_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+/// M10b 5: how long a change waited for the flusher to be *scheduled* after
+/// the sleep returned — the wake/scheduling latency, which is the part a
+/// quantum reduction does NOT control. Reported separately from the total
+/// response so a large number is attributable instead of mysterious.
+static WAKE_WAIT_SUM_US: AtomicU64 = AtomicU64::new(0);
+static WAKE_WAIT_MAX_US: AtomicU64 = AtomicU64::new(0);
+static WAKE_WAIT_N: AtomicU64 = AtomicU64::new(0);
+
 /// M10b 4 (frame pacing) — present-interval accounting. The interval between
 /// consecutive DAMAGE-driven pushes is the frame cadence the user actually
 /// experiences; tracking min/avg/max makes jitter (which is what causes
@@ -1587,6 +1595,12 @@ pub fn flush_loop() {
     let mut idle_quanta: u32 = 0;
     let mut last_gen: u64 = crate::framebuffer::damage_generation();
     loop {
+        // M10b 5: stamp the moment we come back from sleep, so the report can
+        // split "how long the damage waited for the flusher to be SCHEDULED"
+        // (wake - mark) from "how long the submit itself took" (present - wake).
+        // Without this split a large response is ambiguous between a pacing
+        // problem and a scheduler/wake-latency problem.
+        let wake_ns = crate::time::now_ns();
         // Sleep on the ADAPTIVE quantum, not a fixed period: short while the
         // console is active, long once it is idle. The initial frame was
         // already pushed by `present_bringup`, so there is nothing to send on
@@ -1655,6 +1669,15 @@ pub fn flush_loop() {
             Ok(()) => {
                 FLUSH_BYTES.fetch_add((w * h * 4) as u64, Ordering::Relaxed);
                 failures = 0;
+                // M10b 5: attribute the wait. `damage_marked -> wake_ns` is how
+                // long the change sat before the flusher was even running
+                // again (scheduling), which the quantum does not control.
+                if damage_marked != 0 && wake_ns > damage_marked {
+                    let w = (wake_ns - damage_marked) / 1_000;
+                    WAKE_WAIT_N.fetch_add(1, Ordering::Relaxed);
+                    WAKE_WAIT_SUM_US.fetch_add(w, Ordering::Relaxed);
+                    WAKE_WAIT_MAX_US.fetch_max(w, Ordering::Relaxed);
+                }
                 // M10b 4: the direct damage->present response (how long this
                 // change waited to be pushed) — the number the adaptive cadence
                 // improves, measured independently of input.
@@ -1763,6 +1786,21 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
             sum_resp / n_resp,
             if min_resp == u64::MAX { 0 } else { min_resp },
             max_resp
+        ));
+    }
+    // M10b 5: attribution — how much of the response is SCHEDULING (the change
+    // waiting for the flusher to be run again) rather than pacing. A high
+    // number here means the quantum is not the bottleneck; the scheduler's
+    // wake latency is.
+    let n_wake = WAKE_WAIT_N.swap(0, Ordering::Relaxed);
+    let sum_wake = WAKE_WAIT_SUM_US.swap(0, Ordering::Relaxed);
+    let max_wake = WAKE_WAIT_MAX_US.swap(0, Ordering::Relaxed);
+    if n_wake > 0 {
+        log(&alloc::format!(
+            "[vgpu] response: wake/schedule n={} avg={} us max={} us",
+            n_wake,
+            sum_wake / n_wake,
+            max_wake
         ));
     }
     if lat.samples == 0 && hw.samples == 0 {

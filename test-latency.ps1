@@ -84,6 +84,19 @@ try {
         if ($i % 2 -eq 0) { $dx = 30; $dy = 18 } else { $dx = -30; $dy = -18 }
         Send-Mon "mouse_move $dx $dy"
     }
+
+    # Phase 2 (M10b 5): ON-DEMAND single-glyph workload. Let the console go
+    # quiet first (so the flusher's idle backoff engages), then type one
+    # character at a time, well spaced. Each keystroke produces ISOLATED
+    # framebuffer damage (the shell echoes it), so the damage->present response
+    # measures a single clean present instead of a boot burst - this is the
+    # workload the burst test could not provide, and the one a pacing A/B needs.
+    Start-Sleep -Seconds 6   # let the console quiesce -> idle backoff engages
+    foreach ($k in 'a', 'b', 'c', 'd', 'e') {
+        Send-Mon "sendkey $k"
+        Start-Sleep -Milliseconds 700   # spacing so each glyph is its own present
+    }
+    Start-Sleep -Seconds 4   # close the window the phase-2 presents fall into
 } catch {
     $script:fail += "latency: could not talk to the QMP monitor ($($_.Exception.Message))"
 } finally {
@@ -96,8 +109,8 @@ if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 Start-Sleep -Milliseconds 500
 
 $content = @(Get-Content $log -ErrorAction SilentlyContinue)
-Write-Output '--- [vgpu] latency + flush lines ---'
-$content | Where-Object { $_.Contains('[vgpu] latency') -or $_.Contains('[vgpu] flush') } | ForEach-Object { "  $_" }
+Write-Output '--- [vgpu] latency + response + pacing + flush lines ---'
+$content | Where-Object { $_ -match '\[vgpu\] (latency|response|pacing|flush)' } | ForEach-Object { "  $_" }
 Write-Output '--- [mouse] pos lines (cursor actually moved) ---'
 $content | Where-Object { $_.Contains('[mouse] pos') } | Select-Object -First 4 | ForEach-Object { "  $_" }
 
