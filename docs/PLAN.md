@@ -54,7 +54,7 @@ Two signature goals beyond "a working hobby OS":
 | **M9.6** | **Core hardening + missing subsystems** — A: upgrades (TSC ns timekeeping ✅, APIC/IOAPIC + LAPIC timer ✅, scheduler v2 ✅, FPU/SIMD save-restore ✅, block cache ✅, frame alloc v2 ✅) · B: missing subsystems (PCI ✅, ACPI ✅, process lifecycle ✅, raw input ring ✅, `perf` instrumentation ✅) · C: ABI/file-API foundation (argv/envp/auxv ✅, user-pointer validation ✅, errno ✅, mount table) | **done** — A1–A6, B1–B5, C1–C3 all complete; M9.6 regressions pass on BIOS + UEFI (test-fs, test-sched, test-proc, test-block, test-memory, test-pci, test-acpi, test-raw, test-input, test-fpu, test-time, test-args). |
 | **M9.7** | **Linux ABI compat — run static Linux ELFs**: syscall-number shim, argv/envp/auxv, `arch_prctl` TLS, mmap/brk, PIE/relocations | ✅ done |
 | **M9.8** | **SMP — multi-core** (its own stage, per decision): MADT-driven AP startup, per-CPU data, per-CPU run queues + IPIs | ✅ done — GS-base per-CPU blocks, INIT-SIPI-SIPI AP bring-up through a hand-assembled low-page trampoline, per-CPU GDT/TSS + IDT + LAPIC timers, reschedule IPI, per-CPU RSP/syscall slots, boot context restored as a task, kernel-service lock (`ksl`) + input/keyboard/mouse locking, **task migration with work stealing**, stall diagnostic re-based on provable starvation, and the `xsave64`/`xrstor64` EDX:EAX mask bug fixed (AVX/YMM now survives switches under migration); `test-smp.ps1` passes at `-smp 1/2/4`, `test-avx.ps1` at `-smp 4 -cpu max` (200+ rounds, zero failures), all 25 suites green |
-| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b stage 1 ✅ **done** (virtio-gpu transport probe: four capability regions, VERSION_1 negotiated, 2 queues/1 scanout, `virgl=1 ctx=1` on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green); M10b stage 2 ✅ **done** (control virtqueue engine + GEM-lite resource: queue → DRIVER_OK → CREATE_2D/ATTACH_BACKING → canary → SET_SCANOUT/TRANSFER+FLUSH → console adopt + 100 ms flusher on `-vga virtio`; graceful no-transport fallback on std-VGA, documented virgl 2D-skip on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green, QEMU `guest_errors` empty); M10b stage 3a ✅ **done** (damage-rect present: dirty bbox tracked in `framebuffer.rs`, only what the console drew is transferred; measured ~90 % DMA saved, idle console costs zero — all suites green); M10b stage 3b ✅ **done** (input→present latency probe: mouse IRQ stamps the input, the flusher times device-ack, power-of-two histogram + n/avg/min/max report, under test in `test-latency.ps1`; measured ~64 ms software-cursor baseline — the number every later optimization is judged against); M10b stage 3c ✅ **done** (hardware cursor on queue 1: sprite uploaded once as a B8G8R8A8 2D resource, every move a 56-byte MOVE_CURSOR with zero framebuffer damage; measured input→MOVE_CURSOR avg=130 µs vs ~57 ms software — a ~440× pointer-latency win; the flusher is scheduled first so the optional cursor can never block present); M10b stage 4 ✅ **done, caveat** (adaptive present cadence: 1 ms latency quantum while active, 16 ms idle backoff, damage-generation change signal; new `response: damage->present` and `pacing: interval` metrics — but the boot-burst test workload can't cleanly A/B the cadence, so no measured win is claimed, only the removal of the structural 100 ms wait); M10b stage 5 ✅ **done — a finding, not a win** (on-demand single-glyph workload + response/wake attribution: ~70% of framebuffer-present latency is SCHEDULER wake latency ~170ms of ~239ms, NOT the pacing quantum — the 1ms quantum/16ms idle are working; the next optimization should attack task wake-up (event-driven present / scheduler priority), not pacing. No latency win claimed from stage 4). M10b stage 6 (next): attack scheduler wake latency (event-driven present, or a present-priority class). M10b/c direction: **virtio-gpu is the primary backend** (DMA resources, command virtqueues), the dispi driver stays as the legacy fallback backend; for a low-latency/gaming OS the present path is the priority, not a general surface/blit API or virgl/3D |
+| **M10** | **GPU driver system — staged, from basic to decent**: M10a PCI GPU scan + modesetting (kernel-controlled framebuffer, replace the bootloader-fixed one); M10b render-surface API (`surface_create/blit/present`) + compositor stub + 2D blits; M10c real acceleration path toward a decent driver (hardware blit/fill where QEMU exposes it, dirty-rect present, vsync-ish pacing) | M10a ✅ **done** (dispi modeset driver, PCI BAR sizing, canary-verified mapping, graceful fallback — `test-gpu.ps1` ×2 green, all suites green); M10b stage 1 ✅ **done** (virtio-gpu transport probe: four capability regions, VERSION_1 negotiated, 2 queues/1 scanout, `virgl=1 ctx=1` on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green); M10b stage 2 ✅ **done** (control virtqueue engine + GEM-lite resource: queue → DRIVER_OK → CREATE_2D/ATTACH_BACKING → canary → SET_SCANOUT/TRANSFER+FLUSH → console adopt + 100 ms flusher on `-vga virtio`; graceful no-transport fallback on std-VGA, documented virgl 2D-skip on virtio-vga-gl — `test-gpu.ps1` 4 boots ×2 green, all suites green, QEMU `guest_errors` empty); M10b stage 3a ✅ **done** (damage-rect present: dirty bbox tracked in `framebuffer.rs`, only what the console drew is transferred; measured ~90 % DMA saved, idle console costs zero — all suites green); M10b stage 3b ✅ **done** (input→present latency probe: mouse IRQ stamps the input, the flusher times device-ack, power-of-two histogram + n/avg/min/max report, under test in `test-latency.ps1`; measured ~64 ms software-cursor baseline — the number every later optimization is judged against); M10b stage 3c ✅ **done** (hardware cursor on queue 1: sprite uploaded once as a B8G8R8A8 2D resource, every move a 56-byte MOVE_CURSOR with zero framebuffer damage; measured input→MOVE_CURSOR avg=130 µs vs ~57 ms software — a ~440× pointer-latency win; the flusher is scheduled first so the optional cursor can never block present); M10b stage 4 ✅ **done, caveat** (adaptive present cadence: 1 ms latency quantum while active, 16 ms idle backoff, damage-generation change signal; new `response: damage->present` and `pacing: interval` metrics — but the boot-burst test workload can't cleanly A/B the cadence, so no measured win is claimed, only the removal of the structural 100 ms wait); M10b stage 5 ✅ **done — a finding, not a win** (on-demand single-glyph workload + response/wake attribution: ~70% of framebuffer-present latency is SCHEDULER wake latency ~170ms of ~239ms, NOT the pacing quantum — the 1ms quantum/16ms idle are working; the next optimization should attack task wake-up (event-driven present / scheduler priority), not pacing. No latency win claimed from stage 4). M10b stage 6 ✅ **done, partial win** (event-driven present: damage path wakes the flusher on the empty→non-empty transition via a new scheduler primitive that also sends the reschedule IPI; flusher promoted to RT. Measured single-glyph present latency 239 → 134 ms, a real ~44% win; residual ~105 ms is upstream ring-3-shell scheduling, not the present path). M10b stage 7 (next): a kernel-local single-glyph present test (bypassing the shell) to finish attributing the residual latency, then real frame pacing/tearing. M10b/c direction: **virtio-gpu is the primary backend** (DMA resources, command virtqueues), the dispi driver stays as the legacy fallback backend; for a low-latency/gaming OS the present path is the priority, not a general surface/blit API or virgl/3D |
 | M11 | NTFS read-only + multi-drive mounting | extra Windows compat |
 | **M12** | **PE foundation**: parse `.exe` / `.dll` (PE/COFF), relocations, DLL imports groundwork | solid foundation only |
 | M13 | GUI: window manager + compositor + built-in apps (terminal, file manager) | apps on the M9.5 base |
@@ -1076,6 +1076,47 @@ attack.
 Suites: `test-latency.ps1` (now runs the on-demand phase + asserts the
 response/pacing/wake lines), `test-gpu.ps1` ×2, `test-smp.ps1`,
 `test-avx.ps1`, `test-fs.ps1`, `test-shell.ps1` — all exit 0. `build.ps1` clean.
+
+## M10b stage 6 — event-driven present (done: mechanism works, partial win)
+
+**Scope:** stage 5 showed the flusher's response was dominated by *scheduling*
+wait (~170 ms of ~239 ms), not the pacing quantum. Stage 6 makes the present
+path event-driven: the damage path wakes the flusher directly on a drawn
+change, instead of relying on the flusher's poll timer to notice.
+
+**What it does.**
+- `scheduler::wake_task_now(id)` — promote a `Sleeping` task to `Ready` now
+  (idempotent, safe from IRQ or task context), and send the reschedule IPI
+  (`smp::kick_others()`) so the newly-Ready task is seen by the other CPUs.
+  This mirrors what `spawn`/`exit`/`kill`/`set_priority` already do.
+- `framebuffer::mark_dirty_rect` calls `virtio::wake_present_on_damage()` on the
+  **empty → non-empty** damage transition only (per-pixel it would take the
+  scheduler lock per pixel; a burst keeps the box non-empty and wakes once).
+- The flusher publishes its task id and promotes itself to **RT** priority, so
+  a damage wake preempts CPU-bound Normal work.
+
+**Measured** (isolated single-glyph presents, `test-latency.ps1`):
+- Before (stage 5): `damage->present ≈ 239 ms`, `wake/schedule ≈ 170 ms`.
+- After (event-driven + RT): `damage->present ≈ 134 ms`, `wake/schedule ≈ 105 ms`,
+  and `event-driven wakeups=6` (damage woke the flusher directly, matching the
+  5 typed glyphs — the mechanism is demonstrably firing).
+
+**So: a real ~44 % improvement in single-glyph present latency (239 → 134 ms),
+attributable to event-driven wake + RT priority.** That is a measured win.
+
+**Honest caveat / where the rest of the latency is.** The residual ~105 ms
+`wake/schedule` did NOT drop to ~0 even with the IPI kick and RT priority, so
+the remaining wait is not the present path's timer. The `sendkey` workload
+drives the echo through the **ring-3 shell**, whose own task scheduling sits
+*upstream* of the damage mark; a large part of what this harness measures is
+how long the ring-3 shell takes to echo, not how long the flusher takes to
+present. Separating those needs a kernel-local draw that bypasses the shell
+(single glyph drawn from the flusher's own task), which this harness does not
+yet have. The next clean step is a **kernel-side single-glyph present test** to
+attribute present latency without the shell in the loop.
+
+Suites: `test-latency.ps1`, `test-gpu.ps1` ×2, `test-smp.ps1`, `test-avx.ps1`,
+`test-fs.ps1`, `test-shell.ps1` — all exit 0. `build.ps1` clean.
 
 ## M10b stage 3b — decisions and deferrals
 

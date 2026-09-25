@@ -613,9 +613,46 @@ pub fn sleep_kernel(ms: u64) {
     x86_64::instructions::interrupts::enable();
 }
 
-/// Block the current task until a keyboard line is available, then yield.
-/// Used by the blocking SYS_READ(0) path. `preempt()` wakes it when
-/// `keyboard::line_pending()` turns true. IF-safe: callable from task context.
+/// M10b 6 (event-driven present): wake a Sleeping task immediately, before its
+/// timer deadline.
+///
+/// This is the primitive that lets the present path be driven by DAMAGE rather
+/// than by a poll timer. `sleep_kernel` parks a task and the 1 ms timer wakes it
+/// when `now >= sleep_until_ms`; the flusher's response to a drawn change was
+/// therefore bounded below by "how long until the timer tick, and then how long
+/// until the scheduler runs me again" — measured as ~170 ms of scheduling
+/// latency. When the console draws something, this makes the flusher Ready at
+/// once, so it does not have to wait out its remaining back-off.
+///
+/// Safe to call from any context (IRQ or task): it takes the scheduler guard
+/// and only ever promotes Sleeping -> Ready, which is idempotent and cannot
+/// corrupt a Running/Dead task. Returns true if it actually woke someone.
+pub fn wake_task_now(id: u64) -> bool {
+    let mut woke = false;
+    {
+        let _g = sched_guard();
+        unsafe {
+            for t in TASKS.iter_mut() {
+                if t.id == id {
+                    if t.state == State::Sleeping {
+                        t.state = State::Ready;
+                        woke = true;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    // A state change must reach the OTHER cpus: without the reschedule IPI
+    // the newly-Ready task sits on the run queue until some cpu's next 1 ms
+    // timer tick happens to look at it - which is precisely the ~105 ms
+    // residual wake latency this was meant to remove. Every other state change
+    // in this file (spawn/exit/kill/set_priority) kicks for the same reason.
+    if woke {
+        smp::kick_others();
+    }
+    woke
+}
 pub fn block_current_on_input() {
     x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         let _g = sched_guard();

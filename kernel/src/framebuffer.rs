@@ -210,6 +210,7 @@ fn mark_dirty(x: usize, y: usize) {
 #[inline]
 fn mark_dirty_rect(x0: usize, y0: usize, x1: usize, y1: usize) {
     let mut slot = DIRTY.lock();
+    let was_empty = slot.is_none();
     *slot = Some(match *slot {
         Some((ax0, ay0, ax1, ay1)) => (
             ax0.min(x0),
@@ -220,6 +221,15 @@ fn mark_dirty_rect(x0: usize, y0: usize, x1: usize, y1: usize) {
         None => (x0, y0, x1, y1),
     });
     drop(slot);
+    // M10b 6 (event-driven present): when the box transitions empty ->
+    // non-empty, a NEW damage episode began; wake the flusher so it does not
+    // wait out its back-off. Only on the transition (a burst keeps the box
+    // non-empty and wakes once), because `mark_dirty_rect` runs per pixel and
+    // taking the scheduler lock per pixel would be catastrophic. A burst is
+    // still picked up on the flusher's next quantum via the generation change.
+    if was_empty {
+        crate::virtio::wake_present_on_damage();
+    }
     // Bump the generation AFTER releasing the lock: the present path only
     // reads it, and bumping inside the lock would add an atomic RMW to the
     // per-pixel hot path for no benefit.

@@ -1483,6 +1483,33 @@ const FLUSH_IDLE_BACKOFF: u32 = 25;
 static FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
 static FLUSH_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+/// The task id of the present flusher, published by `flush_loop` so the damage
+/// path can wake it on a drawn change (M10b 6, event-driven present). 0 = not
+/// yet registered (damage before the flusher started just waits for the timer).
+static PRESENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
+/// How many times the damage path woke the flusher (M10b 6). Reported so the
+/// event-driven path's contribution is visible.
+static PRESENT_WAKEUPS: AtomicU64 = AtomicU64::new(0);
+
+/// M10b 6 (event-driven present): called by the damage path on an empty ->
+/// non-empty damage transition. Wakes the flusher task so a drawn change is
+/// presented immediately instead of waiting out the flusher's back-off sleep.
+///
+/// This is the piece that removes the dominant latency term measured in
+/// stage 5 (~170 ms of scheduling wait): the flusher no longer has to be
+/// waiting for its timer to fire before it can notice damage. No-op until the
+/// flusher publishes its task id, and no-op when the flusher is already
+/// Running/Ready (the wake is idempotent).
+pub fn wake_present_on_damage() {
+    let id = PRESENT_TASK_ID.load(Ordering::Acquire);
+    if id == 0 {
+        return; // flusher not started yet
+    }
+    if crate::scheduler::wake_task_now(id) {
+        PRESENT_WAKEUPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// M10b 5: how long a change waited for the flusher to be *scheduled* after
 /// the sleep returned — the wake/scheduling latency, which is the part a
 /// quantum reduction does NOT control. Reported separately from the total
@@ -1586,6 +1613,21 @@ fn note_present(now_ns: u64) {
 pub fn flush_loop() {
     let mut failures: u32 = 0;
     let mut since_report: u64 = 0;
+    // M10b 6 (event-driven present): publish this task's id so the damage path
+    // can wake it on a drawn change instead of waiting out the back-off. The
+    // flusher parks between quanta, so its response latency was dominated by
+    // "when is the timer going to run me again" (~170 ms, measured). On damage
+    // we promote it Ready immediately.
+    PRESENT_TASK_ID.store(crate::scheduler::current_task_id(), Ordering::Release);
+    // M10b 6: promote the flusher to RT. The event-driven wake makes it Ready
+    // the moment damage appears, but at Normal priority it still queues behind
+    // CPU-bound Normal tasks and the ~200 ms scheduling wait persists. RT
+    // preempts them the instant the damage wake fires, which is the whole
+    // point of driving present by event rather than by a poll timer.
+    let my_id = crate::scheduler::current_task_id();
+    if my_id != 0 {
+        crate::scheduler::set_priority(my_id, crate::scheduler::PRIO_RT);
+    }
     // Snapshot of the cumulative counters at the last report, so each report
     // describes only its own window.
     let mut last_bytes: u64 = FLUSH_BYTES.load(Ordering::Relaxed);
@@ -1801,6 +1843,14 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
             n_wake,
             sum_wake / n_wake,
             max_wake
+        ));
+    }
+    // M10b 6: how many presents were driven by a damage-triggered wake (the
+    // event-driven path) rather than by the poll timer expiring.
+    let wakeups = PRESENT_WAKEUPS.swap(0, Ordering::Relaxed);
+    if wakeups > 0 {
+        log(&alloc::format!(
+            "[vgpu] response: event-driven wakeups={wakeups} (damage woke the flusher directly)"
         ));
     }
     if lat.samples == 0 && hw.samples == 0 {
