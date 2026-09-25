@@ -1280,6 +1280,63 @@ pub fn draw_probe_marker() {
     mark_dirty_rect(x0, y0, x0 + P - 1, y0 + P - 1);
 }
 
+/// Draw one animated frame of the kernel frame clock (M10b 8): a box that
+/// travels along a horizontal track, the whole track redrawn and damage-marked
+/// each frame.
+///
+/// This is the per-frame *load* for the frame-pacing measurement: a small,
+/// realistic damage strip (the track), drawn kernel-locally (no ring-3 shell),
+/// so the flusher presents exactly one strip per frame and the pacing counters
+/// measure the real frame cadence + jitter.
+///
+/// The track sits at the very bottom of the screen, below the console text
+/// region, so it never overwrites the header/clock and does not disturb
+/// anything the boot-flow assertions read.
+pub fn draw_anim_frame(i: u32) {
+    const TRACK_H: usize = 24;
+    const MARGIN: usize = 8;
+    // Geometry + pixel writes inside one IF=0 window (FB lock), like every
+    // other console draw: the mouse IRQ also takes FB.
+    let (x0, x1, y0, y1) = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut slot = FB.lock();
+        let Some(w) = slot.as_mut() else {
+            return (0, 0, 0, 0);
+        };
+        let (W, H) = (w.info.width, w.info.height);
+        let x0 = MARGIN;
+        let x1 = W.saturating_sub(MARGIN + 1);
+        let y0 = H.saturating_sub(TRACK_H + MARGIN);
+        let y1 = y0 + TRACK_H - 1;
+        if x1 <= x0 || y1 < y0 {
+            return (0, 0, 0, 0);
+        }
+        // Clear the track to background, then draw the box at its position.
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                w.set_pixel(x, y, 0x0E1420);
+            }
+        }
+        let span = x1 - x0;
+        let box_w = 24usize.min(span);
+        let pos = if span > box_w {
+            (i as usize) % (span - box_w + 1)
+        } else {
+            0
+        };
+        for y in y0..=y1 {
+            for x in x0 + pos..(x0 + pos + box_w).min(x1 + 1) {
+                w.set_pixel(x, y, 0x3B82F6); // accent blue box
+            }
+        }
+        (x0, x1, y0, y1)
+    });
+    if x1 <= x0 {
+        return; // degenerate geometry, no writer
+    }
+    // Mark the whole track damaged (one strip per frame).
+    mark_dirty_rect(x0, y0, x1, y1);
+}
+
 pub fn console_bytes(data: &[u8]) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         {

@@ -169,6 +169,11 @@ if (-not (Has-Line $content @('[vgpu] pacing:', 'presents', 'interval'))) {
 if (-not (Has-Line $content @('[vgpu] probe: kernel-local draw->present', 'n=', 'avg='))) {
     $script:fail += 'latency: no kernel-local probe sample (pure present latency not measured)'
 }
+# M10b 8: the kernel frame clock drives a continuous animated load; the pacing
+# report must include an achieved-fps figure.
+if (-not (Has-Line $content @('[vgpu] pacing:', 'presents', 'fps', 'interval'))) {
+    $script:fail += 'latency: no frame-pacing fps/jitter report (M10b 8 frame clock)'
+}
 if ($content | Where-Object { $_ -match 'EXCEPTION' -and $_ -notmatch 'Breakpoint' }) {
     $script:fail += 'latency: unexpected exception occurred'
 }

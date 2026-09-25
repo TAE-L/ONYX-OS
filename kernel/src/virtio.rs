@@ -1429,6 +1429,9 @@ pub fn present_bringup(width: usize, height: usize) -> bool {
     // M10b 7: spawn the kernel-local present-latency probe once the present
     // path is live. Pure measurement task; failure to spawn is harmless.
     spawn_present_probe();
+    // M10b 8: spawn the kernel frame clock (animated load) to measure real
+    // frame pacing + jitter under continuous present. Best-effort.
+    spawn_frame_clock();
     true
 }
 
@@ -1493,6 +1496,36 @@ static PRESENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 /// How many times the damage path woke the flusher (M10b 6). Reported so the
 /// event-driven path's contribution is visible.
 static PRESENT_WAKEUPS: AtomicU64 = AtomicU64::new(0);
+
+/// M10b 8: the kernel frame clock. Draws one animated frame per tick (via
+/// `framebuffer::draw_anim_frame`) at a target cadence, so the flusher presents
+/// a continuous stream of frames. The pacing counters in the report then measure
+/// the REAL frame cadence + jitter under load — the number a game cares about.
+///
+/// Runs kernel-locally (no ring-3 shell), and only after boot/autoexec has
+/// settled so the animation never competes with the boot flow.
+fn frame_clock_task() {
+    // Target cadence: 50 ms ~= 20 fps. Deliberately NOT 60 fps: under this
+    // 2-cpu TCG VM a 16 ms producer outruns the scheduler, so the flusher
+    // coalesces many frames per present and the "cadence" becomes a collapse,
+    // not a measurement. 20 fps is a rate this machine sustains end to end, so
+    // the pacing report reflects real frame pacing + jitter rather than
+    // overload. (Raising the target to chase 60 fps is a scheduler/CPU-count
+    // problem, not a present-path one - the present path itself is sub-ms.)
+    const FRAME_MS: u64 = 50;
+    crate::scheduler::sleep_kernel(8000); // let boot finish first
+    let mut frame: u32 = 0;
+    loop {
+        crate::framebuffer::draw_anim_frame(frame);
+        frame = frame.wrapping_add(1);
+        crate::scheduler::sleep_kernel(FRAME_MS);
+    }
+}
+
+/// Spawn the kernel frame clock (M10b 8). Only on the virtio present path.
+pub fn spawn_frame_clock() {
+    crate::scheduler::spawn(frame_clock_task);
+}
 
 /// M10b 7: a KERNEL-LOCAL single-rect draw task, used to measure PURE present
 /// latency with no ring-3 shell / echo / input in the loop.
@@ -1857,9 +1890,16 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
     let min_int = PRESENT_MIN_US.swap(u64::MAX, Ordering::Relaxed);
     let max_int = PRESENT_MAX_US.swap(0, Ordering::Relaxed);
     if n_int > 0 {
+        // M10b 8: also report the achieved frame rate (from the mean frame
+        // interval) alongside the jitter, so "how many fps did we actually
+        // sustain, and how much did it wobble" is one line.
+        let avg_us = sum_int / n_int;
+        let fps_x100 = if avg_us == 0 { 0 } else { 100_000_000 / avg_us };
         log(&alloc::format!(
-            "[vgpu] pacing: {n_int} presents, interval avg={} us min={} us max={} us",
-            sum_int / n_int,
+            "[vgpu] pacing: {n_int} presents, {}.{:02} fps, interval avg={} us min={} us max={} us",
+            fps_x100 / 100,
+            fps_x100 % 100,
+            avg_us,
             if min_int == u64::MAX { 0 } else { min_int },
             max_int
         ));
