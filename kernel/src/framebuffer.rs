@@ -5,7 +5,7 @@
 //! and draw 8x8 bitmap glyphs from the `font8x8` crate's legacy glyph table.
 
 use bootloader_api::info::{FrameBufferInfo, PixelFormat};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
 
 /// `font8x8::legacy::BASIC_LEGACY` holds raw glyphs for ASCII 0..=127.
@@ -258,22 +258,51 @@ pub mod latency {
     static MAX_US: AtomicU64 = AtomicU64::new(0);
     static SUM_US: AtomicU64 = AtomicU64::new(0);
 
+    /// The same accounting for the hardware cursor: input -> MOVE_CURSOR
+    /// acknowledged by the device. This is the number that a game actually
+    /// feels for the pointer, and with a hardware cursor it is a completely
+    /// different (and far smaller) quantity than the framebuffer present
+    /// latency above, because no pixels are involved at all.
+    static HW_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    static HW_MIN_US: AtomicU64 = AtomicU64::new(u64::MAX);
+    static HW_MAX_US: AtomicU64 = AtomicU64::new(0);
+    static HW_SUM_US: AtomicU64 = AtomicU64::new(0);
+
     /// Monotonic nanosecond stamp of the most recent cursor move, or 0 if the
     /// current dirty rect did not come from a cursor move. Read (and cleared)
     /// by the flusher when it presents.
     static PENDING_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Separate pending stamp for the HARDWARE cursor path. When the display
+    /// owns the cursor, a move produces no framebuffer damage, so the
+    /// flusher never sees it; the latency that matters is input -> the device
+    /// acknowledging MOVE_CURSOR, which is measured here instead (M10b 3c).
+    static PENDING_HW_NS: AtomicU64 = AtomicU64::new(0);
 
     /// Record that a cursor move was applied at `now_ns` (called from the
     /// mouse IRQ, so it must stay allocation-free and O(1)).
     #[inline]
     pub fn note_input(now_ns: u64) {
         PENDING_NS.store(now_ns, AtomicOrdering::Relaxed);
+        PENDING_HW_NS.store(now_ns, AtomicOrdering::Relaxed);
     }
 
     /// Take the pending input stamp, if a cursor move is waiting to be shown.
     #[inline]
     pub fn take_pending() -> Option<u64> {
         let ns = PENDING_NS.swap(0, AtomicOrdering::Relaxed);
+        if ns == 0 {
+            None
+        } else {
+            Some(ns)
+        }
+    }
+
+    /// Take the hardware-cursor pending stamp (input instant not yet measured
+    /// against a MOVE_CURSOR completion).
+    #[inline]
+    pub fn take_pending_hw() -> Option<u64> {
+        let ns = PENDING_HW_NS.swap(0, AtomicOrdering::Relaxed);
         if ns == 0 {
             None
         } else {
@@ -307,6 +336,26 @@ pub mod latency {
         MAX_US.fetch_max(us, AtomicOrdering::Relaxed);
     }
 
+    /// Record one completed input->MOVE_CURSOR sample (hardware cursor).
+    pub fn record_hw(delta_ns: u64) {
+        let us = delta_ns / 1_000;
+        HW_SAMPLES.fetch_add(1, AtomicOrdering::Relaxed);
+        HW_SUM_US.fetch_add(us, AtomicOrdering::Relaxed);
+        let mut cur = HW_MIN_US.load(AtomicOrdering::Relaxed);
+        while us < cur {
+            match HW_MIN_US.compare_exchange_weak(
+                cur,
+                us,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        HW_MAX_US.fetch_max(us, AtomicOrdering::Relaxed);
+    }
+
     /// Reset the histogram (used by the periodic report so each line covers
     /// one window rather than the whole boot).
     pub fn reset_window() -> Snapshot {
@@ -320,6 +369,16 @@ pub mod latency {
             h.store(0, AtomicOrdering::Relaxed);
         }
         s
+    }
+
+    /// Reset the hardware-cursor window and return its summary.
+    pub fn reset_window_hw() -> Snapshot {
+        Snapshot {
+            samples: HW_SAMPLES.swap(0, AtomicOrdering::Relaxed),
+            min_us: HW_MIN_US.swap(u64::MAX, AtomicOrdering::Relaxed),
+            max_us: HW_MAX_US.swap(0, AtomicOrdering::Relaxed),
+            sum_us: HW_SUM_US.swap(0, AtomicOrdering::Relaxed),
+        }
     }
 
     /// A window/point-in-time summary of the latency histogram.
@@ -396,6 +455,67 @@ const CURSOR: [&str; CURSOR_H] = [
 
 /// Max sprite pixel scale (set from resolution at boot: 2 on >= 1600 px wide).
 const CURSOR_SCALE_MAX: usize = 2;
+
+/// Set once the display owns the cursor itself (M10b 3c hardware cursor).
+///
+/// When true, `move_cursor` stops painting the software sprite and forwards the
+/// new position to the GPU instead: a mouse move then costs one ~56-byte
+/// virtio command and ZERO framebuffer damage, instead of restoring and
+/// repainting two full cursor rectangles that the damage-rect flusher would
+/// then have to transfer. That is the whole latency win, and it is why the
+/// software sprite path is kept as the fallback for the dispi backend (which
+/// has no cursor queue).
+static HW_CURSOR: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable the hardware-cursor path. Called by the present path once
+/// the cursor queue is live; `false` restores software-cursor drawing.
+pub fn set_hardware_cursor(active: bool) {
+    HW_CURSOR.store(active, Ordering::Release);
+}
+
+/// True when the display owns the cursor.
+pub fn hardware_cursor_active() -> bool {
+    HW_CURSOR.load(Ordering::Acquire)
+}
+
+/// The cursor sprite as raw `B8G8R8A8` pixels, scaled to the active scale,
+/// for the hardware cursor's backing resource.
+///
+/// Layout matches `VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM` (1): B, G, R, A per
+/// pixel, little-endian. The sprite's three states map to
+/// `X` (outline) = opaque black, `#` (fill) = opaque white, `.` =
+/// transparent (A = 0), which is why a cursor wants the A8 format while the
+/// scanout resource wants the X8 one.
+///
+/// Returns `(pixels, width, height)`. The device allocates up to 64x64 for the
+/// cursor, so the scaled 16x24 sprite (max 32x48) always fits.
+pub fn cursor_bitmap_rgba() -> (alloc::vec::Vec<u8>, usize, usize) {
+    let cs = CUR_SCALE.load(Ordering::Relaxed).clamp(1, CURSOR_SCALE_MAX);
+    let w = CURSOR_W * cs;
+    let h = CURSOR_H * cs;
+    let mut out = alloc::vec::Vec::with_capacity(w * h * 4);
+    for row in CURSOR.iter() {
+        for _ in 0..cs {
+            for ch in row.chars() {
+                // (b, g, r, a)
+                let px: [u8; 4] = match ch {
+                    'X' => [0x00, 0x00, 0x00, 0xFF],
+                    '#' => [0xFF, 0xFF, 0xFF, 0xFF],
+                    _ => [0x00, 0x00, 0x00, 0x00], // transparent
+                };
+                for _ in 0..cs {
+                    out.extend_from_slice(&px);
+                }
+            }
+        }
+    }
+    (out, w, h)
+}
+
+/// The sprite's hotspot (the pixel that points): the arrow's tip, top-left.
+pub const CURSOR_HOT_X: u32 = 0;
+pub const CURSOR_HOT_Y: u32 = 0;
+
 /// Active cursor pixel scale (updated by `init_global`, read on every draw).
 static CUR_SCALE: AtomicUsize = AtomicUsize::new(1);
 
@@ -513,30 +633,58 @@ pub fn move_cursor(dx: i32, dy: i32) {
     // particular move changed the sprite. The flusher turns this into an
     // input->present delta. O(1), allocation-free, safe in IRQ context.
     latency::note_input(crate::time::now_ns());
+
+    // Compute the new position first (shared by both cursor paths), so the
+    // hardware path and the software sprite always agree on where the pointer
+    // is - and so `cursor_pos()` stays authoritative either way.
+    //
+    // `apply_sensitivity` has SIDE EFFECTS (it accumulates sub-pixel motion in
+    // ACC_X8/ACC_Y8), so it is called exactly ONCE here and the old position is
+    // carried out alongside the new one for the software-sprite diff.
+    let (width, height, old_x, old_y, nx, ny) = {
+        // Bind the guard to a local: `FB.lock().as_ref()` inline would create a
+        // temporary MutexGuard that is dropped (and thus unlocks) at the end of
+        // the `let-else` expression while `w` still borrows it.
+        let guard = FB.lock();
+        let Some(w) = guard.as_ref() else {
+            return;
+        };
+        let (width, height) = (w.info.width, w.info.height);
+        let old_x = CUR_X.load(Ordering::Relaxed);
+        let old_y = CUR_Y.load(Ordering::Relaxed);
+        let (mdx, mdy) = apply_sensitivity(dx, dy);
+        if mdx == 0 && mdy == 0 {
+            return; // sub-pixel motion only; it stays accumulated
+        }
+        let cs = CUR_SCALE.load(Ordering::Relaxed).max(1);
+        let max_x = width.saturating_sub(CURSOR_W * cs) as i64;
+        let max_y = height.saturating_sub(CURSOR_H * cs) as i64;
+        let nx = ((old_x as i64 + mdx as i64).clamp(0, max_x)) as usize;
+        let ny = ((old_y as i64 + mdy as i64).clamp(0, max_y)) as usize;
+        (width, height, old_x, old_y, nx, ny)
+    };
+    if nx == old_x && ny == old_y {
+        return; // pinned at an edge
+    }
+    CUR_X.store(nx, Ordering::Relaxed);
+    CUR_Y.store(ny, Ordering::Relaxed);
+
+    // M10b 3c: the display owns the cursor -> forward the position as a
+    // MOVE_CURSOR command and return. NO framebuffer is touched, so the
+    // damage-rect flusher has nothing to push and the pointer is not delayed
+    // by the 100 ms present cadence.
+    if HW_CURSOR.load(Ordering::Acquire) {
+        crate::virtio::hardware_cursor_move(nx, ny);
+        return;
+    }
+
+    // Software-sprite path (the dispi backend, or before the hardware cursor
+    // is live): repaint the sprite with the diff algorithm.
     let mut slot = FB.lock();
     let w = match slot.as_mut() {
         Some(w) => w,
         None => return,
     };
-    let (width, height) = (w.info.width, w.info.height);
-    let old_x = CUR_X.load(Ordering::Relaxed);
-    let old_y = CUR_Y.load(Ordering::Relaxed);
-
-    // Apply the Windows-style acceleration curve (lossless 1/8-px integration).
-    let (mdx, mdy) = apply_sensitivity(dx, dy);
-    if mdx == 0 && mdy == 0 {
-        return; // sub-pixel motion only; it stays accumulated for next packet
-    }
-
-    // Clamp so the whole sprite stays on screen.
-    let cs = CUR_SCALE.load(Ordering::Relaxed).max(1);
-    let max_x = width.saturating_sub(CURSOR_W * cs) as i64;
-    let max_y = height.saturating_sub(CURSOR_H * cs) as i64;
-    let nx = ((old_x as i64 + mdx as i64).clamp(0, max_x)) as usize;
-    let ny = ((old_y as i64 + mdy as i64).clamp(0, max_y)) as usize;
-    if nx == old_x && ny == old_y {
-        return; // pinned at an edge with movement pushing into it
-    }
 
     // Snapshot the current save buffer, then move the sprite with a diff:
     //   1. restore every old-sprite pixel the NEW sprite will not paint

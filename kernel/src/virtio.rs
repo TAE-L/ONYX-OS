@@ -138,6 +138,24 @@ const GPU_RESP_OK: u32 = 0x1100;
 /// device ignores it.
 const GPU_FMT_B8G8R8X8: u32 = 2;
 
+// --- cursor queue (queue 1) -------------------------------------------------
+
+/// Cursor commands (virtio-gpu 1.0 5.7.4). A separate contiguous block from
+/// the 2D commands, so these values cannot be confused with the table above.
+const GPU_CMD_UPDATE_CURSOR: u32 = 0x0300;
+const GPU_CMD_MOVE_CURSOR: u32 = 0x0301;
+
+/// `struct virtio_gpu_cursor_pos` is 16 bytes: scanout_id, x, y, padding.
+const CURSOR_POS_LEN: usize = 16;
+/// `struct virtio_gpu_update_cursor` = 24 (ctrl_hdr) + 16 (pos) + 4
+/// (resource_id) + 4 (hot_x) + 4 (hot_y) + 4 (padding) = 56.
+///
+/// The trailing `__le32 padding` is part of the struct: QEMU's
+/// `virtio_gpu_handle_cursor` copies exactly `sizeof(cursor_info)` and logs
+/// "cursor size incorrect" for a short request (the same length trap as the
+/// 2D commands).
+const CURSOR_CMD_LEN: usize = 56;
+
 /// Modern virtio only: the interface is *modern* when the driver walks its
 /// capability list (`virtio_pci_cap`, id 0x09) **and** the device advertises
 /// `VIRTIO_F_VERSION_1` (bit 0 of feature word 1).
@@ -1403,6 +1421,12 @@ pub fn present_bringup(width: usize, height: usize) -> bool {
     *RESOURCE.lock() = Some(res);
     log("[vgpu] present: flusher scheduled - damage-rect transfer+flush every 100 ms \
           (only what the console drew since the last push)");
+    // M10b 3c: hand the cursor to the device (queue 1) LAST, and only as a
+    // best-effort extra. The flusher is already live at this point, so even if
+    // the cursor bring-up fails or stalls, the present path keeps working and
+    // the software cursor is the fallback. Enabling the cursor must never be
+    // able to block the console from being scheduled.
+    hardware_cursor_enable();
     true
 }
 
@@ -1578,16 +1602,294 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
     // that saves bandwidth but inflates input->present is a bad trade for a
     // game, and only a side-by-side line makes that visible.
     let lat = crate::framebuffer::latency::reset_window();
-    if lat.samples == 0 {
+    let hw = crate::framebuffer::latency::reset_window_hw();
+    if lat.samples == 0 && hw.samples == 0 {
         log("[vgpu] latency: no input samples this window (idle console)");
     } else {
-        let avg = lat.sum_us / lat.samples;
-        log(&alloc::format!(
-            "[vgpu] latency: input->present n={} avg={} us min={} us max={} us",
-            lat.samples,
-            avg,
-            if lat.min_us == u64::MAX { 0 } else { lat.min_us },
-            lat.max_us
-        ));
+        if lat.samples > 0 {
+            let avg = lat.sum_us / lat.samples;
+            log(&alloc::format!(
+                "[vgpu] latency: input->present n={} avg={} us min={} us max={} us",
+                lat.samples,
+                avg,
+                if lat.min_us == u64::MAX { 0 } else { lat.min_us },
+                lat.max_us
+            ));
+        }
+        if hw.samples > 0 {
+            // M10b 3c: the hardware-cursor number - the pointer latency with no
+            // framebuffer present in the path. This is the one a game feels.
+            let avg = hw.sum_us / hw.samples;
+            log(&alloc::format!(
+                "[vgpu] latency: input->MOVE_CURSOR n={} avg={} us min={} us max={} us",
+                hw.samples,
+                avg,
+                if hw.min_us == u64::MAX { 0 } else { hw.min_us },
+                hw.max_us
+            ));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M10b 3c: hardware cursor (queue 1) - the input-latency optimization
+// ---------------------------------------------------------------------------
+//
+// The software cursor repaints two full 16x24 (or 32x48 scaled) rectangles on
+// every mouse packet. That dirties the framebuffer, so the damage-rect
+// flusher transfers those rectangles and the pixel only reaches the display
+// on the next 100 ms tick. The cursor therefore carries the SAME latency as
+// any other drawing - which is wrong, because the cursor is the one thing the
+// player is looking at while they move the mouse.
+//
+// A hardware cursor lives on queue 1: the sprite is uploaded ONCE as a 2D
+// resource, and each move is a 56-byte `MOVE_CURSOR` command carrying only a
+// position. No framebuffer traffic at all, so the device can move the cursor
+// without waiting for - or being delayed by - any present.
+
+/// The cursor queue (index 1) state, once brought up. Same split-ring shape
+/// as the control queue; a separate pair of frames so a cursor move can never
+/// contend with (or corrupt) a control-queue command in flight.
+static CURSOR_QUEUE: Mutex<Option<QueueState>> = Mutex::new(None);
+
+/// Resource id holding the cursor bitmap (a 2D resource created over the
+/// control queue, then referenced by `UPDATE_CURSOR`).
+const CURSOR_RES_ID: u32 = 2;
+
+/// Bring up queue 1 and return whether it is usable.
+///
+/// Deliberately a SEPARATE function from the control-queue bring-up rather
+/// than a refactor of it: the control queue is the load-bearing, already
+/// verified path, and a change there risks the whole present path for no
+/// gain. This mirrors its structure (allocate -> program -> enable).
+fn cursor_queue_init() -> Result<(), &'static str> {
+    let Some(info) = device() else {
+        return Err("no virtio-gpu device recorded by the probe");
+    };
+    if info.num_queues < 2 {
+        return Err("device does not expose a cursor queue");
+    }
+    if CURSOR_QUEUE.lock().is_some() {
+        return Ok(());
+    }
+    let common = info.common_va as *mut u8;
+    let rd16 = |off: usize| unsafe { read_volatile(common.add(off) as *const u16) };
+    let wr16 = |off: usize, v: u16| unsafe { write_volatile(common.add(off) as *mut u16, v) };
+    let wr32 = |off: usize, v: u32| unsafe { write_volatile(common.add(off) as *mut u32, v) };
+
+    wr16(CC_QUEUE_SELECT as usize, 1);
+    let max_size = rd16(CC_QUEUE_SIZE as usize);
+    let mut size = core::cmp::min(max_size, Q_SIZE_MAX);
+    if size > 2 {
+        let mut p = 2u16;
+        while p * 2 <= size {
+            p *= 2;
+        }
+        size = p;
+    }
+    if size < 2 {
+        return Err("cursor queue smaller than 2 descriptors");
+    }
+
+    let (ring_phys, cmd_phys) = crate::memory::with_global_frames(|frames| {
+        let ring = frames.allocate_frame().map(|f| f.start_address().as_u64());
+        let cmd = frames.allocate_frame().map(|f| f.start_address().as_u64());
+        ring.zip(cmd)
+    })
+    .ok_or("global frame allocator is not installed")?
+    .ok_or("out of frames for the cursor queue")?;
+    unsafe {
+        phys_write_bytes(ring_phys, 4096);
+        phys_write_bytes(cmd_phys, 4096);
+    }
+
+    wr16(CC_QUEUE_SIZE as usize, size);
+    if rd16(CC_QUEUE_SIZE as usize) != size {
+        return Err("device did not accept the cursor queue size");
+    }
+    let desc = ring_phys + DESC_OFF;
+    let avail = ring_phys + AVAIL_OFF;
+    let used = ring_phys + USED_OFF;
+    wr32(CC_QUEUE_DESC as usize, desc as u32);
+    wr32(CC_QUEUE_DESC as usize + 4, (desc >> 32) as u32);
+    wr32(CC_QUEUE_DRIVER as usize, avail as u32);
+    wr32(CC_QUEUE_DRIVER as usize + 4, (avail >> 32) as u32);
+    wr32(CC_QUEUE_USED as usize, used as u32);
+    wr32(CC_QUEUE_USED as usize + 4, (used >> 32) as u32);
+
+    let notify_off = rd16(CC_QUEUE_NOTIFY_OFF as usize);
+    let doorbell = info.notify_va + u64::from(notify_off) * u64::from(info.caps.notify_mul);
+    wr16(CC_QUEUE_ENABLE as usize, 1);
+    if rd16(CC_QUEUE_ENABLE as usize) != 1 {
+        return Err("device did not enable the cursor queue");
+    }
+    *CURSOR_QUEUE.lock() = Some(QueueState {
+        ring_phys,
+        cmd_phys,
+        size,
+        avail_idx: 0,
+        used_idx: 0,
+        doorbell,
+    });
+    Ok(())
+}
+
+
+/// Submit one cursor command (56 bytes, no response buffer) and wait for the
+/// used ring.
+///
+/// This mirrors `submit` but for a queue that is fire-and-forget: the device
+/// pushes a used element with `len = 0`, so the `len >= 4` response check
+/// that the control queue needs is deliberately ABSENT here (there is no
+/// response to read; the used entry only signals completion).
+fn cursor_submit(build: impl FnOnce(u64)) -> Result<(), &'static str> {
+    let mut guard = CURSOR_QUEUE.lock();
+    let q = guard.as_mut().ok_or("cursor queue is not initialized")?;
+    let req = q.cmd_phys + CMD_REQ_OFF;
+    unsafe { phys_write_bytes(req, CMD_BUF_LEN) };
+    build(req);
+
+    let d0 = q.ring_phys + DESC_OFF;
+    unsafe {
+        phys_write_u32(d0, req as u32);
+        phys_write_u32(d0 + 4, (req >> 32) as u32);
+        phys_write_u32(d0 + 8, CURSOR_CMD_LEN as u32);
+        phys_write_u16(d0 + 12, 0); // read-only request, no chaining
+        phys_write_u16(d0 + 14, 0);
+        let slot = q.ring_phys + AVAIL_RING_OFF + u64::from(q.avail_idx % q.size) * 2;
+        phys_write_u16(slot, 0);
+    }
+    fence(Ordering::SeqCst);
+    q.avail_idx = q.avail_idx.wrapping_add(1);
+    unsafe { phys_write_u16(q.ring_phys + AVAIL_IDX_OFF, q.avail_idx) };
+    fence(Ordering::SeqCst);
+    // Doorbell VALUE = queue index (1 here; NOTIFICATION_DATA not negotiated).
+    unsafe { write_volatile(q.doorbell as *mut u32, 1) };
+
+    let deadline = crate::apic::ms_since_boot() + CMD_TIMEOUT_MS;
+    loop {
+        let used_idx = unsafe { phys_read_u16(q.ring_phys + USED_IDX_OFF) };
+        if used_idx != q.used_idx {
+            fence(Ordering::SeqCst);
+            q.used_idx = q.used_idx.wrapping_add(1);
+            return Ok(());
+        }
+        if crate::apic::ms_since_boot() >= deadline {
+            return Err("cursor queue did not complete within 500 ms");
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Write a `virtio_gpu_update_cursor` header at `req` for `ty`.
+///
+/// Layout (little-endian, offsets from the 24-byte ctrl_hdr):
+///   +24 scanout_id, +28 x, +32 y, +36 pos.padding,
+///   +40 resource_id, +44 hot_x, +48 hot_y, +52 padding.
+fn cursor_header(req: u64, ty: u32, scanout: u32, x: u32, y: u32, res_id: u32) {
+    unsafe {
+        cmd_write_u32(req, 0, ty);
+        cmd_write_u32(req, CMD_HDR_LEN, scanout);
+        cmd_write_u32(req, CMD_HDR_LEN + 4, x);
+        cmd_write_u32(req, CMD_HDR_LEN + 8, y);
+        cmd_write_u32(req, CMD_HDR_LEN + 12, 0); // pos padding
+        cmd_write_u32(req, CMD_HDR_LEN + 16, res_id);
+        cmd_write_u32(req, CMD_HDR_LEN + 20, crate::framebuffer::CURSOR_HOT_X);
+        cmd_write_u32(req, CMD_HDR_LEN + 24, crate::framebuffer::CURSOR_HOT_Y);
+        cmd_write_u32(req, CMD_HDR_LEN + 28, 0); // struct padding
+    }
+}
+
+/// `MOVE_CURSOR` - reposition the existing hardware cursor. This is the hot
+/// path: 56 bytes, no framebuffer damage, no present dependency.
+fn cursor_move(scanout: u32, x: u32, y: u32) -> Result<(), &'static str> {
+    cursor_submit(|req| cursor_header(req, GPU_CMD_MOVE_CURSOR, scanout, x, y, 0))
+}
+
+/// `UPDATE_CURSOR` - point the cursor at a resource (the sprite upload).
+/// Sent once at bring-up; subsequent moves use `MOVE_CURSOR`.
+fn cursor_update(scanout: u32, res_id: u32) -> Result<(), &'static str> {
+    cursor_submit(|req| cursor_header(req, GPU_CMD_UPDATE_CURSOR, scanout, 0, 0, res_id))
+}
+
+
+/// Bring the hardware cursor up end to end: queue 1, the sprite resource, and
+/// the initial `UPDATE_CURSOR`.
+///
+/// Returns `true` when the display now owns the cursor (the console stops
+/// painting the software sprite), `false` when the software cursor stays (the
+/// device has no cursor queue, or any step was refused) — the graceful
+/// fallback, because a missing hardware cursor is never a reason to lose the
+/// pointer.
+pub fn hardware_cursor_enable() -> bool {
+    if let Err(e) = cursor_queue_init() {
+        log(&alloc::format!("[vgpu] cursor: queue unavailable ({e}) - software cursor kept"));
+        return false;
+    }
+    // Upload the sprite as a 2D resource over the CONTROL queue (the cursor
+    // queue carries only the header, never pixel data).
+    let (pixels, w, h) = crate::framebuffer::cursor_bitmap_rgba();
+    let bytes = pixels.len() as u64;
+    let frames = (bytes + 4095) / 4096;
+    let Some(phys) = crate::memory::alloc_contiguous(frames) else {
+        log("[vgpu] cursor: no memory for the sprite - software cursor kept");
+        return false;
+    };
+    let Some(off) = crate::memory::phys_offset() else {
+        return false;
+    };
+    // Copy the sprite into its backing frame through the physical window.
+    unsafe {
+        let dst = (off + phys) as *mut u8;
+        core::ptr::copy_nonoverlapping(pixels.as_ptr(), dst, pixels.len());
+    }
+    let res = GpuResource {
+        id: CURSOR_RES_ID,
+        w: w as u32,
+        h: h as u32,
+        // B8G8R8A8_UNORM = 1: the cursor NEEDS alpha (transparent pixels),
+        // which is why this is NOT the scanout's X8 format.
+        format: 1,
+        backing_phys: phys,
+        backing_bytes: bytes,
+    };
+    if create_2d(&res).is_err() || attach_backing(&res).is_err() {
+        log("[vgpu] cursor: sprite resource refused - software cursor kept");
+        return false;
+    }
+    if let Err(e) = cursor_update(0, CURSOR_RES_ID) {
+        log(&alloc::format!("[vgpu] cursor: UPDATE_CURSOR refused ({e}) - software cursor kept"));
+        return false;
+    }
+    crate::framebuffer::set_hardware_cursor(true);
+    // Put it where the software sprite currently is, so the handoff is
+    // invisible: the pointer does not jump.
+    let (x, y) = crate::framebuffer::cursor_pos();
+    let _ = cursor_move(0, x as u32, y as u32);
+    log(&alloc::format!(
+        "[vgpu] cursor: hardware cursor live on queue 1 ({w}x{h} B8G8R8A8, moved via MOVE_CURSOR - zero framebuffer damage)"
+    ));
+    true
+}
+
+/// Move the hardware cursor to an absolute position, if it is live.
+///
+/// Called from the mouse IRQ path (via `framebuffer::move_cursor` when the
+/// hardware cursor owns the pointer). Best-effort: a failure leaves the
+/// device's cursor where it was; the software sprite is NOT redrawn as a
+/// fallback (that would double-draw), and the next successful move corrects
+/// it.
+pub fn hardware_cursor_move(x: usize, y: usize) {
+    if cursor_move(0, x as u32, y as u32).is_ok() {
+        // M10b 3c: measure the latency the player actually feels for the
+        // pointer - input IRQ -> device acknowledged MOVE_CURSOR. This is NOT
+        // the framebuffer present latency: no pixels moved, so the 100 ms
+        // flush cadence is not in this path at all.
+        if let Some(input_ns) = crate::framebuffer::latency::take_pending_hw() {
+            let now_ns = crate::time::now_ns();
+            if now_ns > input_ns {
+                crate::framebuffer::latency::record_hw(now_ns - input_ns);
+            }
+        }
     }
 }

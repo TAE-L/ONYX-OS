@@ -107,16 +107,34 @@ if (-not (Has-Line $content @('[vgpu] queue: controlq size=', 'DRIVER_OK'))) {
 if (-not (Has-Line $content @('[vgpu] present: console adopted'))) {
     $script:fail += 'latency: console not adopted onto the virtio surface'
 }
+# M10b 3c: the hardware cursor must be live on queue 1 (a device without a
+# cursor queue is allowed to fall back to software, so this is asserted only
+# as "either hardware-cursor is live, OR the documented fallback is logged").
+if (-not (Has-Line $content @('[vgpu] cursor: hardware cursor live'))) {
+    if (-not (Has-Line $content @('[vgpu] cursor:', 'software cursor kept'))) {
+        $script:fail += 'latency: neither the hardware cursor nor the documented software-cursor fallback was reported'
+    }
+}
 if (-not (Has-Line $content @('[mouse] pos=('))) {
     $script:fail += 'latency: mouse injection did not move the cursor (no [mouse] pos line)'
 }
-# The probe must have CLOSED at least one window with real samples: a report
-# line with n>0, not the "no input samples" idle line.
-if (-not (Has-Line $content @('[vgpu] latency: input->present', 'n=', 'avg='))) {
-    $script:fail += 'latency: no input->present sample reported (probe did not close the loop)'
-}
+# The probe must have CLOSED at least one window with real samples. WHICH probe
+# is the correct one depends on who owns the cursor:
+#   * software cursor -> a mouse move dirties the framebuffer, so the
+#     input->present probe is the signal to require;
+#   * hardware cursor -> a mouse move produces NO framebuffer damage (it is a
+#     MOVE_CURSOR command), so input->present may legitimately be empty and
+#     input->MOVE_CURSOR is the signal to require instead.
+$hwLive = Has-Line $content @('[vgpu] cursor: hardware cursor live')
 if (Has-Line $content @('[vgpu] latency: no input samples')) {
     $script:fail += 'latency: every window reported "no input samples" despite mouse injection'
+}
+if ($hwLive) {
+    if (-not (Has-Line $content @('[vgpu] latency: input->MOVE_CURSOR', 'n=', 'avg='))) {
+        $script:fail += 'latency: hardware cursor is live but no input->MOVE_CURSOR latency was reported'
+    }
+} elseif (-not (Has-Line $content @('[vgpu] latency: input->present', 'n=', 'avg='))) {
+    $script:fail += 'latency: no input->present sample reported (probe did not close the loop)'
 }
 if ($content | Where-Object { $_ -match 'EXCEPTION' -and $_ -notmatch 'Breakpoint' }) {
     $script:fail += 'latency: unexpected exception occurred'
