@@ -108,7 +108,7 @@ try {
 # needs the console IDLE for a full second before each sample, so a busy
 # console can delay its first sample well past the injection phase. Wait
 # generously so the probe assertion is not timing-flaky.
-Start-Sleep -Seconds 20
+Start-Sleep -Seconds 30
 if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 Start-Sleep -Milliseconds 500
 
