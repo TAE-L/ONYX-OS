@@ -1094,8 +1094,27 @@ unsafe fn plan_switch(me: usize) -> Option<SwitchPlan> {
         if TASKS[idx].state != State::Ready {
             continue;
         }
+        // M10b/P1 step B: CPU-affinity filter (RESTORED). A task is only
+        // considered by the CPU that owns it (`owner_cpu`), so its whole
+        // context - the heap `sp_slot`, its kernel stack re-installed into
+        // this CPU's TSS.RSP0, and its FPU save area - is only ever touched
+        // by ONE cpu. That is what makes cross-CPU execution memory-safe:
+        // the M9.8-(d)/(e) removal of this filter let any Ready task migrate
+        // to any CPU, but the task *context* was never made migration-safe, so
+        // two CPUs could touch the same `sp_slot`/FPU area - the P1
+        // memory-corruption class (an inert `Task` layout change, stage 10,
+        // flipped it into a jump-to-heap fault).
+        //
+        // Cost: a task is pinned to its birth CPU, so SMP balancing is coarser
+        // (a busy CPU keeps its own tasks; a peer cannot steal work). That is
+        // the correct trade for SAFETY, and it is exactly the stepping stone
+        // to the per-CPU owned-context rewrite (step A) that will make the
+        // context a single owned allocation and re-enable safe migration.
+        if usize::from(TASKS[idx].owner_cpu) != me {
+            continue;
+        }
         let p = TASKS[idx].priority as u32;
-        let local = usize::from(TASKS[idx].owner_cpu) == me;
+        let local = true; // the filter above guarantees owner_cpu == me
         // Strictly better priority wins; equal priority prefers the local
         // task, and a task we already chose can only be displaced by a local
         // one of the same priority.
@@ -1147,11 +1166,14 @@ unsafe fn plan_switch(me: usize) -> Option<SwitchPlan> {
         smp::set_pending_prev(cur);
     }
 
-    // Incoming task: fresh slice, Running, owned by this CPU.
+    // Incoming task: fresh slice, Running. M10b/P1 step B: do NOT rewrite
+    // `owner_cpu` here. With the affinity filter above, `owner_cpu` is now the
+    // task's authoritative CPU and must stay stable for the task's lifetime;
+    // overwriting it on every switch is exactly what let a task (and its
+    // sp_slot/FPU context) drift onto a CPU that was already touching it.
     if next != MAIN_INDEX {
         TASKS[next].slice_left = fresh_slice(TASKS[next].priority);
         TASKS[next].state = State::Running;
-        TASKS[next].owner_cpu = me as u8;
     }
 
     // Ring-3 entry (LAPIC timer / syscall / IPI) must land on the incoming

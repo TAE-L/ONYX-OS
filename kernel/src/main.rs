@@ -210,10 +210,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_writeln!("spawned header clock");
     // FPU/SSE corruption regression: two tasks keep live XMM accumulators
     // across preemptions and verify exact checkpoints (see below).
+    //
+    // M10b/P1 step B: with the CPU-affinity filter restored in plan_switch, a
+    // task stays on the CPU that owns it. Spawn both fpu-test tasks on the
+    // SAME CPU (the BSP, via plain spawn) would serialize them and double this
+    // test's wall time, which is what it is designed NOT to do - the two tasks
+    // are an SMP regression that should run concurrently on separate cores and
+    // verify per-CPU FPU state. So spawn them on distinct CPUs: task A on the
+    // current (boot) CPU, task B on the first online AP when one exists. With
+    // the affinity filter active, spawn_on_cpu is now SAFE (a task is pinned to
+    // that one CPU and never migrates), which is exactly the invariant the
+    // filter restores. On a single-CPU boot both fall back to the local CPU.
     scheduler::spawn(fpu_test_a);
     serial_writeln!("spawned fpu-test A");
-    scheduler::spawn(fpu_test_b);
-    serial_writeln!("spawned fpu-test B");
+    if crate::smp::online_cpus() > 1 {
+        scheduler::spawn_on_cpu(fpu_test_b, scheduler::PRIO_NORMAL, 1);
+        serial_writeln!("spawned fpu-test B (pinned to CPU 1)");
+    } else {
+        scheduler::spawn(fpu_test_b);
+        serial_writeln!("spawned fpu-test B");
+    }
     // M9.8-f: AVX/YMM regression — only when boot enabled XCR0.YMM, so the
     // task's VEX-encoded code can never execute on a CPU without AVX.
     if fpu::avx_enabled() {

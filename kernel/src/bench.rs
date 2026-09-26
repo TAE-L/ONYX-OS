@@ -133,8 +133,22 @@ pub fn task() {
         crate::smp::online_cpus(),
         crate::scheduler::current_index()
     );
-    for _ in 0..WORKERS {
-        crate::scheduler::spawn_prio(worker, crate::scheduler::PRIO_NORMAL);
+    // M10b/P1 step B: with the CPU-affinity filter restored in plan_switch, a
+    // task stays on the CPU that owns it, so spawning every worker with plain
+    // `spawn_prio` would pin ALL of them to this CPU and serialize the
+    // benchmark (observed: cpus=[0,0,0,0]). Spawn worker `i` explicitly on CPU
+    // `i` instead: with the filter active that is SAFE (each worker is pinned to
+    // one CPU and never migrates) and it still measures the thing this
+    // benchmark exists to measure — real parallel execution across cores. The
+    // completion-time CPU is still what gets recorded, so the "did they run on
+    // different cores" check is unchanged.
+    let online = crate::smp::online_cpus();
+    for i in 0..WORKERS {
+        if online > 1 && i < online {
+            crate::scheduler::spawn_on_cpu(worker, crate::scheduler::PRIO_NORMAL, i);
+        } else {
+            crate::scheduler::spawn_prio(worker, crate::scheduler::PRIO_NORMAL);
+        }
     }
     let t0 = crate::apic::ms_since_boot();
     loop {
