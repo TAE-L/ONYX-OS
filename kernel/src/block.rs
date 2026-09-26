@@ -13,6 +13,18 @@ use spin::Mutex;
 use crate::ata::{AtaDrive, DriveInfo, SECTOR_SIZE};
 use crate::serial_writeln;
 
+/// M10b P3: sanity bounds for a GPT partition-entry array read off the disk.
+/// These bound the disk-controlled `entry_size` / `entry_count` so a corrupt
+/// header cannot drive a slice out of range (a kernel panic under
+/// `panic = abort`). The minimum is the UEFI entry layout size (128 bytes: the
+/// 72-byte name at offset 56..128 must fit); the maxima are generous well
+/// beyond any real disk but still bound the allocation.
+const GPT_ENTRY_MIN: usize = 128;
+const GPT_ENTRY_MAX: usize = 4096;
+const GPT_MAX_ENTRIES: u32 = 4096;
+/// Cap on the entry-array read: 4096 sectors = 2 MiB.
+const GPT_MAX_SECTORS: u64 = 4096;
+
 /// The (single) boot disk. `None` until `init()` succeeds.
 static DISK: Mutex<Option<Disk>> = Mutex::new(None);
 
@@ -72,6 +84,11 @@ pub fn init() {
         return;
     }
     serial_writeln!("M5: read-verify PASSED (LBA0 stable across 2 reads)");
+
+    // M10b P3: prove the GPT geometry validation rejects hostile on-disk values
+    // without panicking. Runs on every boot (deterministic, no disk access) so
+    // a regression here aborts the kernel and is caught immediately.
+    gpt_selftest();
 
     if a[510] != 0x55 || a[511] != 0xAA {
         serial_writeln!("M5: LBA0 has no 0x55AA signature — no partition table");
@@ -173,6 +190,75 @@ fn mbr_type_name(t: u8) -> String {
 /// partitions in its free entry slots ("hybrid" layout, like real-world
 /// hybrid MBRs), since the GPT entry array itself only carries the
 /// firmware's ESP.
+/// M10b P3: validate the disk-supplied GPT entry-array geometry before it is
+/// used to index or allocate. Returns `Err(reason)` for a header that cannot
+/// describe a real entry array.
+///
+/// Extracted as a pure `fn` (no disk, no allocation) so `gpt_selftest` can
+/// drive the exact validation the boot path uses with hostile values - that is
+/// the only way to test this deterministically: the real trigger for
+/// `scan_gpt` is MBR partition 0's type byte being 0xEE, and on this image that
+/// same byte is the bootloader's own boot partition, so corrupting it stops the
+/// kernel from booting at all (verified).
+fn validate_gpt_geometry(entry_size: usize, entry_count: u32) -> Result<(), alloc::string::String> {
+    use alloc::format;
+    if entry_size < GPT_ENTRY_MIN {
+        return Err(format!(
+            "GPT entry size {entry_size} below minimum {GPT_ENTRY_MIN}"
+        ));
+    }
+    if entry_size > GPT_ENTRY_MAX {
+        return Err(format!(
+            "GPT entry size {entry_size} above maximum {GPT_ENTRY_MAX}"
+        ));
+    }
+    if entry_count > GPT_MAX_ENTRIES {
+        return Err(format!(
+            "GPT entry count {entry_count} above maximum {GPT_MAX_ENTRIES}"
+        ));
+    }
+    Ok(())
+}
+
+/// M10b P3 self-test: feed hostile GPT geometry through the real validation and
+/// assert every one is REJECTED (a panic here would abort the kernel, so the
+/// test passing is the proof the boot path is safe on such media).
+///
+/// Runs on every boot; it touches no disk and allocates only small Strings, so
+/// it is deterministic and cheap. A PASS line is asserted by
+/// `test-fs-corrupt.ps1`.
+pub fn gpt_selftest() {
+    let bad: [(usize, u32); 5] = [
+        (0, 128),          // entry_size 0 -> old code sliced table[0..0] then indexed on
+        (32, 128),         // entry_size < 128 -> old code panicked on e[56..128]
+        (usize::MAX, 128),  // absurd entry_size -> huge allocation / OOB
+        (128, u32::MAX),    // absurd entry_count -> huge allocation
+        (128, 0),          // degenerate but legal; must be ACCEPTED below
+    ];
+    let mut rejected = 0u32;
+    for (i, (es, ec)) in bad.iter().enumerate() {
+        let expect_ok = i == bad.len() - 1; // the last row is the valid case
+        match validate_gpt_geometry(*es, *ec) {
+            Ok(()) if expect_ok => {}
+            Ok(()) => {
+                serial_writeln!("M5: gpt-selftest BAD: ({es},{ec}) was accepted but is invalid");
+            }
+            Err(_) if !expect_ok => rejected += 1,
+            Err(_) => {
+                serial_writeln!("M5: gpt-selftest BAD: valid ({es},{ec}) was rejected");
+            }
+        }
+    }
+    if rejected == bad.len() as u32 - 1 {
+        // NB: do not put the word "panic" in this message. Several suites
+        // assert on `PANIC|EXCEPTION` in the serial log, so naming it here
+        // would make them report a phantom kernel panic (hit exactly once).
+        serial_writeln!("M5: gpt-selftest PASS ({rejected} corrupt geometries rejected, kernel healthy)");
+    } else {
+        serial_writeln!("M5: gpt-selftest FAILED ({rejected} rejected)");
+    }
+}
+
 fn scan_gpt(
     drive: &mut AtaDrive,
     lba0: &[u8; SECTOR_SIZE],
@@ -188,34 +274,68 @@ fn scan_gpt(
     let entry_count = u32::from_le_bytes(hdr[80..84].try_into().unwrap());
     let entry_size = u32::from_le_bytes(hdr[84..88].try_into().unwrap()) as usize;
 
+    // M10b P3: `entry_size` and `entry_count` come straight off the disk, and
+    // everything below indexes with them. An unvalidated value here is a kernel
+    // PANIC on corrupt media (panic=abort, so it takes the whole kernel with
+    // it) - the same blast radius as a bug anywhere else. Reject a header that
+    // cannot describe a real entry array instead of slicing off the end of
+    // `table`. (Kept in a `fn` so the corrupt-input self-test can drive it
+    // without a real disk - see `gpt_selftest`.)
+    if let Err(why) = validate_gpt_geometry(entry_size, entry_count) {
+        serial_writeln!("M5: {why} - corrupt GPT header, ignoring GPT");
+        return (Layout::Gpt, Vec::new(), String::new());
+    }
+
     // Validate the header CRC32 (computed with the CRC field zeroed).
     let mut tmp = hdr;
     tmp[16..20].fill(0);
     let crc_ok = crc32(&tmp[..hdr_size.min(512)]) == hdr_crc_stored;
     serial_writeln!("M5: GPT header CRC {}", if crc_ok { "OK" } else { "BAD" });
 
-    // Read the entry array (may span several sectors).
-    let bytes = entry_count as usize * entry_size;
-    let sectors = ((bytes + SECTOR_SIZE - 1) / SECTOR_SIZE).max(1) as u8;
-    let mut table = alloc::vec![0u8; sectors as usize * SECTOR_SIZE];
-    if drive
-        .read_sectors(entry_lba as u32, sectors, &mut table)
-        .is_err()
-    {
-        serial_writeln!("M5: failed to read GPT entry array");
-        return (Layout::Gpt, Vec::new(), String::new());
+    // Read the entry array (may span several sectors). `saturating_mul` plus a
+    // sector cap keep a corrupt count from overflowing the allocation or asking
+    // the drive for a gigantic transfer.
+    //
+    // `read_sectors` takes a `u8` count (max 255 per call), so the array is
+    // read in CHUNKS rather than with one cast. The old `sectors as u8` was a
+    // silent truncation: an array needing >255 sectors was under-read and the
+    // loop then indexed past the end. The chunk loop reads exactly the sectors
+    // the validated sizes call for.
+    let bytes = (entry_count as usize).saturating_mul(entry_size);
+    let want_sectors = (bytes.div_ceil(SECTOR_SIZE) as u64).min(GPT_MAX_SECTORS);
+    let mut table = alloc::vec![0u8; want_sectors as usize * SECTOR_SIZE];
+    let mut lba = entry_lba;
+    let mut remaining = want_sectors;
+    while remaining > 0 {
+        let chunk = remaining.min(255) as u8;
+        let off = (want_sectors - remaining) as usize * SECTOR_SIZE;
+        if drive
+            .read_sectors(lba as u32, chunk, &mut table[off..off + chunk as usize * SECTOR_SIZE])
+            .is_err()
+        {
+            serial_writeln!("M5: failed to read GPT entry array");
+            return (Layout::Gpt, Vec::new(), String::new());
+        }
+        lba += chunk as u64;
+        remaining -= chunk as u64;
     }
 
     let mut parts = Vec::new();
     for i in 0..entry_count as usize {
-        let e = &table[i * entry_size..(i + 1) * entry_size];
+        // `entry_size` is validated and `table` is sized from it, so this slice
+        // is in range; `get` is a hard guarantee that a future change to the
+        // sizing above cannot reintroduce a panic.
+        let off = i * entry_size;
+        let Some(e) = table.get(off..off + entry_size) else {
+            break;
+        };
         let type_guid: [u8; 16] = e[0..16].try_into().unwrap();
         if type_guid == [0u8; 16] {
             continue;
         }
         let first = u64::from_le_bytes(e[32..40].try_into().unwrap());
         let last = u64::from_le_bytes(e[40..48].try_into().unwrap());
-        // Name: UTF-16LE in bytes 56..128.
+        // Name: UTF-16LE in bytes 56..128 (entry_size >= 128 guarantees it).
         let mut name = String::new();
         for ch in e[56..128].chunks_exact(2) {
             let c = u16::from_le_bytes(ch.try_into().unwrap());
@@ -226,7 +346,9 @@ fn scan_gpt(
         }
         parts.push(Partition {
             start_lba: first,
-            sectors: last - first + 1,
+            // `last - first` underflows in release (wrapping) / debug (panic)
+            // when a corrupt entry has first > last; saturating keeps it sane.
+            sectors: last.saturating_sub(first).saturating_add(1),
             kind: guid_kind(type_guid),
             name: if name.is_empty() { None } else { Some(name) },
         });
