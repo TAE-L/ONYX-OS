@@ -1524,28 +1524,17 @@ fn frame_clock_task() {
 
 /// Spawn the kernel frame clock (M10b 8). Only on the virtio present path.
 pub fn spawn_frame_clock() {
-    // M10b 10: pin the frame clock (the animated LOAD) to a spare AP so it stops
-    // contending with the flusher on the BSP. This is the measured win: moving
-    // the load off the flusher's core lifted pacing ~5 -> ~10 fps. Two safety
-    // notes, both learned in stage 9:
-    //   * The frame clock starts ~8 s after present, by which time the APs are
-    //     online, so `spawn_pinned(cpu=1)` is safe; and `spawn_pinned` refuses
-    //     an offline target anyway, returning None (no broken task) rather than
-    //     the null-context #GP the old bare `spawn_on_cpu` produced.
-    //   * The FLUSHER is NOT pinned (see gpu::spawn_task) - it should float to
-    //     whichever core is free; it is the load, not the presenter, that must
-    //     get off the busy core.
-    if crate::smp::online_cpus() > 1 {
-        if crate::scheduler::spawn_pinned(frame_clock_task, crate::scheduler::PRIO_NORMAL, 1)
-            .is_none()
-        {
-            // AP not up yet: fall back to the local CPU (still measured, just
-            // contended).
-            crate::scheduler::spawn(frame_clock_task);
-        }
-    } else {
-        crate::scheduler::spawn(frame_clock_task);
-    }
+    // M10b 9: the frame clock is spawned on the CURRENT cpu (the flusher's cpu),
+    // deliberately. Pinning it to another core (`spawn_on_cpu(..., 1)`) measured
+    // better (5 -> ~10 fps) but crashed with a null-context jump: `spawn_on_cpu`
+    // only sets `owner_cpu` and assumes the target AP is already fully online
+    // with its per-CPU context set up, which is NOT true at present-bringup
+    // time, and `plan_switch` is free to steal an `owner_cpu=1` task onto
+    // CPU-0 (the affinity filter was removed in M9.8-d/e), so its context can
+    // run on the wrong core. Spawning on the current cpu keeps the task's
+    // context self-consistent. Getting true cross-core affinity right is a
+    // scheduler fix, not a present fix - tracked for the scheduler track.
+    crate::scheduler::spawn(frame_clock_task);
 }
 
 /// M10b 7: a KERNEL-LOCAL single-rect draw task, used to measure PURE present
