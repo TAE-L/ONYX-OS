@@ -876,6 +876,14 @@ fn task() {
 /// `smp::spawn_bringup_task` â€” the task runs only once the scheduler is live,
 /// i.e. strictly after `init` finished the modeset.
 pub fn spawn_task() {
+    // M10b 10: the GPU task BECOMES the present flusher. It is deliberately NOT
+    // CPU-pinned: measurement showed pinning it to the spawning (BSP) CPU makes
+    // pacing WORSE (~1 fps) because the BSP also runs the shell, ticker, clock
+    // and frame clock, and a pinned flusher can never be stolen to a quieter
+    // core. The right long-term answer is to pin the *load* (frame clock) to a
+    // spare AP and let the flusher float to wherever there is a free core - the
+    // scheduler's steal behaviour is actually helping here. See stage 9/10 in
+    // PLAN.md.
     crate::scheduler::spawn(task);
 }
 

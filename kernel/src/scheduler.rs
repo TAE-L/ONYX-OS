@@ -83,6 +83,14 @@ struct Task {
     /// CPU currently executing this task while `state == Running` (M9.8); any
     /// other state leaves the value stale and meaningless.
     owner_cpu: u8,
+    /// M10b 10: opt-in CPU pin. `u8::MAX` (the default) = the task may run on
+    /// any CPU (`plan_switch` may steal it). Any other value = the task is
+    /// pinned to that CPU and is only ever scheduled there, so `plan_switch`
+    /// on a different CPU skips it. This is what `owner_cpu` is NOT: line ~1154
+    /// rewrites `owner_cpu = me` on every switch, so `owner_cpu` is a movable
+    /// hint, not a guarantee. A latency-critical task (the present flusher) that
+    /// must own a core needs this real pin.
+    pinned_cpu: u8,
     priority: u8,
     /// Ticks of 1 ms remaining before a same-priority peer gets the CPU.
     slice_left: u32,
@@ -232,6 +240,7 @@ fn new_task(entry: fn(), priority: u8, parent_id: u64) -> Task {
             stack,
             kstack_top: top & !0xF,
             state: State::Ready,
+            pinned_cpu: u8::MAX, // M10b 10: unpinned by default; opt in explicitly
             // A task is born on the CPU that spawned it and stays there: every
             // task's kernel stack lives in that CPU's TSS/syscall slot only
             // while it runs there (kernel tasks have no thread migration).
@@ -323,6 +332,7 @@ pub fn spawn_user_with_parent(user_rip: u64, user_rsp: u64, parent_id: u64) -> u
                 kstack_top: top & !0xF,
                 state: State::Ready,
                 owner_cpu: smp::cpu_index() as u8,
+                pinned_cpu: u8::MAX, // M10b 10: ring-3 tasks unpinned by default
                 priority: PRIO_NORMAL,
                 slice_left: fresh_slice(PRIO_NORMAL),
                 sleep_until_ms: 0,
@@ -423,6 +433,52 @@ pub fn spawn_on_cpu(entry: fn(), priority: u8, cpu: usize) -> u64 {
     }
     smp::kick_others();
     id
+}
+
+/// M10b 10: spawn a kernel task **pinned** to CPU `cpu` (a real affinity pin,
+/// not a steal-able hint). The task will only ever be scheduled on `cpu`.
+///
+/// Safety rule (learned the hard way in stage 9): the target CPU MUST be
+/// online, or must be the current CPU. Pinning a task to an AP that has not
+/// finished bring-up leaves it Ready with a context no CPU will claim, and the
+/// first CPU to touch it jumps through a null slot -> #GP. So unlike a bare
+/// `spawn_on_cpu`, this refuses an offline target and returns `None` instead of
+/// creating the broken task. The flusher uses this to own a core only when that
+/// core is real.
+///
+/// Returns the new task's id, or `None` if `cpu` is not (yet) online.
+pub fn spawn_pinned(entry: fn(), priority: u8, cpu: usize) -> Option<u64> {
+    // Refuse an offline / not-yet-bring-up target. The current CPU is always
+    // usable; any other CPU must be online.
+    let me = smp::cpu_index();
+    if cpu != me {
+        let p = smp::per_cpu_ptr(cpu);
+        if !unsafe { (*p).online.load(Ordering::Relaxed) } {
+            return None;
+        }
+    }
+    let id = {
+        let _g = sched_guard();
+        unsafe {
+            let mut t = new_task(entry, priority, 0);
+            t.owner_cpu = cpu as u8;
+            t.pinned_cpu = cpu as u8; // M10b 10: the actual pin
+            let id = t.id;
+            TASKS.push(t);
+            TASK_COUNT += 1;
+            id
+        }
+    };
+    // Wake the target CPU (if it is a peer) so it picks the task up now.
+    if cpu != me {
+        let p = smp::per_cpu_ptr(cpu);
+        smp::send_ipi(
+            unsafe { (*p).lapic_id.load(Ordering::Relaxed) },
+            crate::apic::RESCHED_VECTOR,
+        );
+    }
+    smp::kick_others();
+    Some(id)
 }
 
 /// Is at least one task Ready and owned by this CPU right now?
@@ -1092,6 +1148,16 @@ unsafe fn plan_switch(me: usize) -> Option<SwitchPlan> {
     for k in 0..n {
         let idx = (start + k) % n;
         if TASKS[idx].state != State::Ready {
+            continue;
+        }
+        // M10b 10: a CPU-pinned task may ONLY run on its pinned CPU. This is
+        // the opt-in affinity the present flusher needs to own a core: without
+        // it, plan_switch freely steals any Ready task onto any CPU, so a
+        // "pinned" task is only a preference. Skipping here (not at switch
+        // time) means a pinned task is never even considered by the wrong CPU,
+        // so it never steals or runs there.
+        let pin = TASKS[idx].pinned_cpu;
+        if pin != u8::MAX && usize::from(pin) != me {
             continue;
         }
         let p = TASKS[idx].priority as u32;
