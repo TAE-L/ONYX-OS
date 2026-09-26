@@ -1321,6 +1321,59 @@ now covers `*.ll`, `*.err`, `*.out`, `*.pid`, `*.txt`; all 17 were
 `.txt` was a build log (verified) and all real documentation is `docs/*.md`
 (verified unaffected). Standalone commit `ba70b42`.
 
+## M10b P3 — disk-input-driven panic hardening (done)
+
+**Scope.** `panic = abort` is set in both Cargo profiles, so any panic on a
+path driven by disk bytes takes the whole kernel down — a corrupt boot sector
+had the same blast radius as a scheduler bug. Audited the 48 `.unwrap()` /
+`expect` / `panic!` sites in `ext2.rs` / `block.rs` / `fat.rs` / `virtio.rs` and
+hardened the ones bad media can actually reach.
+
+**The real find: `block.rs` `scan_gpt`.** It read `entry_size` and
+`entry_count` straight off the GPT header and used them to index the partition
+-entry array, unvalidated:
+
+- `entry_size == 0` → `table[0..0]`, and the loop then indexed past it;
+- `entry_size < 128` → the UTF-16 name read at `e[56..128]` sliced out of range;
+- `sectors as u8` → a >255-sector entry array was **silently truncated** by the
+  `u8` cast, under-read, then indexed past the bytes it actually had;
+- `entry_count * entry_size` could overflow the allocation;
+- `last - first + 1` underflowed on a corrupt entry (`first > last`).
+
+All now go through `validate_gpt_geometry()` (bounds) plus a saturating,
+**chunked** read (a GPT array larger than one 255-sector transfer is now read
+in pieces rather than truncated), and a rejected header logs and degrades to
+"no GPT partitions" instead of aborting.
+
+**Audited and deliberately left as-is** (genuine invariants, not disk-driven):
+- the `ext2` block-iterator slices (`t[k*4..k*4+4]` …) are bounded by the
+  compile-time `PTRS`/`BLOCK` constants into fixed `[u8; BLOCK]` arrays, so no
+  disk value can take them out of range;
+- `fat.rs`'s `spc` divide is already validated (`spc == 0` → `BadFs`) before the
+  divide, and the `si * 32` slices are bounded by a modulo of the same buffer's
+  size.
+
+**Verification** — `block::gpt_selftest()` drives the *real* validation with
+hostile geometries on every boot: `(0,128)`, `(32,128)`, `(MAX,128)`,
+`(128,MAX)` must be rejected and `(128,0)` accepted; a regression aborts the
+kernel and is caught immediately. Asserted by the new `test-fs-corrupt.ps1`.
+
+**Why a self-test rather than a crafted corrupt image** (the obvious approach,
+which I tried first and abandoned): the real trigger for `scan_gpt` is MBR
+partition 0's type byte being `0xEE`, but on this image that *same* byte is the
+bootloader's own boot partition (type `0x20`, LBA 1). Setting it to `0xEE` to
+reach the GPT path stops the kernel from booting at all — verified: zero
+serial output. Exercising the validation directly is deterministic and needs
+no crafted media.
+
+**Gotcha worth remembering** (hit and fixed): the self-test's PASS line must not
+contain the word "panic" — several suites assert on `PANIC|EXCEPTION` in the
+serial log, so naming it there made `test-fs` report a *phantom* kernel panic.
+
+Suites: `test-fs-corrupt.ps1` (new), `test-fs.ps1`, `test-gpu.ps1` ×2,
+`test-smp.ps1`, `test-avx.ps1`, `test-shell.ps1`, `test-latency.ps1`,
+`test-para.ps1` — all exit 0. `build.ps1` clean.
+
 ## M10b stage 3b — decisions and deferrals
 
 - **Deferred scatter-gather backing.** 8.1 MiB contiguous always fits the
