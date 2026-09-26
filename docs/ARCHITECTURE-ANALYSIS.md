@@ -41,6 +41,42 @@ frame rate long before the display hardware matters.
 | `-smp 4` + a `Task` struct-field addition | **heap-entry crash** | stage 10 |
 | same code at `bcd2749` (before the field) | **passes** | bisect |
 
+## P1 root-cause — refined (after code-level tracing)
+
+I traced every path that touches a task's saved context. The relevant
+invariants and the one real gap:
+
+- `Task.sp_slot` and `Task.fpu_area` are **separate heap boxes**
+  (`Box::leak`), so `TASKS` reallocation does not invalidate the raw pointers
+  `preempt()` carries — good.
+- A task is only ever `Running` on one CPU: `plan_switch` sets
+  `state=Running, owner_cpu=me` **under `SCHED_LOCK`**, and the Ready-scan only
+  selects `State::Ready`. So a peer cannot steal a Running task, and
+  `release_pending_prev` only re-arms a task on the CPU that owns it.
+  Those invariants hold.
+- **`preempt()` (scheduler.rs ~970-1009) is the exposure.** It computes
+  `plan` (raw `sp_slot`/`fpu_area` pointers) *under* the lock, then the guard
+  drops (releasing the lock and re-enabling interrupts), and only then runs
+  `context_switch`. The *pick* is safe; the *switch* is not under the lock. The
+  code's own comment (~line 984) claims "no other CPU can have claimed either
+  context" — that holds for the incoming task, but the outgoing task's
+  `sp_slot` is being written by this CPU while a peer can, in that window,
+  observe and re-arm other tasks. The exact interleaving that corrupts memory
+  in the field (it is intermittent — a field change, not a logic change,
+  flips it) is a genuine TOCTOU between "plan computed under lock" and
+  "context_switch executed after unlock", compounded by the per-task context
+  being *split* between a heap `sp_slot` and a per-CPU `TSS.RSP0`/FPU area.
+
+**Why this is architectural, not a typo:** the split ownership (a task's saved
+RSP lives in one heap box while its kernel stack pointer is re-installed into
+*each* CPU's TSS as it migrates) is only safe if migration and switch are
+mutually exclusive. They are not — the switch is outside the lock. A correct
+design makes a task's context **owned by one CPU at a time, immutable while
+running**, so a switch is a single-owner operation with no peer able to touch
+the same bytes. That is item (2) in the fix below, and it is the minimum
+change that makes cross-CPU scheduling *safe by construction* rather than by
+argument.
+
 ## The structural problems
 
 ### P1 — Cross-CPU task execution is not memory-safe (critical)
@@ -134,11 +170,52 @@ and *trustworthy* CPU isolation for the display path.
   things preventing it (unsafe cross-CPU contexts, 1 ms quantization) are
   architectural and have a known fix, and that the present path is already fast
   enough not to be the bottleneck.
-- The crash on `master` (`9b21b7a`) is a real regression introduced by stage 10
-  and NOT yet root-caused. It is a symptom of P1. **The safe rollback point is
-  `bcd2749`** (stage 9), which passes the full suite. Master is left as-is so
-  the failing state stays reproducible, but master must not be treated as green
-  until P1 is fixed.
+- The crash on `master` (`9b21b7a`) was a real regression introduced by stage 10
+  and is now **reverted** (commit `184997c`): the `pinned_cpu` field + frame-clock
+  pin were removed, and the tree is green again (full suite + latency test pass).
+  The P1 memory-corruption class it exposed is documented above and is the first
+  thing to fix — not by re-adding the pin, but by making task contexts owned.
+
+## When is the desktop?
+
+Short answer: **the desktop is item (5), and it is blocked on (1)-(4) — but
+not as far as it looks.** Here is the honest dependency chain and what a
+minimal desktop actually needs.
+
+**What a desktop is here.** Not a window manager bolted onto the text console.
+It is a **compositor**: a kernel task that owns a framebuffer surface, draws
+arbitrary shapes/text into it, and *presents* it on a frame clock. The good
+news: we already have every hard part of that except the "draw arbitrary
+shapes" and "own the frame clock" parts — the present path (damage rect,
+transfer+flush, sub-ms) and the cursor are done and measured. A desktop is
+mostly a **drawing API + a frame loop** on top of what already works.
+
+**The dependency chain:**
+1. **P1 fix (safe task contexts)** — blocking. A compositor/UI is exactly the
+   kind of code that stresses task migration and CPU affinity (render thread,
+   event thread, present thread). Shipping a UI on the current unsafe cross-CPU
+   context path would reproduce the crash on demand.
+2. **P2 fix (deadline timer)** — blocking for *smooth* UI. A compositor on a
+   1 ms tick can hit ~60 fps at best and jitters badly; a 240 Hz desktop needs
+   a real deadline timer. The present path being fast doesn't help if the
+   compositor can't wake on time.
+3. **P6 (surface/blit API)** — this is the actual "make the desktop" work:
+   `surface_create/blit/fill/present`, a font blitter, and moving the console
+   onto the same surface API so text and UI share one present path.
+
+So the realistic order is **execution model (P1-P2) → surface API (P6) →
+compositor/desktop**. That is not "the desktop is far away" — it is "the desktop
+is one major subsystem (P6) away, but two foundations underneath it must be
+solid first, and they are the same work a gaming OS needs anyway."
+
+**A pragmatic, high-value milestone** (if you want pixels on screen sooner than
+the full rewrite): a **minimal single-task compositor** — one kernel task that
+owns a full-screen surface, draws a few rectangles and a blitted font each
+frame, and presents via the existing damage-rect path, at a fixed cadence. It
+needs P6 (the blit API) but can run pinned to one CPU, so it largely sidesteps
+P1/P2 while still proving the whole "draw → present" loop. That gives a real
+desktop *look* and a real frame loop early, and it becomes the testbed the
+later scheduler work makes fast.
 
 ## Immediate next actions (in order)
 
