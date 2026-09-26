@@ -228,3 +228,37 @@ would call a desktop.
 **Carried caveats:** pin the LOAD / float the PRESENTER (item 8); the present
 path is already sub-ms - the wins are in the scheduler (steps 1-2) and the
 substrate (step 3).
+
+---
+
+## 16. P1 step A (owned contexts) - ATTEMPTED, REVERTED, do not redo blindly
+
+**Goal.** Collapse a task context (saved SP + kernel stack + FPU image) into ONE
+owned `TaskCtx` allocation so a context is touched by exactly one CPU and safe
+migration/work-stealing can return.
+
+**What I tried.** Added `struct TaskCtx { sp: u64, fpu: &static mut FpuArea,
+stack: [u8; 64K], cpu: u8 }`, boxed it in `Task.ctx`, and pointed `sp_slot()`,
+`fpu_ptr()` and the `kstack_top` TSS update at the box.
+
+**Result: a double-fault (#DF) on the very first context switch, on every CPU
+count (even -smp 1).** Reverted with `git checkout -- kernel/src/scheduler.rs`;
+the base is green again. Nothing was committed, so nothing is lost.
+
+**Two traps hit along the way (both cost time):**
+- `fpu::new_area()` returns `&'static mut FpuArea` (a leaked Box), NOT an inline
+  FpuArea - so the field type is a reference, and it cannot be `Box::new(...)`ed
+  again. Reading it out of a `static mut Vec` needs `addr_of_mut!(..).read()` (you
+  cannot form a `&mut` through a Vec index).
+- Repeated PowerShell `Set-Content -Encoding UTF8` edits prepend a UTF-8 BOM
+  (EF BB BF) to the file and mangle em-dashes in comments. A BOM before `//!` is
+  a Rust compile error waiting to happen. After heavy scripted editing, verify
+  the first bytes are `47,47,33` (`//!`), not `239,187,191`.
+
+**Lesson / how to redo it.** The double fault is a REAL bug in the restructure,
+not the encoding (the base builds and runs). The likely cause to check FIRST:
+the initial `sp` is written by `prepare_stack(&mut ctx.stack)` BEFORE the `Box` is
+moved into `Task` - a Box move does not move its heap contents, so the sp should
+stay valid, BUT the `kstack_top` (TSS.RSP0) and the saved `sp` must be derived
+from the SAME box. Do it one small step at a time with a build+smp test after
+each, and never do a multi-site scripted rewrite of the scheduler in one go.
