@@ -1530,3 +1530,43 @@ defaulting to responsiveness over throughput.
 - FS drivers (M6/M7) tested from **ring 3** through the shell — the payoff of
   the M4-first ordering.
 - Manually: `cargo run -- bios-gui` for the graphical window.
+---
+
+## P1A status (dated 2026-09-26): owned context - built, then REVERTED
+
+**Verdict: not landed. The tree is back at the P1 safety floor and is green.**
+
+The `TaskCtx` restructure (one owned allocation holding saved SP + kernel stack
++ FPU image, tagged with the CPU it runs on) compiled cleanly but produced a
+**double fault (#DF) on the very first context switch**, on every CPU count
+including `-smp 1`. It was reverted with `git checkout -- kernel/src/scheduler.rs`
+rather than left half-working. Details and the two encoding/ownership traps are
+in KNOWLEDGE.md item 16.
+
+**What is verified green at this commit (full suite, sequential):**
+
+| Test | Result |
+|---|---|
+| `build.ps1` | 0 (no new warnings) |
+| `test-smp.ps1` | 0 |
+| `test-avx.ps1` | 0 |
+| `test-para.ps1` | 0 - `cpus=[1,2,3,0] distinct=4, speedup x4.3` |
+| `test-fs-corrupt.ps1` | 0 - 4 corrupt geometries rejected |
+| `test-fs.ps1` | 0 |
+| `test-gpu.ps1` x2 | 0 / 0 (no flake) |
+| `test-shell.ps1` | 0 |
+| `test-latency.ps1` | 0 |
+
+**Latency note (feeds P2).** Present latency is bimodal, not uniformly ~300 us:
+`damage->present` measured `min=283 us` but `max=111944 us`, and one run showed
+`wake/schedule avg=110310 us` with pacing at only `7.89 fps`
+(`interval avg=126651 us`). The fast path is as good as measured before, but the
+tail is dominated by **scheduler wake-up / cadence**, not by the GPU driver. This
+is direct evidence for the P2 deadline timer: the 1 ms LAPIC quantum cannot
+service a 1000 FPS loop, and a periodic task is being made to wait a whole
+quantum before it is run.
+
+**Next (unchanged order):** redo P1A one small step at a time - build + `test-smp`
+after each edit - until one owned context is genuinely in place; then P2
+deadline timer; then P6a surface/blit + scalable Unicode font, compositor and
+input dispatch, and finally the first desktop (taskbar, clock, one window).
