@@ -33,6 +33,7 @@
 
 use crate::fpu;
 use crate::smp;
+use alloc::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -77,18 +78,92 @@ pub enum State {
     Dead,
 }
 
+/// M10b P1A: a task's ENTIRE machine context in ONE owned allocation.
+///
+/// A context used to be three independent heap allocations: a leaked saved-SP
+/// slot, a leaked kernel stack, and a `Box<FpuArea>`. Three pointers the
+/// scheduler had to keep mutually consistent, and only ONE cpu was allowed to
+/// touch any of them - which is why migration had to stay disabled. Collapsing
+/// them into one value makes the invariant checkable: the context has a single
+/// address, a single owner and a single lifetime. That is what makes safe
+/// migration possible again.
+///
+/// `repr(C)` pins the field order and `align(64)` guarantees the allocation is
+/// 64-byte aligned, so the inline `fpu` image (itself `align(64)`) is 64-byte
+/// aligned for `fxsave` with no manual alignment code. The stack comes FIRST, so
+/// its base is the allocation base and is 64-byte aligned as well.
+#[repr(C, align(64))]
+struct TaskCtx {
+    /// The kernel stack the task runs on. `sp` below points into this buffer.
+    stack: [u8; STACK_SIZE],
+    /// Saved RSP, written and read by `context_switch` on every switch.
+    sp: u64,
+    /// FXSAVE/XSAVE image (x87+SSE+AVX), swapped on every switch.
+    fpu: fpu::FpuArea,
+}
+
+// NOTE: the "which CPU owns this context" tag deliberately does NOT live here
+// yet. `Task::owner_cpu` is still the single authority (the affinity filter in
+// `plan_switch` reads it), and migration is still disabled. Adding a second copy
+// here would create exactly the split-brain hazard P1 exists to remove: two
+// fields that mean the same thing and can disagree. When migration is switched
+// on, the tag MOVES here and `owner_cpu` is deleted in the same change - never
+// duplicated.
+
+impl TaskCtx {
+    /// 16-aligned top of the kernel stack: where ring-3 interrupt/syscall entry
+    /// lands (TSS.RSP0 + syscall entry KSTACK_TOP).
+    #[inline]
+    fn kstack_top(&self) -> u64 {
+        (self.stack.as_ptr() as u64 + STACK_SIZE as u64) & !0xF
+    }
+}
+
+/// M10b P1A: allocate a `TaskCtx` and initialise it IN PLACE, then return the
+/// owning `Box`.
+///
+/// The obvious `Box::new(TaskCtx { stack: [0u8; STACK_SIZE], .. })` is a trap:
+/// a struct literal materialises the whole ~66 KB value as a temporary in the
+/// CALLING frame before it is copied to the heap, and that does not fit in a
+/// 64 KiB kernel stack. The first attempt at step A died exactly that way - a
+/// smashed stack that only surfaced as a `#DF` at the NEXT context switch, with
+/// no clue which task was at fault.
+///
+/// Allocating first and writing every field through the raw pointer means no
+/// large temporary is ever created. `alloc_zeroed` gives the same zeroed memory
+/// `Box` would, and `Box::from_raw` takes ownership back so the block is freed
+/// normally afterwards.
+///
+/// `init` receives the kernel stack and returns the initial `sp` to store.
+fn new_ctx<F: FnOnce(&mut [u8]) -> u64>(init: F) -> Box<TaskCtx> {
+    let layout = Layout::new::<TaskCtx>();
+    unsafe {
+        let p = alloc_zeroed(layout);
+        if p.is_null() {
+            handle_alloc_error(layout);
+        }
+        let ctx = p as *mut TaskCtx;
+        let stack = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!((*ctx).stack) as *mut u8,
+            STACK_SIZE,
+        );
+        stamp_stack_canary(stack);
+        let sp = init(stack);
+        core::ptr::addr_of_mut!((*ctx).sp).write(sp);
+        fpu::seed_in_place(&mut *core::ptr::addr_of_mut!((*ctx).fpu));
+        Box::from_raw(ctx)
+    }
+}
+
 struct Task {
     id: u64,
     entry: fn(),
-    /// Heap-allocated RSP slot (never moves): `context_switch` writes the
-    /// outgoing task's stack pointer through it and reads it again on resume.
-    /// Not a field of `TASKS[i]` because the vector may reallocate while the
-    /// switch runs outside the scheduler lock (M9.8).
-    sp_slot: *mut u64,
-    stack: &'static mut [u8],
-    /// Top of this task's kernel stack (16-aligned). Ring-3 interrupt/syscall
-    /// entry lands here (TSS.RSP0 + syscall entry KSTACK_TOP).
-    kstack_top: u64,
+    /// M10b P1A: the whole machine context - kernel stack, saved RSP and FXSAVE
+    /// image - in ONE owned allocation. It lives behind a `Box` precisely so its
+    /// address is stable: the `TASKS` vec may reallocate while a switch runs
+    /// outside the scheduler lock, but the heap block never moves, so a saved
+    /// `sp` pointing into it stays valid.
+    ctx: Box<TaskCtx>,
     state: State,
     /// CPU currently executing this task while `state == Running` (M9.8); any
     /// other state leaves the value stale and meaningless.
@@ -117,13 +192,6 @@ struct Task {
     /// conventions (arg 4 in r10, `-errno` returns), served by the shim in
     /// `syscall::dispatch`.
     linux_abi: bool,
-    /// 512-byte FXSAVE image swapped by `context_switch` (FPU/SSE state).
-    /// M10b P1A: owned by value in a `Box` instead of a raw pointer into a
-    /// `Box::leak`ed allocation, so the FPU state is owned by the task rather
-    /// than being an independent allocation the scheduler must keep alive.
-    /// `FpuArea` is `align(64)`, so the image stays 64-byte aligned (required by
-    /// `fxsave`) with no manual alignment code.
-    fpu_area: Box<fpu::FpuArea>,
 }
 
 static mut TASKS: Vec<Task> = Vec::new();
@@ -174,10 +242,6 @@ fn cur_index() -> usize {
 }
 
 /// Heap-allocated, never-moving RSP slot for a task (see `Task::sp_slot`).
-fn new_sp_slot(sp: u64) -> *mut u64 {
-    Box::leak(Box::new(sp))
-}
-
 /// M10b P1A: stamp the low-end canary of a freshly allocated task stack.
 ///
 /// Must be called for every new task (kernel and ring-3) before the first
@@ -224,7 +288,12 @@ unsafe fn sp_slot(idx: usize) -> *mut u64 {
     if idx == MAIN_INDEX {
         &raw mut (*smp::this_cpu()).idle_sp
     } else {
-        TASKS[idx].sp_slot
+        // The saved SP is a FIELD of the context allocation, so this is a
+        // pointer straight into the task's own context block - stable, and
+        // provably the same allocation as its stack and FPU image.
+        let b: *mut Box<TaskCtx> = &raw mut TASKS[idx].ctx;
+        let c: *mut TaskCtx = &raw mut **b;
+        &raw mut (*c).sp
     }
 }
 
@@ -238,11 +307,11 @@ unsafe fn fpu_ptr(idx: usize) -> *mut fpu::FpuArea {
     if idx == MAIN_INDEX {
         &raw mut (*smp::this_cpu()).idle_fpu
     } else {
-        // `addr_of_mut!` avoids forming a `&mut` through the `static mut` Vec
-        // index, then `as_mut()` yields the address of the OWNED image (not the
-        // address of the Box header, which is what the switch must not touch).
-        let b: *mut Box<fpu::FpuArea> = &raw mut TASKS[idx].fpu_area;
-        (*b).as_mut() as *mut fpu::FpuArea
+        // The image is a FIELD of the context allocation, so this is the same
+        // single block as the stack and the saved SP - one allocation, one owner.
+        let b: *mut Box<TaskCtx> = &raw mut TASKS[idx].ctx;
+        let c: *mut TaskCtx = &raw mut **b;
+        &raw mut (*c).fpu
     }
 }
 
@@ -278,18 +347,14 @@ unsafe fn validate_ctx(idx: usize, tag: &str) -> bool {
         return true; // per-CPU idle context: layout checked in smp.rs
     }
     let t = &TASKS[idx];
-    // `sp_slot` is a *pointer to* the saved-SP slot, so the saved stack pointer
-    // is the value it points at. Reading the pointer itself instead would just
-    // yield the slot's own heap address.
-    let sp = t.sp_slot.read_volatile();
-    let base = t.stack.as_ptr() as u64;
-    let top = base + t.stack.len() as u64;
-    // Dereference the `Box` to reach the IMAGE, exactly as `fpu_ptr` does. Taking
-    // the address of the field itself would only measure where the `Task` struct
-    // sits inside the `TASKS` Vec, which has no relation to the 64-byte
-    // alignment the image actually needs.
-    let b: *const Box<fpu::FpuArea> = &raw const t.fpu_area;
-    let fp = (*b).as_ref() as *const fpu::FpuArea as u64;
+    let b: *const Box<TaskCtx> = &raw const t.ctx;
+    let c: &TaskCtx = &**b;
+    // The saved RSP is a field OF the context, so this is a direct read (there
+    // is no pointer-to-slot indirection any more).
+    let sp = c.sp;
+    let base = c.stack.as_ptr() as u64;
+    let top = base + STACK_SIZE as u64;
+    let fp = (&raw const c.fpu) as *const fpu::FpuArea as u64;
 
     // 8-byte alignment is the only alignment a saved RSP is guaranteed to have:
     // the switch pushes/pops 8-byte slots, so alignment parity is whatever the
@@ -302,7 +367,7 @@ unsafe fn validate_ctx(idx: usize, tag: &str) -> bool {
     // pre-populated frames live just below `kstack_top`.
     let sp_in_stack = sp >= base && sp <= top;
     let fpu_ok = fp != 0 && fp % 64 == 0;
-    let can_ok = stack_canary_ok(t.stack);
+    let can_ok = stack_canary_ok(&c.stack);
 
     if sp_ok && sp_in_stack && fpu_ok && can_ok {
         return true;
@@ -335,36 +400,27 @@ static mut NOREADY_TICKS: u32 = 0;
 static mut NOREADY_DUMPED: bool = false;
 
 fn new_task(entry: fn(), priority: u8, parent_id: u64) -> Task {
-    unsafe {
-        let stack: &'static mut [u8] = Box::leak(vec![0u8; STACK_SIZE].into_boxed_slice());
-        stamp_stack_canary(stack);
-        let sp = prepare_stack(stack);
-        let top = stack.as_ptr() as u64 + stack.len() as u64;
-        let fpu_area = fpu::new_owned_area();
-        Task {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            entry,
-            sp_slot: new_sp_slot(sp),
-            stack,
-            kstack_top: top & !0xF,
-            state: State::Ready,
-            // A task is born on the CPU that spawned it and stays there: every
-            // task's kernel stack lives in that CPU's TSS/syscall slot only
-            // while it runs there (kernel tasks have no thread migration).
-            owner_cpu: smp::cpu_index() as u8,
-            priority,
-            slice_left: fresh_slice(priority),
-            sleep_until_ms: 0,
-            blocked_on_input: false,
-            blocked_on_raw: false,
-            wake_diag: false,
-            parent_id,
-            exit_code: 0,
-            reaped: false,
-            blocked_on_child: false,
-            linux_abi: false,
-            fpu_area,
-        }
+    let ctx = new_ctx(prepare_stack);
+    Task {
+        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        entry,
+        ctx,
+        state: State::Ready,
+        // A task is born on the CPU that spawned it and stays there: every
+        // task's kernel stack lives in that CPU's TSS/syscall slot only
+        // while it runs there (kernel tasks have no thread migration).
+        owner_cpu: smp::cpu_index() as u8,
+        priority,
+        slice_left: fresh_slice(priority),
+        sleep_until_ms: 0,
+        blocked_on_input: false,
+        blocked_on_raw: false,
+        wake_diag: false,
+        parent_id,
+        exit_code: 0,
+        reaped: false,
+        blocked_on_child: false,
+        linux_abi: false,
     }
 }
 
@@ -426,18 +482,12 @@ pub fn spawn_user_with_parent(user_rip: u64, user_rsp: u64, parent_id: u64) -> u
     let id = {
         let _g = sched_guard();
         unsafe {
-            let stack: &'static mut [u8] = Box::leak(vec![0u8; STACK_SIZE].into_boxed_slice());
-            stamp_stack_canary(stack);
-            let sp = prepare_stack_user(stack, user_rip, user_rsp);
-            let top = stack.as_ptr() as u64 + stack.len() as u64;
-            let fpu_area = fpu::new_owned_area();
+            let ctx = new_ctx(|stack| prepare_stack_user(stack, user_rip, user_rsp));
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             TASKS.push(Task {
                 id,
                 entry: bug_entry,
-                sp_slot: new_sp_slot(sp),
-                stack,
-                kstack_top: top & !0xF,
+                ctx,
                 state: State::Ready,
                 owner_cpu: smp::cpu_index() as u8,
                 priority: PRIO_NORMAL,
@@ -451,7 +501,6 @@ pub fn spawn_user_with_parent(user_rip: u64, user_rsp: u64, parent_id: u64) -> u
                 reaped: false,
                 blocked_on_child: false,
                 linux_abi: false,
-                fpu_area,
             });
             TASK_COUNT += 1;
             crate::serial_writeln!(
@@ -1299,7 +1348,7 @@ unsafe fn plan_switch(me: usize) -> Option<SwitchPlan> {
     let ktop = if next == MAIN_INDEX {
         smp::idle_kstack_top()
     } else {
-        TASKS[next].kstack_top
+        TASKS[next].ctx.kstack_top()
     };
     crate::gdt::set_kernel_stack(x86_64::VirtAddr::new(ktop));
     crate::syscall::set_kernel_stack_top(ktop);

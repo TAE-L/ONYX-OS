@@ -456,27 +456,23 @@ pub fn init_ap() {
     }
 }
 
-/// M10b P1A: a fresh, template-seeded state image for a task, OWNED by the task.
+/// M10b P1A: seed an ALREADY-ALLOCATED image in place with the captured template.
 ///
-/// The old constructor ended in `Box::leak`, which forced every task's FPU image
-/// to live in its own separate allocation forever, as a third independent
-/// pointer the scheduler had to keep alive and keep aligned by hand. Returning
-/// the `Box` instead lets the task hold the image by value, so the FPU state
-/// becomes part of the task's own context rather than something reachable only
-/// through a raw pointer.
+/// This replaces the old `new_owned_area() -> Box<FpuArea>`, which is no longer
+/// correct for the current design: a task's FXSAVE image now lives INSIDE the
+/// task's single `TaskCtx` allocation, so there is no separate `Box` to hand
+/// back. Writing the template through the caller's reference keeps the image
+/// where it already is.
 ///
-/// The leaking variant is deliberately removed rather than left unused: it is the
-/// exact allocation pattern step A is eliminating, and keeping it around only
-/// invites someone to call it and silently undo the ownership.
-///
-/// The image is still 64-byte aligned: `FpuArea` is `#[repr(C, align(64))]`, and
-/// `Box` preserves a type's alignment, so no manual alignment logic is needed.
-pub fn new_owned_area() -> Box<FpuArea> {
+/// `copy_from_slice` is used rather than `area.bytes = src.bytes` on purpose:
+/// array assignment can build a 2 KB temporary on the stack, and this kernel
+/// already has a stack-overflow bug of exactly that family (see the
+/// `TaskCtx` construction in scheduler.rs). `copy_from_slice` is a `memcpy`
+/// straight from one heap location to another.
+pub fn seed_in_place(area: &mut FpuArea) {
     unsafe {
-        let mut area = Box::new(FpuArea::zeroed());
         let src = &*core::ptr::addr_of!(TEMPLATE);
-        area.bytes = src.bytes;
-        area
+        area.bytes.copy_from_slice(&src.bytes);
     }
 }
 
