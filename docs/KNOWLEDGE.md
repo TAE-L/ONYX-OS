@@ -290,6 +290,24 @@ then write fields via raw pointers), or keep the stack as a separate heap slice
 and accept 2 allocations instead of 3 (still a real improvement, and safe). Do
 NOT "fix" it by enlarging stacks - the temporary IS the bug.
 
+**RESOLVED - the diagnosis was correct and step 2b landed on `6ca1ba9`.**
+`new_ctx()` does exactly the prescribed in-place construction
+(`alloc_zeroed(Layout::new::<TaskCtx>())` + raw-pointer field writes) and the
+one-allocation context now boots, schedules and switches with zero `#DF`. So the
+66 KB stack temporary was the whole cause, not a red herring.
+
+The same trap bit a SECOND time in miniature: `fpu::seed_in_place()` originally
+did `area.bytes = src.bytes`, and array assignment of a 2048-byte array can build
+a temporary. It now uses `copy_from_slice` (a `memcpy` straight from one heap
+location to another). **Rule of thumb for this kernel: any copy of a
+stack-sized or FpuArea-sized value is suspect - use `memcpy`-style APIs and
+write through pointers.**
+
+Third instance of the same *class* of bug, worth remembering: a `#DF` or silent
+corruption after a "safe looking" refactor is usually a large value passing
+through the stack, not a pointer/alignment mistake. Check for big temporaries
+first.
+
 ### Facts established by the validator (all measured, not assumed)
 
 - **A saved RSP is only guaranteed 8-byte aligned.** Its 16-byte parity VARIES

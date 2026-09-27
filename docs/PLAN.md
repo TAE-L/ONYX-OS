@@ -1611,3 +1611,42 @@ still 2 allocations (FPU box + leaked stack) plus the leaked 8-byte SP slot.
 **Suite green at `3ac6a25`** (strictly sequential): build/smp/avx/para(x4.9, 4
 distinct CPUs)/fs-corrupt/fs/gpu x2/shell/latency all 0, zero `ctxcheck` reports.
 AVX: 58 rounds, 16 YMM lanes intact across 21 switches, XCR0=0x7.
+
+## P1A LANDED: one owned context (2026-09-27, `6ca1ba9`)
+
+**The goal of P1A is achieved: a task context is ONE owned allocation.**
+
+`TaskCtx { stack, sp, fpu }` is a single `#[repr(C, align(64))]` value held as
+`Box<TaskCtx>`. All three former per-task allocations are gone - the leaked
+saved-SP slot, the leaked kernel stack, and the `Box<FpuArea>`. A context now
+has a single address, a single owner and a single lifetime.
+
+**How the old #DF was avoided.** `new_ctx()` calls
+`alloc_zeroed(Layout::new::<TaskCtx>())` and writes each field through the raw
+pointer, so the ~66 KB struct is NEVER materialised on the stack. That temporary
+was the entire cause of the original crash. `fpu::seed_in_place()` uses
+`copy_from_slice` (a memcpy) for the same reason.
+
+**Layout.** The stack is the FIRST field, so its base is the allocation base and
+is 64-byte aligned; the inline `fpu` image is 64-byte aligned for `fxsave`
+without any manual alignment code.
+
+**The CPU tag stays in `Task::owner_cpu` and is deliberately NOT duplicated**
+into the context. Two fields that mean the same thing can disagree, which is
+exactly the split-brain hazard P1 exists to eliminate. When migration is enabled,
+the tag MOVES into the context and `owner_cpu` is deleted in the same change.
+
+**Suite green at `6ca1ba9`** (strictly sequential): build/smp/avx/para(x4.26, 4
+distinct CPUs)/fs-corrupt/fs/gpu x2/shell/latency all 0, zero `ctxcheck` reports,
+zero `#DF`.
+
+**What P1A deliberately did NOT do:** migration is still disabled and the
+affinity filter in `plan_switch` still holds. The structural prerequisite is now
+in place, but re-enabling migration is a separate, riskier change - it must move
+the CPU tag into the context and delete `owner_cpu` atomically, and it should be
+gated behind the validator, not done blind.
+
+**Recommended next:** P2 deadline timer. The owned context is a safety
+prerequisite, not a speed fix - latency is still bimodal (`min=336 us` but
+`max=157706 us`, pacing 7.67 fps, `wake/schedule avg=133850 us`). Cadence, not
+the GPU or the context layout, is what caps the frame rate.
