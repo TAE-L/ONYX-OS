@@ -11,7 +11,7 @@
 # Measured here: WHPX 701 -> 156 ms = x4.5 (4 workers / 4 cores). If WHPX is
 # not available the harness falls back to TCG (thread=multi) with relaxed
 # assertions: correctness + distribution + no-slower-than-serial.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 $img  = Join-Path $root 'target\debug\images\bios.img'
 $fail = @()

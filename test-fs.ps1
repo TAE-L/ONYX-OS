@@ -6,7 +6,7 @@
 #       * unlink: file removed then -ENOENT, dir -> -EISDIR, missing -> -ENOENT
 #   - Shell `stat`/`rm` smoke (autoexec seeded into the FAT image).
 #   - Dual mount intact (FAT32 + ext2 at "/"), no PANIC / unexpected exception.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 $tmp = Join-Path $env:TEMP 'onyx-boot'

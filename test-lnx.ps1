@@ -8,7 +8,7 @@
 #     brk, anonymous mmap (write-back), arch_prctl TLS (fs-relative load),
 #     a relocated .rodata pointer (proves R_X86_64_RELATIVE was applied),
 #     getpid, getrandom, clock_gettime - then exits 0 (exit_group).
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 $tmp = Join-Path $env:TEMP 'onyx-boot'
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null

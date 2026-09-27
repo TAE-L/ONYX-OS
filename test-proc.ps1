@@ -7,7 +7,7 @@
 #     and reports the child's exit code (fstest exits 0).
 #   - Shell `sync` bug fix: SYS_FLUSH is 13 (was 12 = LSPCI).
 #   - No PANIC / unexpected exception.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 $tmp = Join-Path $env:TEMP 'onyx-boot'

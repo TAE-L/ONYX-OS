@@ -1,6 +1,6 @@
 # test-m3.ps1 - boots the kernel headless for 8 seconds, then prints the serial log.
 # Works around the space in the project folder by running from a space-free temp dir.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 # Stage the image + serial log in a space-free temp folder

@@ -6,7 +6,7 @@
 #   - C2: fstest additionally asserts each failure class returns its specific
 #     -errno (ENOENT/EBADF/EEXIST/ESRCH/ECHILD/EFAULT), because syscalls now
 #     decode errors with the Linux convention instead of the old sentinel.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 $tmp = Join-Path $env:TEMP 'onyx-boot'
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null

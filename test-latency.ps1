@@ -13,7 +13,7 @@
 # This is the metric a latency-driven OS is judged by; every later optimization
 # (hardware cursor, frame pacing) is measured against THIS number, so the probe
 # itself is a tested artifact, not debug output.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 $img  = Join-Path $root 'target\debug\images\bios.img'
 $script:fail = @()

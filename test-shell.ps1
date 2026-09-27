@@ -1,6 +1,6 @@
 # test-shell.ps1 - M8: boots headless and prints the ring-3 shell markers
 # (shell ELF loaded from disk, AUTOEXEC script, SYS_SPAWN of FSTEST.ELF).
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 $tmp = Join-Path $env:TEMP 'onyx-boot'

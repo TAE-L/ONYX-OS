@@ -1,6 +1,6 @@
 # Build the workspace with the portable toolchain; tee FULL output to a log.
 $ErrorActionPreference = 'Continue'
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $env:RUSTUP_HOME = "$root\.toolchain\rustup"
 $env:CARGO_HOME  = "$root\.toolchain\cargo"
 $env:Path = "$root\.toolchain\cargo\bin;$root\.toolchain\w64devkit\bin;$env:Path"

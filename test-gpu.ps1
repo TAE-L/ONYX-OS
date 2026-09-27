@@ -26,7 +26,7 @@
 #   * the kernel's log separators are UTF-8 punctuation PowerShell may decode
 #     as replacement glyphs - plain ASCII substrings are immune to that.
 # Output uses Write-Output (not Write-Host) so `*> redirect` captures it all.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 $img  = Join-Path $root 'target\debug\images\bios.img'
 $fail = @()

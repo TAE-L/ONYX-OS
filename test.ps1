@@ -13,7 +13,7 @@ cargo build
 if ($LASTEXITCODE -ne 0) { Write-Host 'BUILD FAILED'; exit 1 }
 
 # Use relative paths + WorkingDirectory to avoid the spaces-in-path bug
-# (the project folder is "PROJECT OS").
+# (the project folder name has contained a space before).
 $qemu   = "$root\.toolchain\qemu\qemu-system-x86_64.exe"
 $imgdir = "$root\target\debug\images"
 $bios   = "$imgdir\bios.img"

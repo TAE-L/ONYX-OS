@@ -2,7 +2,7 @@
 # markers, and grabs a monitor screendump of the graphical console (decoded to
 # ASCII) so firmware/bootloader/kernel display state is visible. Uses -snapshot
 # so the boot never writes to the source image.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 $ovmf_code = Join-Path $root '.toolchain\qemu\share\edk2-x86_64-code.fd'
 

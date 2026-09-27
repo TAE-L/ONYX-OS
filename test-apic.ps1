@@ -5,7 +5,7 @@
 #      guest PS/2 controller -> IRQ1 -> IOAPIC GSI1 -> vector 0x21 -> LAPIC
 #      EOI -> keyboard ring -> shell -> prints "hi" on serial.
 #   4. Full M9.6 regression set (fstest, badptr, time, fpu tasks).
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 $tmp = Join-Path $env:TEMP 'onyx-boot'

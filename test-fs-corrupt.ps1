@@ -24,7 +24,7 @@
 #   * the kernel continues past the block layer (frame allocator / heap test),
 #     proving nothing aborted,
 #   * no EXCEPTION line anywhere.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 $src  = Join-Path $root 'target\debug\images\bios.img'
 $tmp  = Join-Path $env:TEMP 'onyx-fs-corrupt'

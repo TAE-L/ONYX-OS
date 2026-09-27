@@ -7,7 +7,7 @@
 #   - Live path: types `perf` at the shell -> SYS_PERF prints a SECOND
 #     snapshot (asserts >= 2 [perf] uptime lines).
 #   - No PANIC / unexpected exception; fstest still PASSED.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 $tmp = Join-Path $env:TEMP 'onyx-boot'
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null

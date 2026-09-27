@@ -4,7 +4,7 @@
 #   - MADT: LAPIC + IOAPIC + IRQ-overrides parsed
 #   - Cross-check: MADT IOAPIC addr matches the live A2 APIC wiring
 #   - fstest still passes (nothing broken)
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 $tmp = Join-Path $env:TEMP 'onyx-boot'

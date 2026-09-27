@@ -4,7 +4,7 @@
 #   reads, cache hit accounting, write-through coherence (/BLCK.TXT across a
 #   flush), and a deterministic read-ahead probe. This script greps all
 #   [blk] markers and fails on any FAILED / missing line.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 $tmp = Join-Path $env:TEMP 'onyx-boot'

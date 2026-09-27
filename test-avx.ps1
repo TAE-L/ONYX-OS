@@ -15,7 +15,7 @@ param(
     [string] $Cpu = 'max',
     [int]    $Seconds = 40
 )
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 function Run-Boot([string] $cpu) {

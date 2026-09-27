@@ -3,7 +3,7 @@
 #      ISA/IDE, std VGA) with BAR decoding.
 #   2. Typing `lspci` at the shell re-prints the table via SYS_LSPCI
 #      (proves the syscall + shell command path).
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 $tmp = Join-Path $env:TEMP 'onyx-boot'

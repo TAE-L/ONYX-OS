@@ -6,7 +6,7 @@
 #   3. mouse_button left     -> [mouse] ... L=1 line.
 #   4. [clock] IST HH:MM:SS heartbeats every 10 s (IST clock advances).
 # All observed lines are printed below so you can SEE position + keys here.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 $tmp = Join-Path $env:TEMP 'onyx-boot'

@@ -2,7 +2,7 @@
 #   1. FPU/SSE state save/restore across context switches (two tasks keep
 #      live XMM accumulators across preemptions and verify checkpoints)
 #   2. user-pointer validation (fstest's badptr checks run on every boot)
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 $tmp = Join-Path $env:TEMP 'onyx-boot'

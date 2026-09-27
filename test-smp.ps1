@@ -10,7 +10,7 @@
 #            hardcoded CPU count).
 #   -smp 1 : NO AP is started - the single-CPU path (all earlier milestones'
 #            tests) must be unchanged.
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 $img  = Join-Path $root 'target\debug\images\bios.img'
 $fail = @()

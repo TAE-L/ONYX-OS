@@ -1,7 +1,7 @@
 # test-time.ps1 - M9.6-A1 regression: high-resolution timekeeping.
 #   - TSC calibrated against the PIT at boot
 #   - SYS_GETTIME(0) monotonic smoke test from ring 3 (fstest)
-$root = 'c:\Users\ASUS\Desktop\PROJECT OS'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 
 $tmp = Join-Path $env:TEMP 'onyx-boot'
