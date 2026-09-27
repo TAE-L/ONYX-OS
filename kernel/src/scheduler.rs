@@ -118,9 +118,12 @@ struct Task {
     /// `syscall::dispatch`.
     linux_abi: bool,
     /// 512-byte FXSAVE image swapped by `context_switch` (FPU/SSE state).
-    /// Raw pointer (never null): the task list is a `static mut` Vec touched
-    /// only with IF=0, so no reference may be formed through the index.
-    fpu_area: *mut fpu::FpuArea,
+    /// M10b P1A: owned by value in a `Box` instead of a raw pointer into a
+    /// `Box::leak`ed allocation, so the FPU state is owned by the task rather
+    /// than being an independent allocation the scheduler must keep alive.
+    /// `FpuArea` is `align(64)`, so the image stays 64-byte aligned (required by
+    /// `fxsave`) with no manual alignment code.
+    fpu_area: Box<fpu::FpuArea>,
 }
 
 static mut TASKS: Vec<Task> = Vec::new();
@@ -235,7 +238,11 @@ unsafe fn fpu_ptr(idx: usize) -> *mut fpu::FpuArea {
     if idx == MAIN_INDEX {
         &raw mut (*smp::this_cpu()).idle_fpu
     } else {
-        TASKS[idx].fpu_area
+        // `addr_of_mut!` avoids forming a `&mut` through the `static mut` Vec
+        // index, then `as_mut()` yields the address of the OWNED image (not the
+        // address of the Box header, which is what the switch must not touch).
+        let b: *mut Box<fpu::FpuArea> = &raw mut TASKS[idx].fpu_area;
+        (*b).as_mut() as *mut fpu::FpuArea
     }
 }
 
@@ -277,7 +284,12 @@ unsafe fn validate_ctx(idx: usize, tag: &str) -> bool {
     let sp = t.sp_slot.read_volatile();
     let base = t.stack.as_ptr() as u64;
     let top = base + t.stack.len() as u64;
-    let fp = t.fpu_area as u64;
+    // Dereference the `Box` to reach the IMAGE, exactly as `fpu_ptr` does. Taking
+    // the address of the field itself would only measure where the `Task` struct
+    // sits inside the `TASKS` Vec, which has no relation to the 64-byte
+    // alignment the image actually needs.
+    let b: *const Box<fpu::FpuArea> = &raw const t.fpu_area;
+    let fp = (*b).as_ref() as *const fpu::FpuArea as u64;
 
     // 8-byte alignment is the only alignment a saved RSP is guaranteed to have:
     // the switch pushes/pops 8-byte slots, so alignment parity is whatever the
@@ -328,7 +340,7 @@ fn new_task(entry: fn(), priority: u8, parent_id: u64) -> Task {
         stamp_stack_canary(stack);
         let sp = prepare_stack(stack);
         let top = stack.as_ptr() as u64 + stack.len() as u64;
-        let fpu_area = fpu::new_area();
+        let fpu_area = fpu::new_owned_area();
         Task {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             entry,
@@ -418,7 +430,7 @@ pub fn spawn_user_with_parent(user_rip: u64, user_rsp: u64, parent_id: u64) -> u
             stamp_stack_canary(stack);
             let sp = prepare_stack_user(stack, user_rip, user_rsp);
             let top = stack.as_ptr() as u64 + stack.len() as u64;
-            let fpu_area = fpu::new_area();
+            let fpu_area = fpu::new_owned_area();
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             TASKS.push(Task {
                 id,
