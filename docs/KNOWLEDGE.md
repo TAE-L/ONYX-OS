@@ -262,3 +262,54 @@ moved into `Task` - a Box move does not move its heap contents, so the sp should
 stay valid, BUT the `kstack_top` (TSS.RSP0) and the saved `sp` must be derived
 from the SAME box. Do it one small step at a time with a build+smp test after
 each, and never do a multi-site scripted rewrite of the scheduler in one go.
+
+### ROOT CAUSE of the #DF (found 2026-09-26, after landing the validator)
+
+**It was almost certainly NOT a pointer/alignment bug. It was a 66 KB stack
+temporary.**
+
+`TaskCtx` held `stack: [u8; STACK_SIZE]` INLINE and was built as
+`Box::new(TaskCtx { stack: [0u8; STACK_SIZE], ... })`. That struct literal
+materialises the WHOLE ~66 KB struct (64 KiB stack + 2 KiB FPU) as a temporary in
+the spawning frame *before* copying it to the heap. `STACK_SIZE` is 64 KiB, so
+the temporary cannot fit in a 64 KiB kernel stack: the spawn smashed the stack
+and the damage only became visible at the next context switch - exactly the
+observed signature (dies right after `M3: spawning tasks...`, a #DF at an
+unexplainable RIP, on `-smp 1` too, where nothing SMP-specific exists). The #DF
+then lands on `DOUBLE_FAULT_STACK_SIZE` (16 KiB, gdt.rs), which is why it reports
+like a hardware fault.
+
+The existing code avoids this by accident: it uses
+`vec![0u8; STACK_SIZE].into_boxed_slice()` + `Box::leak`, and `vec![]` allocates
+on the HEAP. The trap is specifically "put the big array in a struct literal".
+
+**Consequence for step 2b:** a single-allocation context must NOT be built from an
+inline array in a struct literal. Either allocate the box first and initialise it
+in place through the `Box` (e.g. `alloc::alloc::alloc_zeroed(Layout::new::<TaskCtx>())`
+then write fields via raw pointers), or keep the stack as a separate heap slice
+and accept 2 allocations instead of 3 (still a real improvement, and safe). Do
+NOT "fix" it by enlarging stacks - the temporary IS the bug.
+
+### Facts established by the validator (all measured, not assumed)
+
+- **A saved RSP is only guaranteed 8-byte aligned.** Its 16-byte parity VARIES
+  with the preemption point: observed both `...4c0` (0 mod 16) and `...868`
+  (8 mod 16) on healthy runs. The familiar "rsp % 16 == 8" rule describes a
+  function entry after a `call` pushed a return address - it does not apply to a
+  raw saved RSP. Nothing on a resumed task may assume 16-byte stack alignment
+  (this matters for the future compositor/SSE spill paths).
+- **`sp_slot` is a pointer TO the slot.** `t.sp_slot as u64` yields the slot's
+  own heap address, not the saved SP; use `t.sp_slot.read_volatile()`. The tell
+  was saved "sp" values spaced exactly 16 bytes apart in the heap.
+- **`&raw const task.field` measures the FIELD, not what it points at.** For
+  `fpu_area: Box<FpuArea>`, `&raw const t.fpu_area` is the address of the Box
+  inside the `Task` struct in the Vec (arbitrary alignment); the image address
+  needs `(*b).as_ref()` / `(*b).as_mut()`, mirroring `fpu_ptr`.
+
+### Test-harness trap (cost a false regression report)
+
+Launching two `test-gpu.ps1` runs back-to-back makes them fail EVERY variant
+("boot flow broken") because each script kills all QEMU processes on start. A
+serial log that simply STOPS mid-boot (no #DF, no exception, truncated) is the
+signature. Wait for the previous run's processes to be gone before starting the
+next - the "run strictly sequentially" rule is not optional.

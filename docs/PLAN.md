@@ -1570,3 +1570,44 @@ quantum before it is run.
 after each edit - until one owned context is genuinely in place; then P2
 deadline timer; then P6a surface/blit + scalable Unicode font, compositor and
 input dispatch, and finally the first desktop (taskbar, clock, one window).
+
+---
+
+## P1A progress (updated 2026-09-27): validator landed, FPU now owned
+
+Two of the three planned increments are in. Migration is still disabled.
+
+**Step 1 - context canary + pre-switch validation (LANDED, `c8f3336`).**
+Every task kernel stack is stamped with `STACK_CANARY` at its LOW end (where a
+downward overflow hits first), and `validate_ctx()` runs on both contexts right
+before `context_switch`, checking: `sp` non-zero and 8-byte aligned, `sp` INSIDE
+that task's own stack, the FXSAVE image 64-byte aligned, and the canary intact.
+It reports once per task id, then stays quiet. Diagnostic only - the switch still
+proceeds, because refusing to switch could livelock the very CPU that would
+report it.
+
+This is the tool that makes the rest of P1A safe to attempt: step A's original
+failure was an unattributable `#DF`, and this names the offending context.
+
+**Step 2a - the FPU image is OWNED by the task (LANDED, `3ac6a25`).**
+`Task.fpu_area` is now `Box<FpuArea>` rather than a `*mut FpuArea` into a
+`Box::leak`. `fpu::new_area()` is replaced by `new_owned_area()` and the leaking
+constructor is deleted, not left unused. Alignment is free: `FpuArea` is
+`#[repr(C, align(64))]` and `Box` preserves alignment. That removes one of the
+three separate per-task allocations.
+
+**The #DF root cause is now known** (see KNOWLEDGE.md): it was not a pointer
+bug. `Box::new(TaskCtx { stack: [0u8; 65536], .. })` builds the whole ~66 KB
+struct as a temporary ON THE STACK before copying it to the heap, which cannot
+fit in a 64 KiB kernel stack. The spawn smashed the stack and the damage only
+surfaced at the next switch.
+
+**Step 2b - combine sp + fpu + stack into ONE allocation (NOT DONE).** The fix
+is to allocate the box first and initialise it in place
+(`alloc_zeroed(Layout::new::<TaskCtx>())` + raw-pointer field writes), never a
+struct literal containing the big array. Until that lands, a task context is
+still 2 allocations (FPU box + leaked stack) plus the leaked 8-byte SP slot.
+
+**Suite green at `3ac6a25`** (strictly sequential): build/smp/avx/para(x4.9, 4
+distinct CPUs)/fs-corrupt/fs/gpu x2/shell/latency all 0, zero `ctxcheck` reports.
+AVX: 58 rounds, 16 YMM lanes intact across 21 switches, XCR0=0x7.
