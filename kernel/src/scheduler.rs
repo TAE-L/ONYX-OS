@@ -39,6 +39,16 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 const STACK_SIZE: usize = 64 * 1024;
 
+/// M10b P1A: magic stamped at the LOW end of every task kernel stack.
+///
+/// A kernel stack grows DOWN from `kstack_top`, so a runaway frame (a bad
+/// `sp`, a smashed return address, a bug pushing without popping) runs off the
+/// bottom of the stack FIRST and hits this word. Reading it back before we
+/// trust a task's saved `sp` turns "the machine double-faulted somewhere" into
+/// "task N's stack is corrupt", which is the difference between a debuggable
+/// bug and a mystery #DF.
+const STACK_CANARY: u64 = 0x0BAD_C0DE_FA11_BAAD;
+
 /// Sentinel for "this CPU's idle context" (the boot/idle thread of each core).
 const MAIN_INDEX: usize = smp::IDLE_INDEX;
 
@@ -165,6 +175,28 @@ fn new_sp_slot(sp: u64) -> *mut u64 {
     Box::leak(Box::new(sp))
 }
 
+/// M10b P1A: stamp the low-end canary of a freshly allocated task stack.
+///
+/// Must be called for every new task (kernel and ring-3) before the first
+/// switch, or [`stack_canary_ok`] would read unwritten (but allocated) memory
+/// and report a false corruption.
+fn stamp_stack_canary(stack: &mut [u8]) {
+    unsafe {
+        // The canary occupies the FIRST 8 bytes, which is the lowest address -
+        // exactly what a downward-growing stack overflow reaches first.
+        (stack.as_mut_ptr() as *mut u64).write_unaligned(STACK_CANARY);
+    }
+}
+
+/// M10b P1A: is this task's stack canary still intact?
+///
+/// # Safety
+/// `stack` must be the live kernel stack slice of a task that was stamped by
+/// [`stamp_stack_canary`].
+unsafe fn stack_canary_ok(stack: &[u8]) -> bool {
+    (stack.as_ptr() as *const u64).read_unaligned() == STACK_CANARY
+}
+
 /// The RSP slot of context `idx` on the CALLING CPU (MAIN_INDEX = this CPU's
 /// idle context, which lives in its own block).
 ///
@@ -207,6 +239,77 @@ unsafe fn fpu_ptr(idx: usize) -> *mut fpu::FpuArea {
     }
 }
 
+/// M10b P1A: sanity-check a task's context BEFORE `context_switch` trusts it.
+///
+/// This is the guard that turns the step-A failure mode from "double fault at an
+/// unexplainable RIP" into a named, diagnosable task. It runs on the switch path
+/// with the scheduler lock held, so `TASKS` is stable.
+///
+/// Checks, for a non-idle context:
+///   * the saved `sp` is non-zero and 8-byte aligned (the slot discipline of the
+///     switch; its 16-byte parity varies with the preemption point);
+///   * the saved `sp` lies WITHIN this task's own kernel stack - the single most
+///     useful check, because a `sp` from a different (or freed) allocation is
+///     exactly the step-A hazard;
+///   * the FXSAVE image is 64-byte aligned, which `fxsave` requires and which
+///     the AVX path depends on;
+///   * the low-end stack canary is intact (no downward stack underflow).
+///
+/// A failure is reported once per context (not once per tick) so a permanently
+/// corrupt task cannot flood the serial port, and it does NOT change scheduling
+/// here: the caller decides. Its purpose in this step is diagnosis, not
+/// recovery.
+///
+/// # Safety
+/// Scheduler lock held: `TASKS` is not being mutated.
+unsafe fn validate_ctx(idx: usize, tag: &str) -> bool {
+    // One-shot report flag per task id, so a bad context is announced once.
+    static mut REPORTED: [bool; 64] = [false; 64];
+    static REPORTS: AtomicU64 = AtomicU64::new(0);
+
+    if idx == MAIN_INDEX {
+        return true; // per-CPU idle context: layout checked in smp.rs
+    }
+    let t = &TASKS[idx];
+    // `sp_slot` is a *pointer to* the saved-SP slot, so the saved stack pointer
+    // is the value it points at. Reading the pointer itself instead would just
+    // yield the slot's own heap address.
+    let sp = t.sp_slot.read_volatile();
+    let base = t.stack.as_ptr() as u64;
+    let top = base + t.stack.len() as u64;
+    let fp = t.fpu_area as u64;
+
+    // 8-byte alignment is the only alignment a saved RSP is guaranteed to have:
+    // the switch pushes/pops 8-byte slots, so alignment parity is whatever the
+    // preemption point was. Measured in practice, saved RSPs are 0 mod 16 when
+    // the task was preempted on one path and 8 mod 16 on another (interrupt
+    // entry vs. syscall vs. explicit yield), so 16-byte alignment must NOT be
+    // assumed - anything needing 16-byte alignment has to realign itself.
+    let sp_ok = sp != 0 && sp % 8 == 0;
+    // Allow the full stack range: `sp` is a saved mid-frame value, and the
+    // pre-populated frames live just below `kstack_top`.
+    let sp_in_stack = sp >= base && sp <= top;
+    let fpu_ok = fp != 0 && fp % 64 == 0;
+    let can_ok = stack_canary_ok(t.stack);
+
+    if sp_ok && sp_in_stack && fpu_ok && can_ok {
+        return true;
+    }
+
+    let slot = (t.id as usize) % REPORTED.len();
+    if !REPORTED[slot] {
+        REPORTED[slot] = true;
+        REPORTS.fetch_add(1, Ordering::Relaxed);
+        crate::serial_writeln!(
+            "[ctxcheck] CORRUPT {tag} task#{} idx={idx} sp={sp:#x} \
+             stack=[{base:#x},{top:#x}) fpu={fp:#x} canary={can_ok} \
+             (sp_align={sp_ok} sp_in_stack={sp_in_stack} fpu_align={fpu_ok})",
+            t.id
+        );
+    }
+    false
+}
+
 /// B5 stall diagnostic: consecutive ticks the current task was KEPT although
 /// it is not RT. A Normal task must lose the CPU within its 8-tick slice;
 /// far beyond that means the pick found nothing Ready (state corruption /
@@ -222,6 +325,7 @@ static mut NOREADY_DUMPED: bool = false;
 fn new_task(entry: fn(), priority: u8, parent_id: u64) -> Task {
     unsafe {
         let stack: &'static mut [u8] = Box::leak(vec![0u8; STACK_SIZE].into_boxed_slice());
+        stamp_stack_canary(stack);
         let sp = prepare_stack(stack);
         let top = stack.as_ptr() as u64 + stack.len() as u64;
         let fpu_area = fpu::new_area();
@@ -311,6 +415,7 @@ pub fn spawn_user_with_parent(user_rip: u64, user_rsp: u64, parent_id: u64) -> u
         let _g = sched_guard();
         unsafe {
             let stack: &'static mut [u8] = Box::leak(vec![0u8; STACK_SIZE].into_boxed_slice());
+            stamp_stack_canary(stack);
             let sp = prepare_stack_user(stack, user_rip, user_rsp);
             let top = stack.as_ptr() as u64 + stack.len() as u64;
             let fpu_area = fpu::new_area();
@@ -1193,6 +1298,13 @@ unsafe fn plan_switch(me: usize) -> Option<SwitchPlan> {
         old_fpu: fpu_ptr(cur),
         new_fpu: fpu_ptr(next) as *const fpu::FpuArea,
     };
+    // M10b P1A: validate both contexts immediately before we hand them to
+    // `context_switch`. Diagnostic only - the switch still proceeds, because a
+    // refused switch could livelock the very CPU that would report it. What
+    // changes is that a corrupt context is now NAMED on serial at the moment it
+    // is used, instead of surfacing later as an unattributable #DF.
+    validate_ctx(cur, "outgoing");
+    validate_ctx(next, "incoming");
     if SCHED_TRACE
         || (crate::bench::TRACE.load(Ordering::Relaxed) == 1
             && (crate::bench::is_bench_worker(cur) || crate::bench::is_bench_worker(next)))
