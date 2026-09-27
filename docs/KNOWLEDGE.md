@@ -332,7 +332,43 @@ serial log that simply STOPS mid-boot (no #DF, no exception, truncated) is the
 signature. Wait for the previous run's processes to be gone before starting the
 next - the "run strictly sequentially" rule is not optional.
 
-### A fixed boot sleep is a coin flip, not a budget (cost a false "FAILED" after the rename)
+### The LAPIC "closed-loop" calibration is fighting a 5x clock skew (M10b P2, measured)
+
+`calibrate_task` in `apic.rs` measures how many LAPIC ticks actually fire per 50
+PIT ticks and rescales the interval. It compares that count `dm` against **50**.
+But 50 PIT ticks at 100 Hz is **500 ms**, and `dm` counts ticks *in that window*,
+so the correct divisor is 500. As written, `first_guess * dm / 50` MULTIPLIES the
+interval by ~`dm/50` instead of dividing by the error ratio.
+
+Observed live (`test-latency`): `249 ticks/500ms -> interval 2474761 (first guess
+496940)` - a **4.98x LONGER** period. So the nominal "1 ms" preemption tick was
+really running at ~5 ms, and every `sleep_current` deadline, `slice_left` quantum
+and `fresh_slice` unit was stretched with it. This is the true source of the
+"130-200 ms scheduling tail": not tick granularity (the brief's P2 hypothesis)
+but a timer running 5x slow. Fixing the divisor to 500 makes the correction move
+the right way (`494140 -> 249046`).
+
+**But do not ship that fix blind - it trades throughput for latency.** A/B on the
+same host, `test-para.ps1`:
+
+| | serial baseline | -smp 4 speedup | pacing (test-latency) |
+|---|---|---|---|
+| as-is (`/50`) | 710 ms | **x4.08** | ~6 fps, interval ~151 ms |
+| fixed (`/500`) | 2617 ms | **x1.6** | **53-80 fps**, interval ~12-18 ms |
+
+Making the timer tick ~5x more often multiplies preemption/interrupt overhead and
+made the serial baseline **3.7x slower**, collapsing the parallel speedup from
+x4.08 to x1.6 (`test-para` FAILS its x2 threshold). The two effects are real and
+they pull in opposite directions: fewer, coarser ticks are cheap but add latency;
+more ticks cut latency but burn the CPU budget that parallelism depends on.
+
+**The lesson:** the whole scheduler is calibrated in "LAPIC ticks", so this one
+divisor silently rescales every duration in the kernel. Any change to tick rate
+must be A/B'd against BOTH `test-latency` (latency) and `test-para` (throughput)
+- optimising either one alone silently destroys the other. The eventual P2 answer
+is probably a *decoupled* deadline timer (fine-grained wakeups for sleepers)
+while leaving the *preemption* tick coarse, rather than making one tick serve
+both jobs.
 
 After the folder rename `PROJECT OS` -> `PROJECT_OS`, a clean rebuild
 (`Remove-Item -Recurse -Force target` + `build.ps1`, EXIT=0) was followed by
