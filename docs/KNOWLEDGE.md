@@ -331,3 +331,26 @@ Launching two `test-gpu.ps1` runs back-to-back makes them fail EVERY variant
 serial log that simply STOPS mid-boot (no #DF, no exception, truncated) is the
 signature. Wait for the previous run's processes to be gone before starting the
 next - the "run strictly sequentially" rule is not optional.
+
+### A fixed boot sleep is a coin flip, not a budget (cost a false "FAILED" after the rename)
+
+After the folder rename `PROJECT OS` -> `PROJECT_OS`, a clean rebuild
+(`Remove-Item -Recurse -Force target` + `build.ps1`, EXIT=0) was followed by
+`test-smp.ps1` reporting **FAILED** on all three `-smp` settings. Every single
+failure was a *missing marker* (`fstest: PASSED`, `fpu-test: task A PASSED`,
+`[argtest] argc=4`), never a corruption report: zero `#DF`, zero `[ctxcheck]`,
+zero `PANIC`, and the only `EXCEPTION` was the `Breakpoint` the script already
+excludes. A 90 s diagnostic boot showed the markers present at lines 311 / 323 /
+**513** - the kernel was completely healthy, it was just slower than the flat
+`Start-Sleep -Seconds 30/45` the harness allowed. This box is 4 logical cores
+and TCG multiplies the cost, so boot time scales with whatever else is running.
+
+**The lesson that generalises:** a test that asserts "the log contains marker X"
+must also *wait* for marker X. A wall-clock sleep is a race against host load, and
+when it loses, the failure looks exactly like a kernel regression - which is the
+worst possible failure mode, because it invites "fixing" healthy code. Before
+concluding that a refactor/rename broke something, check whether the symptom is
+*missing output* (too slow) or *corrupt output* (actually broken); only the
+latter is a kernel bug. `Invoke-Boot` now polls the log every 5 s until all its
+`-Wait` markers appear, with the old duration kept only as a ceiling, so a busy
+host can no longer manufacture a red suite.
