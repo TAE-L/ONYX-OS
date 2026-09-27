@@ -13,3 +13,8 @@ user/linuxtest/tcore/
 *.pid
 *.txt
 
+# Per-crate build artifacts. The root /target rule above only covers the workspace
+# target dir; test_asm has its own target/ that was previously tracked (with an
+# absolute path baked into the .d files, which broke after the folder rename).
+test_asm/target/
+
