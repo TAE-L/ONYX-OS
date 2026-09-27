@@ -15,7 +15,7 @@ $qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
 $img  = Join-Path $root 'target\debug\images\bios.img'
 $fail = @()
 
-function Invoke-Boot([int]$smp, [int]$seconds, [string]$tag) {
+function Invoke-Boot([int]$smp, [int]$seconds, [string]$tag, [string[]]$Wait) {
     $tmp = Join-Path $env:TEMP "onyx-smp-$tag"
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
     $image = Join-Path $tmp 'bios.img'
@@ -28,7 +28,24 @@ function Invoke-Boot([int]$smp, [int]$seconds, [string]$tag) {
         -ArgumentList @('-smp', "$smp", '-m', '512M', '-drive', "format=raw,file=$image",
                         '-display', 'none', '-serial', "file:$log", '-no-reboot', '-snapshot') `
         -WindowStyle Hidden -PassThru
-    Start-Sleep -Seconds $seconds
+    # Wait for the $Wait markers to actually appear, with $seconds only as a
+    # backstop. A fixed sleep is a race against host load: under TCG this kernel
+    # reaches "fpu-test: task A PASSED" at ~90 s on a busy 4-core box, so the old
+    # flat 30 s budget reported a FAILED suite for a completely healthy kernel
+    # (zero #DF, zero [ctxcheck], zero PANIC - every failure was a missing
+    # marker). Keying the wait to the markers makes the budget a ceiling rather
+    # than a coin flip, and the run still ends as soon as it has what it needs.
+    $deadline = (Get-Date).AddSeconds($seconds)
+    $exited = $p.HasExited
+    do {
+        Start-Sleep -Seconds 5
+        $exited = $p.HasExited
+        $seen = Get-Content $log -ErrorAction SilentlyContinue
+        $done = $true
+        foreach ($m in $Wait) {
+            if (($seen | Select-String -SimpleMatch $m | Measure-Object).Count -lt 1) { $done = $false; break }
+        }
+    } while (-not $done -and -not $exited -and (Get-Date) -lt $deadline)
     $exited = $p.HasExited
     if (-not $exited) { Stop-Process -Id $p.Id -Force }
     Start-Sleep -Milliseconds 600
@@ -42,7 +59,7 @@ function Count-Of($lines, [string]$pattern) {
 # Case 1: -smp 4 (the full milestone)
 # ---------------------------------------------------------------------------
 Write-Host '=== M9.8 SMP: -smp 4 ==='
-$r = Invoke-Boot 4 45 '4'
+$r = Invoke-Boot 4 180 '4' @('[smp] 4 CPU(s) online after bring-up', 'fpu-test: task A PASSED', 'fstest: PASSED', '[argtest] argc=4')
 $c = $r.Log
 Write-Host "qemu self-exited (crash indicator): $($r.Exited); log lines: $($c.Count)"
 $c | Where-Object { $_ -match '^\[smp\]' } | ForEach-Object { Write-Host "  $_" }
@@ -79,7 +96,7 @@ if ((Count-Of $c '[stall]') -gt 0) { $fail += '[-smp 4] scheduler stall diagnost
 # Case 2: -smp 2 (follows the MADT count, not a hardcoded CPU count)
 # ---------------------------------------------------------------------------
 Write-Host '=== M9.8 SMP: -smp 2 ==='
-$r2 = Invoke-Boot 2 30 '2'
+$r2 = Invoke-Boot 2 180 '2' @('[smp] 2 CPU(s) online after bring-up', 'fstest: PASSED')
 $c2 = $r2.Log
 Write-Host "qemu self-exited: $($r2.Exited); log lines: $($c2.Count)"
 $c2 | Where-Object { $_ -match 'online \(|\[smp\] 2 CPU' } | ForEach-Object { Write-Host "  $_" }
@@ -95,7 +112,7 @@ if ((Count-Of $c2 'fstest: PASSED') -lt 1) { $fail += '[-smp 2] fstest PASSED ma
 # Case 3: -smp 1 (single-CPU path must be untouched)
 # ---------------------------------------------------------------------------
 Write-Host '=== M9.8 SMP: -smp 1 (single-CPU regression) ==='
-$r1 = Invoke-Boot 1 30 '1'
+$r1 = Invoke-Boot 1 180 '1' @('[smp] bring-up complete:', 'fpu-test: task A PASSED', 'fstest: PASSED', '[argtest] argc=4')
 $c1 = $r1.Log
 Write-Host "qemu self-exited: $($r1.Exited); log lines: $($c1.Count)"
 $c1 | Where-Object { $_ -match '^\[smp\]' } | ForEach-Object { Write-Host "  $_" }
