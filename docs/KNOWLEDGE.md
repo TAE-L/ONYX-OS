@@ -729,3 +729,74 @@ off-by-`cs` in a sprite mask. Performance bugs and correctness bugs often share
 a hotspot: the per-pixel cursor path that looked expensive was the same path
 that corrupted the screen. Fix the mask and the art in one change, but treat
 them as different classes of problem.
+
+### "fpu-avx test not spawned (AVX unavailable)" is NOT a coverage gap
+
+That line was flagged as a possible hole in the AVX coverage. It is not - it is
+the EXPECTED output of the second boot in `test-avx.ps1`, and the test proves it
+deliberately:
+
+```
+=== -cpu max (self-exited: False) ===          <- AVX-capable CPU
+fpu: XSAVE enabled (XCR0=0x7, area 832 bytes, AVX=yes)
+fpu: avx PASS round 1 (... 16 YMM lanes intact across 506 switches in 1170 ticks, XCR0=0x7)
+... rounds 2-8 all PASS ...
+
+=== -cpu qemu64 (self-exited: False) ===       <- deliberately AVX-less CPU
+fpu: FXSAVE fallback (no XSAVE/OSXSAVE on this CPU)
+fpu-avx test not spawned (AVX unavailable)      <- the message in question
+RESULT: M9.8-f XSAVE/AVX TESTS PASSED
+```
+
+The script runs the same kernel TWICE on purpose: once on `-cpu max` (XSAVE +
+AVX, must take the XSAVE path and keep 16 YMM lanes intact across hundreds of
+switches) and once on `-cpu qemu64` (no XSAVE, must fall back to FXSAVE and must
+NOT spawn the AVX task - asserted at `test-avx.ps1:81`). The message is the
+fallback path announcing itself, and its presence is a PASS condition.
+
+**The lesson:** a status line that looks like a skip is often a tested branch.
+Read the whole test before reading a single log line - the suspicion that "AVX
+was not actually exercised" came from seeing only the second boot's output. The
+real coverage is the 8 PASS rounds with 16 YMM lanes intact across 300-500
+context switches each.
+
+### P6a direction: the blit API
+
+The plan is a **surface/blit API** as the drawing substrate everything else is
+built on, in this order:
+
+1. **Surface** - a first-class offscreen pixel buffer the kernel owns:
+   `surface_create(w, h, format) -> id`, `surface_destroy(id)`. Backing comes
+   from the existing GEM-lite allocator (already proven by the GPU tests, with
+   the canary check), so a surface is a real DMA-capable resource, not a memcpy
+   target. This is deliberately the SAME kind of object the virtio-gpu driver
+   already creates, so a surface can later become a scanout with no second
+   concept of "a thing you can draw on".
+
+2. **Blit** - `blit(dst, src, x, y)` plus a `fill(dst, x, y, w, h, colour)`.
+   Both go through the EXISTING damage path (`mark_dirty` -> the dirty-rect
+   accumulator the present flusher already consumes). This is the key decision:
+   the compositor does not get its own present mechanism, it marks damage and
+   the existing flusher presents it. That is why this session's pacing work
+   (coalesced wakes, decoupled sleeper clock) pays off directly for the desktop
+   instead of being throwaway.
+
+3. **Font** - a scalable Unicode font, because the current console is 8x8
+   `BASIC_LEGACY` ASCII only (ASCII art, per `framebuffer.rs::write_char`). Text
+   is the first real client of the blit API and proves it works.
+
+4. **Compositor** - owns the screen surface, composites windows, marks damage.
+   Input dispatch feeds it; it never touches the hardware directly.
+
+5. **First desktop** - taskbar, clock, one window.
+
+Two constraints carried in from this session, which the compositor MUST respect
+rather than rediscover:
+  * **Only 8-byte stack alignment is guaranteed** on a resumed task (measured
+    both `0 mod 16` and `8 mod 16` across preemption points). Any SSE spill
+    path in the compositor has to tolerate that.
+  * **Never hold `SCHED_LOCK` across a context switch**, and do not structure
+    the compositor as one long non-preemptible critical section. The clock
+    task's old `without_interrupts` + FB-lock redraw was exactly that shape,
+    and it fired thousands of IPIs per redraw. That is the anti-pattern to
+    design against.
