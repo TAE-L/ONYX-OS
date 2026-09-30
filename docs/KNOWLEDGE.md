@@ -343,32 +343,44 @@ interval by ~`dm/50` instead of dividing by the error ratio.
 Observed live (`test-latency`): `249 ticks/500ms -> interval 2474761 (first guess
 496940)` - a **4.98x LONGER** period. So the nominal "1 ms" preemption tick was
 really running at ~5 ms, and every `sleep_current` deadline, `slice_left` quantum
-and `fresh_slice` unit was stretched with it. This is the true source of the
-"130-200 ms scheduling tail": not tick granularity (the brief's P2 hypothesis)
-but a timer running 5x slow. Fixing the divisor to 500 makes the correction move
-the right way (`494140 -> 249046`).
+and `fresh_slice` unit is denominated in that stretched tick. Fixing the divisor
+to 500 makes the correction move the right way (`495447 -> 249046`).
 
-**But do not ship that fix blind - it trades throughput for latency.** A/B on the
-same host, `test-para.ps1`:
+Note what this does and does NOT explain: the ~200 ms `wake/schedule` figure is
+NOT explained by the slow tick alone - a 5x-stretched tick predicts ~5 ms of
+wake granularity, not 200 ms, and the same ~200 ms appears on BOTH sides of the
+A/B. So the tail has some other dominant cause, and this divisor is a real
+correctness wart worth fixing on its own merits - but it is not the P2 answer.
 
-| | serial baseline | -smp 4 speedup | pacing (test-latency) |
-|---|---|---|---|
-| as-is (`/50`) | 710 ms | **x4.08** | ~6 fps, interval ~151 ms |
-| fixed (`/500`) | 2617 ms | **x1.6** | **53-80 fps**, interval ~12-18 ms |
+**But do not ship that fix blind - it measurably COSTS throughput.** A/B on the
+same host, `test-para.ps1` (this is the clean, repeatable measurement):
+
+| | serial baseline | -smp 4 speedup |
+|---|---|---|
+| as-is (`/50`) | 641-710 ms | **x4.08 - x4.58** |
+| fixed (`/500`) | 2617-2944 ms | **x1.6 - x1.77** (test-para FAILS its x2 gate) |
 
 Making the timer tick ~5x more often multiplies preemption/interrupt overhead and
-made the serial baseline **3.7x slower**, collapsing the parallel speedup from
-x4.08 to x1.6 (`test-para` FAILS its x2 threshold). The two effects are real and
-they pull in opposite directions: fewer, coarser ticks are cheap but add latency;
-more ticks cut latency but burn the CPU budget that parallelism depends on.
+made the serial baseline ~4x slower, collapsing the parallel speedup below the
+x2 threshold. Reverted; the as-is numbers were re-confirmed afterwards.
+
+**Correction - a latency claim I had to retract.** My first note here claimed the
+fix took pacing from ~6 fps to 53-80 fps. That comparison was INVALID: the ~6 fps
+figure was sampled from the IDLE phase of the window (idle console, ~1 clock
+redraw/sec) while the 53-80 fps figure came from the ACTIVE phase. Re-running
+`test-latency` on the UNMODIFIED kernel also shows 74-82 fps in its active phase
+and ~0.8 fps in its idle phase. So the apparent 13x latency win was an artifact
+of comparing two different phases, not a real effect. The only conclusion
+supported by repeatable A/B is the test-para throughput regression above.
 
 **The lesson:** the whole scheduler is calibrated in "LAPIC ticks", so this one
 divisor silently rescales every duration in the kernel. Any change to tick rate
 must be A/B'd against BOTH `test-latency` (latency) and `test-para` (throughput)
-- optimising either one alone silently destroys the other. The eventual P2 answer
-is probably a *decoupled* deadline timer (fine-grained wakeups for sleepers)
-while leaving the *preemption* tick coarse, rather than making one tick serve
-both jobs.
+- optimising either one alone silently destroys the other. And always compare like
+with like: latency phases must be compared against the SAME phase, or the
+conclusion is fiction. The eventual P2 answer is probably a *decoupled* deadline
+timer (fine-grained wakeups for sleepers) while leaving the *preemption* tick
+coarse, rather than making one tick serve both jobs.
 
 After the folder rename `PROJECT OS` -> `PROJECT_OS`, a clean rebuild
 (`Remove-Item -Recurse -Force target` + `build.ps1`, EXIT=0) was followed by
