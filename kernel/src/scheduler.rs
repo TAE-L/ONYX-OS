@@ -36,7 +36,7 @@ use crate::smp;
 use alloc::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const STACK_SIZE: usize = 64 * 1024;
 
@@ -987,14 +987,91 @@ pub fn hopb_report() -> Option<(u32, u8, u64, u64)> {
     }
     let c = HOPB_CONTENDER.load(Ordering::Relaxed);
     let idle = HOPB_IDLE.load(Ordering::Relaxed);
-    let prio = unsafe {
-        if (c as usize) < TASK_COUNT {
+    unsafe {
+        let count = TASK_COUNT;
+        let prio = if (c as usize) < count {
             TASKS[c as usize].priority
         } else {
             0
+        };
+        Some((c, prio, n, idle))
+    }
+}
+
+/// P2 tail hunt: index of the present flusher task, published by the flusher on
+/// entry so the damage path can ask "is it parked?" without taking a lock. 0 =
+/// not published yet. A task INDEX (not id) because this is a same-CPU,
+/// scheduling-decision question about the current table.
+static PRESENT_TASK_INDEX: AtomicUsize = AtomicUsize::new(0);
+/// P2 tail hunt: damage wakes, and how many fired on a cpu that the affinity
+/// filter would never pick the flusher on.
+static WAKE_ON_CPU: AtomicU64 = AtomicU64::new(0);
+static WAKE_WRONG_CPU: AtomicU64 = AtomicU64::new(0);
+
+/// Record that a damage wake fired on THIS cpu, and whether the flusher is
+/// owned by it. A mismatch means the wake left the flusher Ready on a CPU that
+/// `plan_switch` will never consider (the affinity filter only looks at tasks
+/// whose `owner_cpu == me`), so it would sit Ready until some other mechanism
+/// moved it. Cheap, lock-free, IRQ-safe.
+pub fn note_present_wake_cpu() {
+    let idx = PRESENT_TASK_INDEX.load(Ordering::Relaxed);
+    unsafe {
+        let count = TASK_COUNT;
+        if idx == 0 || idx >= count {
+            return;
         }
-    };
-    Some((c, prio, n, idle))
+        let me = smp::cpu_index();
+        let owner = TASKS[idx].owner_cpu;
+        WAKE_ON_CPU.fetch_add(1, Ordering::Relaxed);
+        if usize::from(owner) != me {
+            WAKE_WRONG_CPU.fetch_add(1, Ordering::Relaxed);
+            if WAKE_WRONG_CPU.load(Ordering::Relaxed) == 1 {
+                crate::serial_writeln!(
+                    "[sched] PRESENT WAKE ON WRONG CPU: wake fired on cpu{me}, flusher owner_cpu={owner}"
+                );
+            }
+        }
+    }
+}
+
+/// How many damage wakes fired on a cpu other than the flusher's owner.
+pub fn present_wake_wrong_cpu() -> u64 {
+    WAKE_WRONG_CPU.load(Ordering::Relaxed)
+}
+
+/// How many damage wakes fired in total.
+pub fn present_wake_total() -> u64 {
+    WAKE_ON_CPU.load(Ordering::Relaxed)
+}
+
+/// Publish the CALLING task as the present flusher (index form).
+/// Called once by `flush_loop` on entry. Called from TASK context on entry
+/// (interrupts enabled), so `cur_index()` is valid.
+pub fn publish_present_index() {
+    let me = cur_index();
+    PRESENT_TASK_INDEX.store(me, Ordering::Relaxed);
+}
+
+/// Is the present flusher currently PARKED (Sleeping) rather than Running?
+///
+/// P2 tail hunt. `wake_task_now` only promotes `Sleeping -> Ready`, so a wake
+/// that lands while the flusher is Running is a NO-OP: the new damage then waits
+/// out the flusher's entire next park. Reading this from the damage path is
+/// cheap (one atomic load) and turns "is the tail the scheduler, or the
+/// flusher's own cadence?" from a guess into a measurement.
+///
+/// Caller may be IRQ context (the damage path runs from `set_pixel`). Deliberately
+/// lock-free: taking `SCHED_LOCK` here would risk a self-deadlock from the
+/// scheduler's own paths, and a single-word state store is atomic on x86.
+pub fn present_is_parked() -> bool {
+    unsafe {
+        let idx = PRESENT_TASK_INDEX.load(Ordering::Relaxed);
+        let count = TASK_COUNT;
+        if idx == 0 || idx >= count {
+            return false;
+        }
+        TASKS[idx].state == State::Sleeping
+    }
 }
 
 /// Context switches performed on the CALLING CPU so far (M9.8-f). A test can

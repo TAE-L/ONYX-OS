@@ -1516,6 +1516,27 @@ static PRESENT_WAKEUPS: AtomicU64 = AtomicU64::new(0);
 /// the CONSUMER side (which is the only place that knows the episode ended)
 /// rather than by the producer's box state.
 static PRESENT_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+/// P2 tail hunt: total `request_present_wake` attempts, and how many found the
+/// flusher RUNNING (so `wake_task_now` could not promote it and the wake was a
+/// no-op). A high no-op ratio means the tail is the flusher's own park cadence,
+/// not the scheduler - a distinction that changes which knob to turn.
+static WAKE_CALLS: AtomicU64 = AtomicU64::new(0);
+static WAKE_NOOP_RUNNING: AtomicU64 = AtomicU64::new(0);
+/// TSC-ns instant the flusher's current park began (0 = not parked yet).
+/// P2: the present's OWN cost (transfer + flush). Everything else measures the
+/// scheduling around it; this measures the DMA. A large number here means the
+/// tail is the emulated device, not the kernel, and the fix is fewer/smaller
+/// transfers rather than scheduler work.
+static PRESENT_US_N: AtomicU64 = AtomicU64::new(0);
+static PRESENT_US_SUM: AtomicU64 = AtomicU64::new(0);
+static PRESENT_US_MAX: AtomicU64 = AtomicU64::new(0);
+static PARK_START_NS: AtomicU64 = AtomicU64::new(0);
+/// Hop B split: the wake fired BEFORE the flusher parked (pure cadence wait).
+static WAKE_B_CADENCE: AtomicU64 = AtomicU64::new(0);
+static WAKE_B_CADENCE_N: AtomicU64 = AtomicU64::new(0);
+/// Hop B split: the wake fired while parked (a real reschedule wait).
+static WAKE_B_RESCHED: AtomicU64 = AtomicU64::new(0);
+static WAKE_B_RESCHED_N: AtomicU64 = AtomicU64::new(0);
 
 /// Ask for a flusher wake, at most one outstanding per damage episode.
 /// Returns true if this call actually requested a wake.
@@ -1530,6 +1551,28 @@ fn request_present_wake() -> bool {
         PRESENT_WAKE_PENDING.store(false, Ordering::Release);
         return false;
     }
+    // P2 TAIL HUNT: was the flusher actually PARKED when this damage landed?
+    //
+    // `wake_task_now` only promotes Sleeping -> Ready. If the flusher was
+    // RUNNING (mid-loop, mid-present) at this instant, the wake is a NO-OP and
+    // the damage then waits out the flusher's entire NEXT park - a whole
+    // quantum, or the 16 ms idle back-off, of dead time. That would explain a
+    // large hop B with almost no `hopB contender` samples: the scheduler is
+    // never asked to switch, because the task was never made Ready in the first
+    // place.
+    //
+    // Count both cases so the two explanations are distinguishable instead of
+    // guessed at.
+    WAKE_CALLS.fetch_add(1, Ordering::Relaxed);
+    if !crate::scheduler::present_is_parked() {
+        WAKE_NOOP_RUNNING.fetch_add(1, Ordering::Relaxed);
+    }
+    // P2: is the flusher even RUNNABLE by this CPU? The affinity filter in
+    // `plan_switch` only considers tasks whose `owner_cpu` equals the current
+    // CPU, so a wake fired on the WRONG cpu leaves the flusher Ready but
+    // unpickable there. If these ever differ, that is the tail - and no amount
+    // of cadence tuning will touch it.
+    crate::scheduler::note_present_wake_cpu();
     // Stamp BEFORE the wake attempt: this is "the instant something first
     // noticed this damage", which is the boundary between the two hops.
     DAMAGE_WAKE_NS.store(crate::time::now_ns(), Ordering::Release);
@@ -1783,6 +1826,9 @@ pub fn flush_loop() {
     // "when is the timer going to run me again" (~170 ms, measured). On damage
     // we promote it Ready immediately.
     PRESENT_TASK_ID.store(crate::scheduler::current_task_id(), Ordering::Release);
+    // P2 tail hunt: publish our task INDEX too, so the damage path can ask
+    // whether we are parked without taking the scheduler lock.
+    crate::scheduler::publish_present_index();
     // M10b 6: promote the flusher to RT. The event-driven wake makes it Ready
     // the moment damage appears, but at Normal priority it still queues behind
     // CPU-bound Normal tasks and the ~200 ms scheduling wait persists. RT
@@ -1801,16 +1847,42 @@ pub fn flush_loop() {
     let mut idle_quanta: u32 = 0;
     let mut last_gen: u64 = crate::framebuffer::damage_generation();
     loop {
-        // M10b 5: stamp the moment we come back from sleep, so the report can
-        // split "how long the damage waited for the flusher to be SCHEDULED"
-        // (wake - mark) from "how long the submit itself took" (present - wake).
-        // Without this split a large response is ambiguous between a pacing
-        // problem and a scheduler/wake-latency problem.
-        // Sleep on the ADAPTIVE quantum, not a fixed period: short while the
-        // console is active, long once it is idle. The initial frame was
-        // already pushed by `present_bringup`, so there is nothing to send on
-        // the very first pass either way.
-        let sleep_ms = if idle_quanta >= FLUSH_IDLE_BACKOFF {
+        // P2 TAIL FIX - never park on work we already have.
+        //
+        // `wake_task_now` only promotes Sleeping -> Ready, so damage that lands
+        // while this task is RUNNING cannot wake it: the change then waits out
+        // the flusher's ENTIRE next park. Measured, this is the whole tail and
+        // it is sharply bimodal:
+        //
+        //   cadence  (wake hit a Running flusher)  1 sample  avg ~227-269 ms
+        //   resched  (flusher genuinely parked)     2 samples avg ~82-119 us
+        //
+        // i.e. when the wake works it is ~100 us (excellent), and when it
+        // no-ops the change waits a quarter second. One window in three hits
+        // the no-op case. So the fix is neither a shorter sleep nor a better
+        // scheduler - it is to NOT SLEEP when damage is already pending.
+        //
+        // `damage_generation()` is a single relaxed load (no lock, no refcount),
+        // so this check is nearly free. Damage arriving DURING the park is
+        // still handled by the coalescing wake in `request_present_wake`.
+        let pending = crate::framebuffer::damage_generation() != last_gen;
+        // M10b 4 (frame pacing): the cadence is NOT a fixed 100 ms period.
+        // A fixed period is a *latency* decision disguised as a DMA decision:
+        // a glyph drawn just after a tick waits a full period to appear, which
+        // is where the ~57 ms input->present average came from (avg wait ~=
+        // period/2, not transfer time). The flusher runs an ADAPTIVE cadence:
+        // a short *latency quantum* while the console is changing, and a long
+        // back-off after enough consecutive idle quanta, so response latency
+        // is decoupled from CPU/DMA cost instead of trading one for the other.
+        // `damage_generation` is the change signal and is a single relaxed
+        // load, so an idle quantum does no work at all.
+        //
+        // P2: with pending damage there is nothing to wait FOR, so the quantum
+        // collapses to 0 - the present happens on the next scheduling point
+        // instead of after a sleep.
+        let sleep_ms = if pending {
+            0
+        } else if idle_quanta >= FLUSH_IDLE_BACKOFF {
             FLUSH_IDLE_SLEEP_MS
         } else {
             FLUSH_LATENCY_QUANTUM_MS
@@ -1821,6 +1893,14 @@ pub fn flush_loop() {
         // Every scheduler tick that declines to switch to us while we are
         // Ready counts as one tick of "woke but waiting", attributed to
         // whoever held the CPU. Cleared when we are actually running again.
+        // Stamp when this pass's park BEGINS. Damage that arrives BEFORE this
+        // instant found the flusher Running, so `wake_task_now` could not
+        // promote it and the change had to wait out the whole park. Damage that
+        // arrives after it found the flusher genuinely parked, and the wake is
+        // a real reschedule. Splitting hop B on this boundary is what
+        // distinguishes "the flusher's own cadence is the tail" from "the
+        // scheduler is slow" - the two need opposite fixes.
+        PARK_START_NS.store(crate::time::now_ns(), Ordering::Release);
         crate::scheduler::hopb_open();
         crate::scheduler::sleep_kernel(sleep_ms);
         crate::scheduler::hopb_close();
@@ -1843,6 +1923,21 @@ pub fn flush_loop() {
         // with AND without the LAPIC divisor fix, because it was never the
         // tick. Now the metric is the real scheduling wait.
         let wake_ns = crate::time::now_ns();
+        // P2 METRIC CORRECTION: re-arm the wake latch and the wake stamp on
+        // EVERY pass, here - not only inside the damage branch below.
+        //
+        // The latch was previously cleared just before `take_dirty_rect`, i.e.
+        // AFTER the `gen == last_gen` idle `continue`. So a wake that found no
+        // consumable damage left BOTH the latch set and `DAMAGE_WAKE_NS`
+        // pointing at an OLD episode, and hop B was then measured against a
+        // timestamp from many passes ago - inventing a ~200 ms "cadence" wait
+        // that never happened. This is the same failure shape as the two earlier
+        // metric bugs this session (stamp-before-sleep, swap-then-load, and the
+        // conditional latch clear that froze the display): a value whose
+        // lifetime is managed on only SOME paths eventually reads as garbage.
+        // Clearing here makes the stamp always describe the CURRENT pass.
+        release_present_wake();
+        DAMAGE_WAKE_NS.store(0, Ordering::Release);
         if !PRESENT.load(Ordering::Acquire) {
             continue;
         }
@@ -1876,14 +1971,6 @@ pub fn flush_loop() {
         // response — what the adaptive cadence is measured on).
         let damage_marked = crate::framebuffer::damage_marked_ns();
 
-        // P2: re-arm the coalescing wake latch UNCONDITIONALLY, at the top of
-        // the pass - before any `continue` below. This is what keeps one screen
-        // redraw from firing thousands of IPIs (the damage path runs per pixel)
-        // while guaranteeing the latch can never stick. A conditional clear
-        // froze the display after boot, because a wake with no consumable
-        // damage left it latched and every later mark was swallowed.
-        release_present_wake();
-        // There IS new damage: consume the box and present exactly it.
         let Some((x0, y0, x1, y1)) = crate::framebuffer::take_dirty_rect() else {
             // The generation moved but the box was empty (a mark that was
             // already taken, e.g. a failed flush re-arm race). Nothing to do.
@@ -1902,10 +1989,20 @@ pub fn flush_loop() {
         }
         let (w32, h32) = (w as u32, h as u32);
         let (x32, y32) = (x0 as u32, y0 as u32);
+        // P2: how long does the PRESENT itself take? Everything above measures
+        // the scheduling AROUND it. If the transfer+flush is itself ~200 ms then
+        // the "tail" is DMA under TCG, not the scheduler, and no scheduler
+        // change touches it. One `now_ns()` pair per present - free relative to
+        // the work being measured.
+        let present_t0 = crate::time::now_ns();
         match transfer_to_host_2d_rect(&res, 0, x32, y32, w32, h32)
             .and_then(|()| flush_rect(&res, x32, y32, w32, h32))
         {
             Ok(()) => {
+                let present_us = (crate::time::now_ns() - present_t0) / 1_000;
+                PRESENT_US_SUM.fetch_add(present_us, Ordering::Relaxed);
+                PRESENT_US_MAX.fetch_max(present_us, Ordering::Relaxed);
+                PRESENT_US_N.fetch_add(1, Ordering::Relaxed);
                 FLUSH_BYTES.fetch_add((w * h * 4) as u64, Ordering::Relaxed);
                 failures = 0;
                 // M10b 7: kernel-local probe sample (draw -> present) - the pure
@@ -1939,6 +2036,19 @@ pub fn flush_loop() {
                         WAKE_A_MAX_US.fetch_max(a, Ordering::Relaxed);
                         WAKE_B_SUM_US.fetch_add(b, Ordering::Relaxed);
                         WAKE_B_MAX_US.fetch_max(b, Ordering::Relaxed);
+                        // Split hop B at the park boundary. If the wake fired
+                        // BEFORE the flusher parked, the task was Running, the
+                        // wake could not promote it, and this wait is pure
+                        // flusher CADENCE (the fix is the sleep length). If it
+                        // fired while parked, it is a real reschedule wait.
+                        let ps = PARK_START_NS.load(Ordering::Acquire);
+                        if wns < ps && ps > 0 {
+                            WAKE_B_CADENCE.fetch_add(b, Ordering::Relaxed);
+                            WAKE_B_CADENCE_N.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            WAKE_B_RESCHED.fetch_add(b, Ordering::Relaxed);
+                            WAKE_B_RESCHED_N.fetch_add(1, Ordering::Relaxed);
+                        }
                     } else {
                         // No wake stamp in this window: the damage was picked
                         // up purely by the poll timer, so ALL of the wait is
@@ -2130,6 +2240,49 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
         };
         log(&alloc::format!(
             "[vgpu] sleep: n={n_slp} req avg={req_avg} us, ACTUAL avg={act_avg} us max={max_slp} us ({over}x overshoot)"
+        ));
+    }
+    // P2: the present's OWN cost. Everything else measures scheduling; this
+    // measures the DMA. A large number here means the tail is the emulated
+    // device, not the kernel, and the fix is fewer/smaller transfers.
+    let n_pr = PRESENT_US_N.swap(0, Ordering::Relaxed);
+    let sum_pr = PRESENT_US_SUM.swap(0, Ordering::Relaxed);
+    let max_pr = PRESENT_US_MAX.swap(0, Ordering::Relaxed);
+    if n_pr > 0 {
+        log(&alloc::format!(
+            "[vgpu] present cost: n={n_pr} avg={} us max={max_pr} us",
+            sum_pr / n_pr
+        ));
+    }
+    // P2: split hop B on the park boundary. CADENCE = the wake fired while the
+    // flusher was Running, so it could not promote it and the change waited out
+    // a whole park (fix = the sleep length). RESCHED = the wake fired while
+    // parked and the CPU still took a while to come (fix = the scheduler).
+    // These need OPPOSITE changes, so this line is what picks between them.
+    let n_cad = WAKE_B_CADENCE_N.swap(0, Ordering::Relaxed);
+    let cad_sum = WAKE_B_CADENCE.swap(0, Ordering::Relaxed);
+    let n_res = WAKE_B_RESCHED_N.swap(0, Ordering::Relaxed);
+    let res_sum = WAKE_B_RESCHED.swap(0, Ordering::Relaxed);
+    if n_cad + n_res > 0 {
+        log(&alloc::format!(
+            "[vgpu] hopB detail: cadence {n_cad} avg={} us | resched {n_res} avg={} us",
+            if n_cad > 0 { cad_sum / n_cad } else { 0 },
+            if n_res > 0 { res_sum / n_res } else { 0 }
+        ));
+    }
+    // P2: wake-target breakdown. A high NO-OP ratio means the flusher was
+    // Running when the damage landed, so `wake_task_now` could not promote it
+    // and the damage waited out its whole next park - i.e. the tail is the
+    // flusher's own CADENCE, not the scheduler, and the fix is a different
+    // knob entirely (see the wake-split line above for the other half).
+    let n_calls = WAKE_CALLS.swap(0, Ordering::Relaxed);
+    let n_noop = WAKE_NOOP_RUNNING.swap(0, Ordering::Relaxed);
+    let n_wrong = crate::scheduler::present_wake_wrong_cpu();
+    let n_oncpu = crate::scheduler::present_wake_total();
+    if n_calls > 0 {
+        log(&alloc::format!(
+            "[vgpu] wake-target: {n_calls} attempts, {n_noop} hit a RUNNING flusher (no-op) = {}%; wrong-cpu {n_wrong}/{n_oncpu}",
+            (n_noop * 100) / n_calls
         ));
     }
     // M10b 6: how many presents were driven by a damage-triggered wake (the

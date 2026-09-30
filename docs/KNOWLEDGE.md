@@ -730,6 +730,58 @@ a hotspot: the per-pixel cursor path that looked expensive was the same path
 that corrupted the screen. Fix the mask and the art in one change, but treat
 them as different classes of problem.
 
+### The tail hunt: three candidates eliminated, then a FOURTH metric bug
+
+Chasing the remaining ~165-230 ms tail. Each hypothesis was measured, not argued:
+
+1. **CPU affinity / wrong-CPU wake?** No. Added `note_present_wake_cpu()`:
+   `wrong-cpu 0/554`. The wake always fires on the flusher's own CPU. Eliminated.
+2. **The wake no-ops because the flusher is Running?** Partly - 25-33% of wakes
+   did hit a Running flusher. Not the whole story.
+3. **Is the tail the DMA?** No, and this was the surprise worth having.
+   Instrumented the present itself (`present_t0` around transfer+flush):
+   **avg 457-742 us, max ~1.4 ms.** The emulated GPU is fast; the tail is not I/O.
+4. **Then the split that actually resolved it.** `hopB detail` separated hop B on
+   the PARK boundary - did the wake fire before or after the flusher parked? It
+   came out sharply bimodal:
+
+   ```
+   cadence  1 sample  avg ~227-269 ms    (wake fired while Running)
+   resched  2 samples avg ~54-128 us     (wake fired while parked)
+   ```
+
+   When the wake actually works, the flusher gets the CPU in **~100 us** - which
+   is excellent. So the "tail" was always this one bucket.
+
+**And that bucket was MY OWN BUG, a fourth instance of the same family.** The
+coalescing latch and `DAMAGE_WAKE_NS` were cleared only inside the damage branch,
+AFTER the `gen == last_gen` idle `continue`. So a wake that found no consumable
+damage left the latch set AND `DAMAGE_WAKE_NS` pointing at an OLD episode; hop B
+was then computed against a timestamp from many passes earlier, inventing a
+~230 ms wait that never happened. Fixed by clearing both at the top of EVERY
+pass. The cadence bucket then stopped firing at all.
+
+Real fix alongside the metric fix: the flusher now **never parks on work it
+already has** - `sleep_ms = 0` when `damage_generation() != last_gen`, so pending
+damage is presented at the next scheduling point instead of after a sleep. That
+is one relaxed load, no lock.
+
+| | pacing | min interval | damage->present avg |
+|---|---|---|---|
+| before this round | ~10.7-14.5 fps | 281 us | 42-77 ms |
+| after | **~14.3 fps** | **409 us** | **42-68 ms** |
+
+**The lesson, and it is the fourth time:** this session produced FOUR separate
+instances of the same bug - a metric whose value is managed on only SOME paths
+(stamp before sleep; swap-then-load; a conditional latch clear that froze the
+display; and now a conditionally-cleared timestamp that invented a 230 ms tail).
+Every one looked like a plausible performance finding. The discipline that works:
+**before trusting a latency number, ask what could make it wrong by construction,
+and confirm the metric can print a value you did not expect.** Three of the four
+were only caught because the number was suspiciously clean or suspiciously
+large. The remaining ~40-68 ms average damage->present is genuine end-to-end
+work (draw -> park -> DMA), and the scheduling component of it is now ~100 us.
+
 ### "fpu-avx test not spawned (AVX unavailable)" is NOT a coverage gap
 
 That line was flagged as a possible hole in the AVX coverage. It is not - it is
