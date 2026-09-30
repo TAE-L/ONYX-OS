@@ -782,73 +782,57 @@ were only caught because the number was suspiciously clean or suspiciously
 large. The remaining ~40-68 ms average damage->present is genuine end-to-end
 work (draw -> park -> DMA), and the scheduling component of it is now ~100 us.
 
-### "fpu-avx test not spawned (AVX unavailable)" is NOT a coverage gap
+### P6a stage 1: surfaces — and the self-test caught a real bug immediately
 
-That line was flagged as a possible hole in the AVX coverage. It is not - it is
-the EXPECTED output of the second boot in `test-avx.ps1`, and the test proves it
-deliberately:
+New `kernel/src/surface.rs`: first-class offscreen pixel buffers, the drawing
+substrate the whole desktop is built on.
+
+**Why not `Vec<u32>`:** it would be simpler and would work for stage 1. It is
+rejected because the desktop exists to be blitted to the device, and the moment a
+surface is handed to virtio it must be physically contiguous and
+device-addressable - a heap `Vec` is neither. Backing comes from
+`memory::alloc_contiguous` (the same allocator the GEM-lite GPU resource uses)
+and is reached through `memory::phys_offset`, so a surface can become a scanout
+with no second concept of "a thing you can draw on".
+
+API: `create` / `destroy` / `geometry` / `put_pixel` / `pixel` / `take_damage` /
+`stats`. Handles are validated on EVERY entry point, so a stale or forged id
+returns `Err` rather than corrupting memory. Damage is accumulated at the single
+write chokepoint - the same discipline `set_pixel` uses in `framebuffer.rs` -
+so a future draw path cannot forget to mark itself.
+
+**The bug the self-test caught (and why it exists).** The first version returned
+a monotonically increasing id from `NEXT_ID` but looked surfaces up by treating
+that id as a TABLE SLOT INDEX. Those two only agree by accident, so `create`
+returned `id=1` and `geometry(1)` immediately answered "not live". It compiled
+perfectly and would have been a silent, hard-to-trace corruption source the
+moment the compositor used a surface. The id IS the index now, bounded by
+`MAX_SURFACES`.
+
+That is the fifth instance this session of the same shape - **code that compiles
+and looks right, and is wrong** - and the first one that was NOT in
+instrumentation. The self-test exists because of the four previous metric bugs:
+if those had all been caught by reading alone, this would have shipped too. Each
+check prints PASS/BAD and `test-surface.ps1` asserts on **every** line, because a
+self-test that only proves it started is the same mistake as a metric that only
+proves it printed.
 
 ```
-=== -cpu max (self-exited: False) ===          <- AVX-capable CPU
-fpu: XSAVE enabled (XCR0=0x7, area 832 bytes, AVX=yes)
-fpu: avx PASS round 1 (... 16 YMM lanes intact across 506 switches in 1170 ticks, XCR0=0x7)
-... rounds 2-8 all PASS ...
-
-=== -cpu qemu64 (self-exited: False) ===       <- deliberately AVX-less CPU
-fpu: FXSAVE fallback (no XSAVE/OSXSAVE on this CPU)
-fpu-avx test not spawned (AVX unavailable)      <- the message in question
-RESULT: M9.8-f XSAVE/AVX TESTS PASSED
+[surface] PASS create: id=1 64x32 Rgb8888
+[surface] PASS zeroed: all 2048 px read 0
+[surface] PASS rejects: out-of-bounds px, bogus id, zero-size
+[surface] PASS write: put_pixel round-trips through Rgb8888
+[surface] PASS damage: corner writes unioned to (0,0)-(64,32)
+[surface] PASS damage: take_damage clears the rect
+[surface] PASS destroy: id retired, writes now rejected
+[surface] PASS reuse: new surface usable after destroy
+[surface] done: live=0 failed_creates=1
 ```
 
-The script runs the same kernel TWICE on purpose: once on `-cpu max` (XSAVE +
-AVX, must take the XSAVE path and keep 16 YMM lanes intact across hundreds of
-switches) and once on `-cpu qemu64` (no XSAVE, must fall back to FXSAVE and must
-NOT spawn the AVX task - asserted at `test-avx.ps1:81`). The message is the
-fallback path announcing itself, and its presence is a PASS condition.
+(`failed_creates=1` is expected: the test deliberately calls `create(0, 16)` to
+prove a zero-sized request is rejected.)
 
-**The lesson:** a status line that looks like a skip is often a tested branch.
-Read the whole test before reading a single log line - the suspicion that "AVX
-was not actually exercised" came from seeing only the second boot's output. The
-real coverage is the 8 PASS rounds with 16 YMM lanes intact across 300-500
-context switches each.
+**Stage 2 (blit/fill) is the obvious next step**, and it must wire damage into
+the EXISTING `framebuffer::mark_dirty_public` so the present flusher picks
+surfaces up with no new present mechanism.
 
-### P6a direction: the blit API
-
-The plan is a **surface/blit API** as the drawing substrate everything else is
-built on, in this order:
-
-1. **Surface** - a first-class offscreen pixel buffer the kernel owns:
-   `surface_create(w, h, format) -> id`, `surface_destroy(id)`. Backing comes
-   from the existing GEM-lite allocator (already proven by the GPU tests, with
-   the canary check), so a surface is a real DMA-capable resource, not a memcpy
-   target. This is deliberately the SAME kind of object the virtio-gpu driver
-   already creates, so a surface can later become a scanout with no second
-   concept of "a thing you can draw on".
-
-2. **Blit** - `blit(dst, src, x, y)` plus a `fill(dst, x, y, w, h, colour)`.
-   Both go through the EXISTING damage path (`mark_dirty` -> the dirty-rect
-   accumulator the present flusher already consumes). This is the key decision:
-   the compositor does not get its own present mechanism, it marks damage and
-   the existing flusher presents it. That is why this session's pacing work
-   (coalesced wakes, decoupled sleeper clock) pays off directly for the desktop
-   instead of being throwaway.
-
-3. **Font** - a scalable Unicode font, because the current console is 8x8
-   `BASIC_LEGACY` ASCII only (ASCII art, per `framebuffer.rs::write_char`). Text
-   is the first real client of the blit API and proves it works.
-
-4. **Compositor** - owns the screen surface, composites windows, marks damage.
-   Input dispatch feeds it; it never touches the hardware directly.
-
-5. **First desktop** - taskbar, clock, one window.
-
-Two constraints carried in from this session, which the compositor MUST respect
-rather than rediscover:
-  * **Only 8-byte stack alignment is guaranteed** on a resumed task (measured
-    both `0 mod 16` and `8 mod 16` across preemption points). Any SSE spill
-    path in the compositor has to tolerate that.
-  * **Never hold `SCHED_LOCK` across a context switch**, and do not structure
-    the compositor as one long non-preemptible critical section. The clock
-    task's old `without_interrupts` + FB-lock redraw was exactly that shape,
-    and it fired thousands of IPIs per redraw. That is the anti-pattern to
-    design against.

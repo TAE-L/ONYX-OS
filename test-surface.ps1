@@ -1,0 +1,86 @@
+# test-surface.ps1 - P6a stage 1: surfaces (create/read/damage/destroy).
+#
+# Runs the kernel headless and asserts the `[surface]` self-test lines. The
+# self-test prints one PASS/BAD line per check, so this asserts on EVERY check
+# rather than just "the task ran" - a self-test that only proves it started is
+# the same mistake as a metric that only proves it printed.
+#
+# Waits for the final `[surface] done:` marker instead of sleeping a fixed
+# amount: a wall-clock sleep is a race against host load and its failure looks
+# exactly like a kernel regression.
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
+
+$tmp = Join-Path $env:TEMP 'onyx-surface'
+New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+$img = Join-Path $tmp 'bios.img'
+$log = Join-Path $tmp 'serial.log'
+
+Get-Process qemu-system-x86_64 -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 500
+# Boot a COPY: never the shared target\debug\images\bios.img.
+Copy-Item (Join-Path $root 'target\debug\images\bios.img') $img -Force
+Remove-Item $log -ErrorAction SilentlyContinue
+
+$p = Start-Process -FilePath $qemu `
+    -ArgumentList @('-drive', "format=raw,file=$img", '-display', 'none', '-serial', "file:$log", '-no-reboot', '-snapshot') `
+    -WindowStyle Hidden -PassThru
+
+# Poll for the completion marker, with a ceiling.
+$deadline = (Get-Date).AddSeconds(90)
+while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 5
+    if (Test-Path $log) {
+        if (Select-String -Path $log -Pattern '\[surface\] done:' -Quiet) { break }
+        if ($p.HasExited) { break }
+    }
+}
+$selfExited = $p.HasExited
+if (-not $selfExited) { Stop-Process -Id $p.Id -Force }
+Start-Sleep -Milliseconds 800
+
+$lines = Get-Content $log -ErrorAction SilentlyContinue
+Write-Host "qemu self-exited (crash indicator): $selfExited"
+Write-Host '=== surface self-test ==='
+$lines | Select-String -Pattern '\[surface\]' | ForEach-Object { $_.Line }
+
+$fail = @()
+if ($selfExited) { $fail += 'QEMU self-exited (crash)' }
+
+# Every check the self-test can print. Asserting the full list is the point:
+# a missing line means the check never ran, which is a FAILURE, not a skip.
+$required = @(
+    'PASS create',
+    'PASS zeroed',
+    'PASS rejects',
+    'PASS write',
+    'PASS damage: corner writes unioned',
+    'PASS damage: take_damage clears',
+    'PASS destroy',
+    'PASS reuse',
+    '\[surface\] done:'
+)
+foreach ($r in $required) {
+    if (-not ($lines | Select-String -Pattern $r -Quiet)) {
+        $fail += "missing surface marker: $r"
+    }
+}
+# No FAILED line may appear.
+if ($lines | Select-String -Pattern '\[surface\] FAILED') {
+    $lines | Select-String -Pattern '\[surface\] FAILED' | ForEach-Object { Write-Host "  $($_.Line)" }
+    $fail += 'surface self-test reported FAILED'
+}
+# Corruption guards, same as every other suite.
+if ($lines | Select-String -Pattern 'PANIC|DOUBLE FAULT') { $fail += 'kernel fault reported' }
+if ($lines | Where-Object { $_ -match 'EXCEPTION' -and $_ -notmatch 'Breakpoint' }) {
+    $fail += 'unexpected exception'
+}
+
+if ($fail.Count -eq 0) {
+    Write-Host 'RESULT: P6a SURFACE TESTS PASSED' -ForegroundColor Green
+    exit 0
+} else {
+    Write-Host 'RESULT: FAILED:' -ForegroundColor Red
+    $fail | ForEach-Object { Write-Host "  - $_" }
+    exit 1
+}

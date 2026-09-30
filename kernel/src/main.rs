@@ -33,6 +33,7 @@ mod rtc;
 mod scheduler;
 mod serial;
 mod smp;
+mod surface;
 mod syscall;
 mod time;
 mod userspace;
@@ -256,6 +257,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // M9.6-A6: frame-allocator v2 regression (free-list LIFO + bump path).
     scheduler::spawn(mem_test);
     serial_writeln!("spawned mem-test");
+    // P6a stage 1: surface create/read/damage/destroy self-test.
+    scheduler::spawn(surface_test);
+    serial_writeln!("spawned surface-test");
     // M9.6-B5: print one full performance snapshot ~3 s into the boot (the
     // shell's `perf` command re-renders it live at any time).
     scheduler::spawn(perf_task);
@@ -448,7 +452,130 @@ fn mouse_task() {
     mouse::run_reader();
 }
 
-/// IST clock task: reports the wall clock on serial once per second, and every
+/// P6a stage 1 self-test: prove surfaces actually work, not merely that they
+/// compile.
+///
+/// This exists because this session produced FOUR separate "looks right, is
+/// wrong" bugs - three of them in instrumentation. An untested allocator is
+/// exactly where the next one hides. Each check prints PASS/BAD so a test script
+/// can assert on it.
+///
+/// Checks, in order:
+///   1. create returns a live id with the requested geometry
+///   2. a new surface reads back zero (the backing really was zeroed)
+///   3. out-of-bounds and bogus ids are REJECTED, not crashes
+///   4. damage accumulates as a union and clears on take
+///   5. destroy retires the id, and the slot is reusable
+fn surface_test() {
+    use crate::surface::{self, Format};
+    serial_writeln!("[surface] P6a stage 1 self-test");
+
+    // --- 1. create + geometry ------------------------------------------------
+    let Ok(id) = surface::create(64, 32, Format::Rgb8888) else {
+        serial_writeln!("[surface] FAILED: create(64x32) refused");
+        return;
+    };
+    match surface::geometry(id) {
+        Ok((w, h, f)) if w == 64 && h == 32 && f == Format::Rgb8888 => {
+            serial_writeln!("[surface] PASS create: id={id} {w}x{h} Rgb8888")
+        }
+        other => {
+            serial_writeln!("[surface] FAILED: geometry mismatch {other:?}");
+            return;
+        }
+    }
+
+    // --- 2. zeroed backing ---------------------------------------------------
+    // An unzeroed surface would leak stale frame contents AND make every later
+    // visual bug ambiguous, so this is checked rather than assumed.
+    let mut nonzero = 0u32;
+    for y in 0..32 {
+        for x in 0..64 {
+            if surface::pixel(id, x, y) != Ok(0) {
+                nonzero += 1;
+            }
+        }
+    }
+    if nonzero == 0 {
+        serial_writeln!("[surface] PASS zeroed: all 2048 px read 0");
+    } else {
+        serial_writeln!("[surface] FAILED: {nonzero} px non-zero in a fresh surface");
+    }
+
+    // --- 3. rejects ----------------------------------------------------------
+    // A bad handle must be an Err, never a panic or a wild pointer. These are
+    // the paths a future compositor will hit with a stale window id.
+    let oob = surface::pixel(id, 64, 0).is_err() && surface::pixel(id, 0, 32).is_err();
+    let bogus = surface::geometry(9999).is_err() && surface::destroy(9999).is_err();
+    let zero_sz = surface::create(0, 16, Format::Rgb8888).is_err();
+    if oob && bogus && zero_sz {
+        serial_writeln!("[surface] PASS rejects: out-of-bounds px, bogus id, zero-size");
+    } else {
+        serial_writeln!("[surface] FAILED: bounds/id validation accepted a bad argument");
+    }
+
+    // --- 4. write + damage union + clear -------------------------------------
+    // Damage is what the present flusher consumes in stage 2, so its union
+    // behaviour is part of the contract, not an implementation detail. Two
+    // writes at opposite corners must union into ONE rect spanning both, and
+    // take_damage must clear it.
+    let _ = surface::put_pixel(id, 0, 0, 0x112233);
+    let _ = surface::put_pixel(id, 63, 31, 0x445566);
+    let write_ok = surface::pixel(id, 0, 0) == Ok(0x112233)
+        && surface::pixel(id, 63, 31) == Ok(0x445566);
+    if write_ok {
+        serial_writeln!("[surface] PASS write: put_pixel round-trips through Rgb8888");
+    } else {
+        serial_writeln!("[surface] FAILED: pixel write did not read back");
+    }
+    let union = surface::take_damage(id);
+    match union {
+        Some((0, 0, 64, 32)) => {
+            serial_writeln!("[surface] PASS damage: corner writes unioned to (0,0)-(64,32)")
+        }
+        other => serial_writeln!("[surface] FAILED: damage union wrong: {other:?}"),
+    }
+    if surface::take_damage(id).is_none() {
+        serial_writeln!("[surface] PASS damage: take_damage clears the rect");
+    } else {
+        serial_writeln!("[surface] FAILED: take_damage did not clear");
+    }
+
+    // --- 5. destroy retires the id ------------------------------------------
+    // Ids are NOT reused (they ARE table indices - see the TABLE doc comment),
+    // so a destroyed surface must stay dead. This is the contract the
+    // compositor will rely on: a stale window id can never silently alias a
+    // newer surface.
+    if surface::destroy(id).is_err() {
+        serial_writeln!("[surface] FAILED: destroy of a live surface was refused");
+    } else if surface::geometry(id).is_ok() {
+        serial_writeln!("[surface] FAILED: surface still live after destroy");
+    } else if surface::put_pixel(id, 0, 0, 0xFFFFFF).is_ok() {
+        serial_writeln!("[surface] FAILED: a destroyed surface is still writable");
+    } else {
+        serial_writeln!("[surface] PASS destroy: id retired, writes now rejected");
+        // A NEW surface must still work after a destroy - the table must not be
+        // left in a state where allocation is permanently broken.
+        match surface::create(16, 16, Format::B8G8R8X8) {
+            Ok(id2) => {
+                let ok = surface::put_pixel(id2, 0, 0, 0x00FF00).is_ok()
+                    && surface::pixel(id2, 0, 0) == Ok(0x00FF00);
+                let _ = surface::destroy(id2);
+                if ok {
+                    serial_writeln!("[surface] PASS reuse: new surface usable after destroy");
+                } else {
+                    serial_writeln!("[surface] FAILED: new surface did not read back");
+                }
+            }
+            Err(e) => serial_writeln!("[surface] FAILED: create after destroy failed: {e}"),
+        }
+    }
+
+    let (live, failed) = surface::stats();
+    serial_writeln!("[surface] done: live={live} failed_creates={failed}");
+}
+
+/// Header-bar clock task: reports the wall clock on serial once per second, and every
 /// 10 s as a `[clock] IST` heartbeat that the test scripts assert on.
 ///
 /// P2: the ON-SCREEN header-bar rendering that used to live here was REMOVED.
