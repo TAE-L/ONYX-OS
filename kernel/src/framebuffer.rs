@@ -953,7 +953,34 @@ pub fn move_cursor(dx: i32, dy: i32) {
     draw_arrow(w, nx, ny);
     SW_VISIBLE.store(true, Ordering::Release);
     CUR_X.store(nx, Ordering::Relaxed);
-    CUR_Y.store(ny, Ordering::Relaxed);
+    CUR_Y.store(ny, Ordering::Release);
+
+    // P6c: ANNOUNCE THE DAMAGE. This is the fix for "the cursor looks
+    // unrefined / doesn't move smoothly".
+    //
+    // `FrameBufferWriter::set_pixel` (the writer `draw_arrow` draws through)
+    // does NOT call `mark_dirty` - only `TextConsole::set_pixel` does - and
+    // `restore_vacated`/`capture_save` write raw bytes for the same reason.
+    // So the entire software-sprite path mutated the framebuffer WITHOUT
+    // recording any damage. The presenter is damage-driven, so the sprite was
+    // only ever pushed to scanout when some UNRELATED draw happened to mark
+    // dirty: a console line, the 1 Hz clock, an animation tick. The pointer
+    // therefore appeared to move in coarse, quantized jumps tied to unrelated
+    // repaints instead of tracking the mouse - the reported symptom.
+    //
+    // A move dirties BOTH the vacated rect and the newly painted one, so mark
+    // their union (clamped to the surface). `mark_dirty` coalesces into one
+    // bounding box, so the presenter still gets a single rect per tick.
+    let cs = CUR_SCALE.load(Ordering::Relaxed).max(1);
+    let (sw, sh) = (CURSOR_W * cs, CURSOR_H * cs);
+    let (mw, mh) = (w.info.width, w.info.height);
+    let x0 = old_x.min(nx);
+    let y0 = old_y.min(ny);
+    let x1 = (old_x.max(nx) + sw).saturating_sub(1).min(mw.saturating_sub(1));
+    let y1 = (old_y.max(ny) + sh).saturating_sub(1).min(mh.saturating_sub(1));
+    if x1 >= x0 && y1 >= y0 {
+        mark_dirty_rect(x0, y0, x1, y1);
+    }
 }
 
 /// Copy the pixels under (x, y) into the save buffer (raw bytes, so this is
