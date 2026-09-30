@@ -624,3 +624,54 @@ said "the scheduler is slow"; reading it again said "the spinner is the problem"
 (right, but only the FIRST of two); the attribution counter named `clock_task`
 in a single boot. And the fix was not in the scheduler at all - it was an IPI
 storm from a per-pixel hot path.
+
+### Clock removed from the hot path; tick DECOUPLED (the P2 deadline timer)
+
+**1. The on-screen clock is gone; the serial heartbeat stays.** The hop-B
+attribution counter named `clock_task` as the dominant contender, and the
+mechanism was `draw_clock` -> per-pixel `set_pixel` -> `mark_dirty` -> IPI, all
+under `without_interrupts` holding the FB lock. Deleting the task outright was
+NOT an option: `test-rtc.ps1` asserts `clock:` and `test-input.ps1` asserts the
+`[clock] IST` heartbeat, so removing it turns two suites red. The framebuffer
+redraw was removed and the cheap serial heartbeat kept (no framebuffer, no lock,
+no damage, no IPI). Both tests re-verified green. An on-screen clock is the
+compositor's job in P6a - one blit of pre-rendered glyphs, not a per-pixel
+erase-and-repaint of the header bar.
+
+**2. The tick divisor, measured properly this time.** The bug is real: the
+calibration window is 500 ms = 500 ticks at 1000 Hz, but it divided by 50,
+programming a 10x-too-large interval. Measured `127 ticks/500ms` = ~254 Hz.
+Fixing it to 500 is arithmetically correct (170 ticks/500ms, interval 1464386
+-> 168972) and DOES improve latency (pacing ~8.4 -> ~9.8 fps, max park ~33 ->
+~25 ms) - and it destroys throughput: **test-para x5.24 -> x1.43, FAILED**,
+serial baseline 618 ms -> 1958 ms. Four times the preemption interrupts is four
+times the scheduler work, and on a 4-core TCG host that swamps the computation.
+
+So the slow tick is not a free bug: it is (accidentally) buying throughput with
+latency, and one tick rate cannot serve both jobs. The constant stays at 50,
+now with the measurement recorded next to it.
+
+**3. The actual fix - decouple the sleeper clock from the preemption tick.**
+`Task.sleep_until_ns` records the deadline in TSC ns (`time::now_ns()`), an
+independent and much finer clock. `sleep_kernel(ms)` now goes through
+`sleep_current_ns(ms * 1e6)`, and `wake_state_locked` wakes a sleeper when
+EITHER the TSC deadline OR the old tick backstop has passed (one `rdtsc` per
+wake pass, not per task; the tick path is retained so nothing can sleep forever).
+
+This is the decoupling P2 asked for, and it is the first change that improved
+latency WITHOUT costing throughput:
+
+| | pacing | min interval | test-para |
+|---|---|---|---|
+| slow tick (before) | ~8.2-8.6 fps | ~13-54 ms | x5.24 |
+| true 1000 Hz tick | ~9.7-9.8 fps | ~17-25 ms | **x1.43 FAIL** |
+| **decoupled (after)** | **~10.7 fps** | **281 us** | **x3.86 PASS** |
+
+**The lesson:** when one timer serves two conflicting jobs, raising its rate is
+the worst available answer - it appears to optimise both and achieves neither.
+Give each job the clock it actually needs. The preemption tick can stay coarse
+and cheap; sleepers get a fine deadline evaluated on the ticks that happen
+anyway, so the tick rate now bounds only worst-case lateness, not the requested
+duration. Also: "this constant is obviously wrong" is not sufficient reason to
+change it - this one was wrong AND load-bearing, and only an A/B on both metrics
+revealed that.

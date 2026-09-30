@@ -448,9 +448,27 @@ fn mouse_task() {
     mouse::run_reader();
 }
 
-/// Header-bar clock task: redraws the wall clock once per second (RTC boot
-/// time advanced by PIT uptime). The draw itself runs with IF=0 inside
-/// `framebuffer::draw_clock`, so it cannot race the mouse IRQ.
+/// IST clock task: reports the wall clock on serial once per second, and every
+/// 10 s as a `[clock] IST` heartbeat that the test scripts assert on.
+///
+/// P2: the ON-SCREEN header-bar rendering that used to live here was REMOVED.
+/// `framebuffer::draw_clock` redraws a glyph box pixel by pixel under
+/// `without_interrupts` while holding the FB lock, and EVERY `set_pixel` calls
+/// `mark_dirty` -> `wake_present_on_damage` -> reschedule IPI. One redraw
+/// therefore fired thousands of IPIs from inside an interrupts-disabled section
+/// and repeatedly re-woke the present flusher mid-draw. The hop-B attribution
+/// counter named this task (`idx=4 prio=1`, 14 samples/window, dominant) as the
+/// single largest contributor to the damage->present tail.
+///
+/// The desktop's compositor (P6a) draws the clock as a normal client of the
+/// surface/blit API, which is where an on-screen clock belongs: one blit of a
+/// pre-rendered glyph row instead of a per-pixel erase-and-repaint of the
+/// header bar. Reintroducing a per-pixel full-surface write on a 1 Hz timer is
+/// exactly the anti-pattern this task used to be.
+///
+/// The serial heartbeat is KEPT deliberately: `test-rtc.ps1` asserts `clock:`
+/// and `test-input.ps1` asserts the `[clock] IST` heartbeat, and they are
+/// essentially free (no framebuffer, no lock, no damage, no IPI).
 fn clock_task() {
     let mut last = u32::MAX;
     let mut last_dec = u32::MAX;
@@ -459,7 +477,8 @@ fn clock_task() {
         let sod = rtc::now_secs_of_day();
         if sod != last {
             last = sod;
-            framebuffer::draw_clock(&rtc::format_hms(sod));
+            // P2: no `framebuffer::draw_clock` here any more - see the task doc.
+            // On-screen text is the compositor's job now; this task is serial-only.
             if !logged {
                 logged = true;
                 serial_writeln!("clock: {} — updating every second", rtc::format_hms(sod));

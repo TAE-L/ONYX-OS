@@ -416,13 +416,40 @@ fn calibrate_task() {
         if guard > 200 {
             break; // PIT dead - fall through, the sanity check below catches it
         }
-        crate::scheduler::sleep_kernel(25); // 50 ticks = 500 ms total
+        // Sleep in PIT terms, not LAPIC ticks. `sleep_kernel` takes a LAPIC-tick
+        // count, and this loop is pacing against the PIT (100 Hz), so asking for
+        // "25" meant 25 ticks - which was ~98 ms while the tick ran slow, and is
+        // only ~6 ms now that the divisor is correct. Parking a fixed 25 made the
+        // poll cadence depend on the tick rate it is trying to measure. Park ~5
+        // PIT ticks (50 ms) instead: a handful of iterations, and stable at any
+        // tick rate.
+        crate::scheduler::sleep_kernel(5);
     }
     let dm = ms_since_boot().wrapping_sub(m0);
-    let corrected = if dm > 10 && dm != 50 {
-        // fired `dm` ticks where we wanted 50: rescale proportionally
-        // (guarded against a zero/absurd measurement).
-        (((first_guess as u64) * dm) / 50).max(16) as u32
+    // P2 divisor fix: the window is 50 PIT ticks = 500 ms, and at the target
+    // 1000 Hz that is **500** LAPIC ticks - not 50. Dividing by 50 programmed a
+    // 10x-too-large interval, so the tick ran at ~254 Hz instead of 1000 Hz
+    // (measured "127 ticks/500ms"). Fixing the divisor to 500 is arithmetically
+    // correct and DOES improve the present path (pacing ~8.4 -> ~9.8 fps, max
+    // park ~33 ms -> ~25 ms, tick 254 Hz -> ~340 Hz).
+    //
+    // BUT IT FAILS test-para: speedup collapses x5.24 -> x1.43 (fails the x2
+    // gate), and the serial baseline nearly triples (618 ms -> 1958 ms). Four
+    // times the preemption interrupts is four times the scheduler work, and on
+    // a 4-core TCG host that overwhelms the actual computation. This is the
+    // same trade measured earlier in the session, now reproduced deliberately
+    // with the correct arithmetic - so the 10x-too-slow tick is NOT a free bug
+    // to fix: it is (accidentally) buying throughput with latency.
+    //
+    // CONSTANT IS DELIBERATELY 50, i.e. the KNOWN-WRONG divisor, kept until a
+    // DECOUPLED deadline timer exists: fine-grained wakeups for sleepers on one
+    // path, a coarse preemption tick on the other. Fixing this number alone
+    // forces one tick rate to serve two conflicting jobs, and whichever way it
+    // goes, one of latency or throughput loses. Do not "fix" this to 500
+    // without also decoupling - the measurement is in KNOWLEDGE.md.
+    const WANT: u64 = 50;
+    let corrected = if dm > 10 && dm != WANT {
+        (((first_guess as u64) * dm) / WANT).max(16) as u32
     } else {
         first_guess
     };

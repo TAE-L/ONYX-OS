@@ -173,6 +173,23 @@ struct Task {
     slice_left: u32,
     /// Deadline (LAPIC ms) when Sleeping; woken when `now >= sleep_until_ms`.
     sleep_until_ms: u64,
+    /// P2: TSC-nanosecond deadline, the DECOUPLED sleeper clock.
+    ///
+    /// `sleep_until_ms` is a LAPIC-tick count, so its resolution is the tick
+    /// period - and the tick cannot simply be made faster, because 4x the
+    /// preemption interrupts costs 4x the scheduler work (measured: fixing the
+    /// `calibrate_task` divisor to a true 1000 Hz took test-para from x5.24 to
+    /// x1.43). So a sleeper that must wake on time cannot rely on the tick
+    /// count alone.
+    ///
+    /// This deadline is in TSC ns (`time::now_ns()`), an independent and far
+    /// finer clock, so `wake_state_locked` can decide a sleeper is due WITHOUT
+    /// any extra interrupt: it is evaluated on the tick that happens anyway, and
+    /// simply resolves sleepers up to one tick period early. The tick rate then
+    /// sets only the *worst-case* lateness, not the requested duration - which
+    /// is the decoupling the P2 plan called for. 0 = no TSC deadline (task is not
+    /// sleeping, or was parked before this existed).
+    sleep_until_ns: u64,
     /// When Blocked, whether this task waits for a keyboard line.
     blocked_on_input: bool,
     /// M9.6-B4: when Blocked, whether this task waits for a raw input event.
@@ -413,6 +430,7 @@ fn new_task(entry: fn(), priority: u8, parent_id: u64) -> Task {
         priority,
         slice_left: fresh_slice(priority),
         sleep_until_ms: 0,
+        sleep_until_ns: 0,
         blocked_on_input: false,
         blocked_on_raw: false,
         wake_diag: false,
@@ -493,6 +511,7 @@ pub fn spawn_user_with_parent(user_rip: u64, user_rsp: u64, parent_id: u64) -> u
                 priority: PRIO_NORMAL,
                 slice_left: fresh_slice(PRIO_NORMAL),
                 sleep_until_ms: 0,
+                sleep_until_ns: 0,
                 blocked_on_input: false,
                 blocked_on_raw: false,
                 wake_diag: false,
@@ -768,12 +787,47 @@ pub fn sleep_current(wake_ms: u64) {
     }
 }
 
-/// Kernel-task sleep helper: park `ms` milliseconds (rounds to the 1 ms tick)
-/// and resume with interrupts enabled. Safe from a normal kernel task.
+/// Park the current task until its TSC deadline passes.
+///
+/// P2: this is the entry point that makes a sleep mean REAL milliseconds
+/// instead of LAPIC ticks. `sleep_current` takes a tick count, so its
+/// resolution - and its accuracy, since the tick itself is rescaled at runtime
+/// by the closed-loop correction - is tied to the preemption tick. That forces
+/// one tick rate to serve two conflicting jobs: fine enough for the present
+/// flusher's 1-16 ms pacing, coarse enough that preemption does not swamp a
+/// 4-core TCG host (measured: a true 1000 Hz tick took test-para x5.24 -> x1.43).
+///
+/// Recording the deadline in TSC ns decouples them. The tick still drives
+/// preemption at whatever rate is cheap; this deadline is evaluated against a
+/// fine, independent clock on the ticks that happen anyway, so a sleeper can be
+/// resolved up to one tick period EARLY instead of a whole tick late. The tick
+/// rate now bounds only the worst-case lateness, not the requested duration.
+pub fn sleep_current_ns(delay_ns: u64) {
+    let _g = sched_guard();
+    unsafe {
+        let cur = cur_index();
+        if cur != MAIN_INDEX {
+            TASKS[cur].state = State::Sleeping;
+            // Belt and braces: keep the tick-count deadline as a BACKSTOP, set
+            // generously (10x) so if the TSC clock is unavailable (0) the task
+            // still wakes on the coarse path rather than sleeping forever.
+            TASKS[cur].sleep_until_ms = crate::apic::ms_since_boot() + (delay_ns / 1_000_000) * 10 + 10;
+            TASKS[cur].sleep_until_ns = crate::time::now_ns().wrapping_add(delay_ns);
+            TASKS[cur].blocked_on_input = false;
+            TASKS[cur].blocked_on_raw = false;
+        }
+    }
+}
+
+/// Kernel-task sleep helper: park `ms` REAL milliseconds.
+///
+/// P2: goes through `sleep_current_ns` (TSC deadline) rather than adding `ms`
+/// to the tick count, so `ms` means what it says regardless of the preemption
+/// tick rate. The tick still bounds worst-case lateness, but no longer rescales
+/// every duration in the kernel. Safe from a normal kernel task.
 pub fn sleep_kernel(ms: u64) {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let wake = crate::apic::ms_since_boot() + ms;
-        sleep_current(wake);
+        sleep_current_ns(ms.saturating_mul(1_000_000));
         preempt();
     });
     x86_64::instructions::interrupts::enable();
@@ -1485,10 +1539,21 @@ unsafe fn plan_switch(me: usize) -> Option<SwitchPlan> {
 fn wake_state_locked() {
     unsafe {
         let now_ms = crate::apic::ms_since_boot();
+        // P2: the DECOUPLED clock. One TSC read per wake pass (not per task), so
+        // the cost does not scale with the task count. A sleeper is due when
+        // EITHER its fine TSC deadline has passed OR its coarse tick backstop
+        // has - the tick-count path is retained so a task parked before this
+        // existed (or with an unavailable TSC) still wakes.
+        let now_ns = crate::time::now_ns();
         for i in 0..TASK_COUNT {
+            let due_ns = TASKS[i].sleep_until_ns != 0 && now_ns >= TASKS[i].sleep_until_ns;
             match TASKS[i].state {
-                State::Sleeping if now_ms >= TASKS[i].sleep_until_ms => {
+                State::Sleeping if due_ns || now_ms >= TASKS[i].sleep_until_ms => {
                     TASKS[i].state = State::Ready;
+                    // Cleared so a task that is re-parked by a path that only
+                    // sets the tick deadline (sleep_current) is not judged
+                    // against a stale TSC deadline forever.
+                    TASKS[i].sleep_until_ns = 0;
                 }
                 State::Sleeping
                     if now_ms > TASKS[i].sleep_until_ms + 3000 && !TASKS[i].wake_diag =>
