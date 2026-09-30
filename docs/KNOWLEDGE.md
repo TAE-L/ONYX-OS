@@ -525,3 +525,50 @@ investigation. This is the SAME failure shape as the `wake_ns` stamp one commit
 earlier (taken before the sleep instead of after). Before believing any
 "dimension is zero" result, ask what would make it zero *by construction*, and
 confirm the metric can print a NON-zero value at all.
+
+### THE ACTUAL BOTTLENECK: a busy-spin starving the pinned RT flusher
+
+With the split trustworthy (A=1-4 us, B=53-82 ms), the tail is the flusher
+waiting for the CPU. `kick_self` did NOT fix it (re-tested against the corrected
+instrument - still 53-109 ms), so it is not waiting for a tick.
+
+The real cause: `ticker_task` in `main.rs` was a **busy-spin with no sleep and no
+yield** - an always-runnable Normal task. The present flusher is RT but is
+**pinned to its birth CPU** by the affinity filter, and on a 1-CPU boot that is
+the same CPU the spinner occupies. So every damage wake landed on a CPU already
+saturated by a Normal spinner, and the RT task had to fight for it.
+
+Adding `scheduler::yield_current()` to the ticker (NOT a sleep - the ticker is a
+preemption liveness demo and must stay runnable) gives a real win:
+
+| | damage->present max | pacing | test-para |
+|---|---|---|---|
+| before | ~214 ms | ~6.4 fps | x3.97 |
+| after | **~148-187 ms** | **~7-9 fps** | **x4.98** |
+
+Throughput improved too (x3.97 -> x4.98), because a spinning task was also
+stealing a whole core from the parallel benchmark.
+
+**Also tried and REVERTED: `yield_current()` in `clock_task`.** It hung the boot
+immediately after `shell [autoexec]: ls /` - no panic, no `#DF`, just no further
+output, harness FAILED. Isolated by stashing `main.rs` and re-running: the
+ticker yield and `kick_self` were both fine; this one was the hang. Root cause
+NOT yet understood. It stays out - a hang is not worth a micro-gain - but it is a
+real open question: `yield_current` from a kernel task is evidently not
+universally safe here, which matters before the compositor leans on cooperative
+yielding.
+
+**A third reverted candidate:** rewriting the `keep` condition in `plan_switch`
+to let a woken RT task preempt a running Normal one. It was a **no-op for the
+real case** (the flusher is priority 0, the top class, so no strictly-higher
+`best` can exist for it; and when `cur` is Normal the original already switches
+to a higher-priority `best`) AND it dropped the `slice_left` term, which would
+have broken slice enforcement between equal-priority peers.
+
+**The lesson:** the fix was not in the scheduler at all - it was a test/demo
+task that should never have been spinning. Before optimising a scheduling path,
+check what is actually running on the CPU you care about; a "low priority"
+spinner is worse than no priority scheme at all when affinity pins your real
+work next to it. And when an experiment measures worse, verify the TARGET
+before reversing - `kick_self` looked wrong only because the instrument was
+lying, and I nearly discarded a correct idea on bad data.

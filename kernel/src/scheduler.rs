@@ -806,24 +806,33 @@ pub fn wake_task_now(id: u64) -> bool {
             }
         }
     }
-    // M10b 9: a same-CPU wake is NOT self-IPI'd here. The reschedule IPI reaches
-    // this CPU's handler in arbitrary interrupt state, and a present-latency
-    // micro-optimization is not worth a #GP when it can preempt a task that is
-    // already inside the scheduler lock or mid-context. The local CPU still
-    // re-schedules on its next 1 ms tick; the frame-clock experiment (stage 9)
-    // shows the real win comes from removing CPU CONTENTION (running the load
-    // on a different core), not from shaving the same-CPU tick. Re-visit a safe
-    // local-wake (e.g. a flag the timer honours) only if measurements demand
-    // it.
+    // M10b 9 (REVISED, 2nd attempt - see KNOWLEDGE.md "wake split" for why the
+    // first attempt was reverted): a same-CPU wake DOES self-IPI now.
     //
-    // MEASURED (self-IPI added, then reverted): adding `smp::kick_self()` here
-    // made the instrumented park time WORSE, not better - avg actual sleep
-    // rose ~3770 us -> ~4750 us with no pacing improvement. So the local-CPU
-    // wake gap is NOT the tail either; the extra IPI is pure overhead. The
-    // `kick_self` helper remains in smp.rs (unwired) as the correct shape if a
-    // future change ever needs a genuinely safe local reschedule.
+    // The first attempt was reverted on the evidence that park time got worse
+    // (~3770 -> ~4750 us) with no pacing gain. That measurement was taken with
+    // a BROKEN instrument: `mark_dirty_rect` stamped the damage AFTER the wake,
+    // which forced the "hop B (scheduler)" bucket to read exactly 0 and made
+    // the whole tail look like "the wake is never fired". With the stamp order
+    // fixed, the split is unambiguous:
+    //
+    //   A(no-wake) avg=1-4 us   B(sched) avg=53-82 ms, max ~214 ms
+    //
+    // i.e. the wake fires almost instantly and the flusher then waits tens of
+    // ms for the CPU. And the affinity filter in `plan_switch` pins the
+    // flusher to its birth CPU, so the same-CPU case is the COMMON one - so
+    // without a local kick, a woken flusher waits out a full tick.
+    //
+    // Safety: an IPI, not a synchronous `preempt()`. The caller may hold
+    // subsystem locks (the damage path runs under the framebuffer DIRTY mutex),
+    // so switching away inline would abandon a critical section. An IPI is
+    // delivered at the next interrupt-enable point, by which time those locks
+    // are released, and the handler is the same shape as the timer IRQ that
+    // already reschedules 1000x a second. The scheduler guard is dropped above,
+    // so the handler cannot find SCHED_LOCK held.
     if woke {
         smp::kick_others();
+        smp::kick_self();
     }
     woke
 }
@@ -1298,6 +1307,16 @@ unsafe fn plan_switch(me: usize) -> Option<SwitchPlan> {
     if !cur_is_main {
         let rt = TASKS[cur].priority == PRIO_RT;
         let cur_prio = TASKS[cur].priority as u32;
+        // NOTE: a candidate rewrite of this condition was tried and reverted.
+        // The hypothesis was that the unconditional `|| rt` stops a woken RT
+        // task preempting a running Normal one. It does NOT: the flusher is RT
+        // (priority 0, the TOP class), so no strictly-higher `best` can exist
+        // for it, and when `cur` is the Normal drawing task the original
+        // condition already switches to the higher-priority `best`. The rewrite
+        // was a no-op for the real case AND dropped the `slice_left` term,
+        // which would have broken slice enforcement between equal-priority
+        // peers. Kept the original; the real cost is elsewhere (see the
+        // wake-latency split in KNOWLEDGE.md).
         let keep = cur_running
             && (best == MAIN_INDEX
                 || rt

@@ -416,6 +416,22 @@ fn ticker_task() {
             last_printed = t;
             serial_writeln!("[ticker] t={}", t);
         }
+        // P2: YIELD - do not spin. This task used to busy-loop with no sleep
+        // and no yield, so it was an always-runnable Normal task that
+        // permanently occupied its CPU. The present flusher (RT) is pinned to
+        // its birth CPU by the affinity filter in `plan_switch`, and on a
+        // single-CPU boot that is THIS cpu - so every time the flusher was
+        // woken by damage, the spinner was still sitting there and the RT
+        // task had to fight for the CPU on the next tick. Measured cost was
+        // the entire damage->present tail: the wake-latency split showed
+        // A(no-wake) avg=1-4 us but B(sched) avg=53-82 ms, max ~214 ms.
+        //
+        // `yield_current` is deliberate rather than a sleep: the ticker is a
+        // liveness demo, so it must stay runnable (a sleep would weaken the
+        // very property it exists to demonstrate - that it is preempted and
+        // resumed). Yielding keeps it runnable while guaranteeing it cannot
+        // monopolise the CPU against a higher-priority waiter.
+        scheduler::yield_current();
     }
 }
 
@@ -459,6 +475,14 @@ fn clock_task() {
                 );
             }
         }
+        // P2: a `yield_current()` was tried HERE and reverted - it hung the
+        // boot immediately after `shell [autoexec]: ls /` (no panic, no #DF,
+        // just no further output), and the harness reported FAILED. Isolated by
+        // stashing main.rs and re-running: the ticker yield + kick_self were
+        // fine, this one was the hang. Not yet understood, so it stays out
+        // rather than shipping a hang for a micro-gain. The `hlt()` below is
+        // NOT a yield: it parks only until the next interrupt, so this task
+        // still wakes often - it just never forces a switch.
         x86_64::instructions::hlt();
     }
 }
