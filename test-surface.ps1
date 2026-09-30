@@ -26,12 +26,13 @@ $p = Start-Process -FilePath $qemu `
     -ArgumentList @('-drive', "format=raw,file=$img", '-display', 'none', '-serial', "file:$log", '-no-reboot', '-snapshot') `
     -WindowStyle Hidden -PassThru
 
-# Poll for the completion marker, with a ceiling.
+# Poll for both completion markers, with a ceiling.
 $deadline = (Get-Date).AddSeconds(90)
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 5
     if (Test-Path $log) {
-        if (Select-String -Path $log -Pattern '\[surface\] done:' -Quiet) { break }
+        if ((Select-String -Path $log -Pattern '\[surface\] done:' -Quiet) -and
+            (Select-String -Path $log -Pattern '\[blit\] P6a stage 2 self-test done' -Quiet)) { break }
         if ($p.HasExited) { break }
     }
 }
@@ -41,13 +42,15 @@ Start-Sleep -Milliseconds 800
 
 $lines = Get-Content $log -ErrorAction SilentlyContinue
 Write-Host "qemu self-exited (crash indicator): $selfExited"
-Write-Host '=== surface self-test ==='
+Write-Host '=== surface self-test (stage 1) ==='
 $lines | Select-String -Pattern '\[surface\]' | ForEach-Object { $_.Line }
+Write-Host '=== blit self-test (stage 2) ==='
+$lines | Select-String -Pattern '\[blit\]' | ForEach-Object { $_.Line }
 
 $fail = @()
 if ($selfExited) { $fail += 'QEMU self-exited (crash)' }
 
-# Every check the self-test can print. Asserting the full list is the point:
+# Every check the self-tests can print. Asserting the full list is the point:
 # a missing line means the check never ran, which is a FAILURE, not a skip.
 $required = @(
     'PASS create',
@@ -58,17 +61,25 @@ $required = @(
     'PASS damage: take_damage clears',
     'PASS destroy',
     'PASS reuse',
-    '\[surface\] done:'
+    '\[surface\] done:',
+    # stage 2
+    'PASS fill clip',
+    'PASS fill: pixel written inside',
+    'PASS blit rect',
+    'PASS ramp',
+    'PASS damage: destination marked',
+    'PASS rejects: partial-source blit clamped',
+    '\[blit\] P6a stage 2 self-test done'
 )
 foreach ($r in $required) {
     if (-not ($lines | Select-String -Pattern $r -Quiet)) {
         $fail += "missing surface marker: $r"
     }
 }
-# No FAILED line may appear.
-if ($lines | Select-String -Pattern '\[surface\] FAILED') {
-    $lines | Select-String -Pattern '\[surface\] FAILED' | ForEach-Object { Write-Host "  $($_.Line)" }
-    $fail += 'surface self-test reported FAILED'
+# No FAILED line may appear, from either stage.
+if ($lines | Select-String -Pattern '\[(surface|blit)\] FAILED') {
+    $lines | Select-String -Pattern '\[(surface|blit)\] FAILED' | ForEach-Object { Write-Host "  $($_.Line)" }
+    $fail += 'surface/blit self-test reported FAILED'
 }
 # Corruption guards, same as every other suite.
 if ($lines | Select-String -Pattern 'PANIC|DOUBLE FAULT') { $fail += 'kernel fault reported' }

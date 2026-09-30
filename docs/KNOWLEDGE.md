@@ -836,3 +836,51 @@ prove a zero-sized request is rejected.)
 the EXISTING `framebuffer::mark_dirty_public` so the present flusher picks
 surfaces up with no new present mechanism.
 
+### P6a stage 2: fill + blit, and a ramp test that actually tests the blit
+
+`surface::fill(id, x, y, w, h, rgb)` and `surface::blit(dst, src, dx, dy, sx, sy,
+w, h)`, both clipping silently (a rect hanging off the edge draws the visible
+part, like a GPU blit) and both returning the rect they ACTUALLY wrote, so a
+compositor doing dirty-rect maths can check it rather than assume it.
+
+Two decisions worth stating, because they are the ones a future window manager
+will depend on:
+
+* **Damage is recorded on the DESTINATION only.** A blit READS the source, so the
+  source's pixels did not change; marking it would schedule a pointless
+  re-present of a window that was merely looked at. That single distinction is
+  the difference between a compositor costing one present per frame and one
+  costing two. The self-test asserts it explicitly.
+* **A zero-area rect writes nothing and records no damage**, so a fully-clipped
+  window cannot manufacture a phantom present.
+
+The blit validates the SOURCE rect before touching the destination - a partial
+read would otherwise run off the end of the source's backing, which is the one
+memory hole this function could have. Same-format copies convert through
+`0xRRGGBB` for correctness by construction; stage 3 adds a same-format fast path
+only if the profiler says it matters.
+
+**The test that matters is the RAMP, not the bounds checks.** Stage 1's checks
+would all pass with the blit body entirely replaced by a no-op. So stage 2 writes
+a surface where **every pixel encodes its own (x, y)**, blits it at an ODD offset
+(5, 3) - odd in both axes, so a wrong stride or an off-by-one cannot hide - and
+verifies every destination pixel still carries the SOURCE coordinate it came
+from:
+
+```
+[blit] PASS fill clip: asked 16x16 at (24,8), wrote 8x8
+[blit] PASS fill: pixel written inside, nothing written outside
+[blit] PASS blit rect: wrote 8x4 at (5,3)
+[blit] PASS ramp: all 32 blitted pixels carry their SOURCE (x,y)
+[blit] PASS damage: destination marked, source NOT marked by a read
+[blit] PASS rejects: partial-source blit clamped, bad dst / zero-area refused
+```
+
+**The lesson, refining stage 1's:** a test suite must contain a check that FAILS
+when the interesting code is deleted. Stage 1's suite had none - it would have
+passed with `put_pixel` stubbed out - which is why the id/index bug it caught
+surfaced only because the first assertion happened to run create-then-geometry
+in that order. The ramp is that missing check: stub the blit and it fails
+immediately. When adding the next stage, ask what the suite would look like with
+the new function removed.
+

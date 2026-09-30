@@ -255,6 +255,136 @@ pub fn put_pixel(id: SurfaceId, x: usize, y: usize, rgb: u32) -> Result<(), &'st
     }
 }
 
+/// Fill a rectangle with a solid `0xRRGGBB` colour, clipped to the surface, and
+/// union the written rect into the surface's damage.
+///
+/// Clipping is silent and non-fatal: a rectangle that hangs off the edge draws
+/// the visible part, exactly as a GPU blit would. Rejecting the whole call would
+/// make every caller do its own bounds arithmetic, and every caller would get it
+/// wrong once. Returns the rect actually written so tests (and a future
+/// compositor doing dirty-rect maths) can check it.
+///
+/// A zero-area rect writes nothing and records no damage - so a
+/// `blit` of a fully-clipped window cannot manufacture a phantom present.
+pub fn fill(id: SurfaceId, x: usize, y: usize, w: usize, h: usize, rgb: u32) -> Result<(usize, usize, usize, usize), &'static str> {
+    if w == 0 || h == 0 {
+        return Err("surface: zero-area fill");
+    }
+    let _g = LOCK.lock();
+    unsafe {
+        let s = TABLE
+            .get_mut(id as usize)
+            .and_then(|s| s.as_mut())
+            .ok_or("surface: not live")?;
+        let x0 = x.min(s.width);
+        let y0 = y.min(s.height);
+        let x1 = (x + w).min(s.width);
+        let y1 = (y + h).min(s.height);
+        if x0 >= x1 || y0 >= y1 {
+            return Err("surface: fill entirely outside the surface");
+        }
+        let raw = match s.format {
+            Format::Rgb8888 => rgb & 0x00FF_FFFF,
+            Format::B8G8R8X8 => (rgb & 0xFF) << 16 | (rgb & 0xFF00) | (rgb >> 16),
+        };
+        let va = s.va().ok_or("surface: no physical window")?;
+        // Row-at-a-time rather than per-pixel: the inner loop becomes a `u32`
+        // store, which is what makes a full-screen clear cheap enough to do
+        // every frame. A per-pixel bounds check here would be the single
+        // hottest loop in the whole compositor.
+        for row in y0..y1 {
+            let p = (va as *mut u32).add(row * s.width + x0);
+            for i in 0..(x1 - x0) {
+                core::ptr::write_volatile(p.add(i), raw);
+            }
+        }
+        union_damage(s, x0, y0, x1 - x0, y1 - y0);
+        Ok((x0, y0, x1 - x0, y1 - y0))
+    }
+}
+
+/// Copy a rectangle from one surface to another, with optional clipping on both
+/// sides, and union the written rect into the DESTINATION's damage only.
+///
+/// Damage is recorded on the destination and NOT the source: the source's own
+/// pixels did not change, so marking it would schedule a pointless re-present of
+/// a window that was merely read. That distinction is the difference between a
+/// compositor that costs one present per frame and one that costs two.
+///
+/// The copy always goes through `0xRRGGBB`, converting on the way in and out,
+/// so blitting between different formats is correct by construction rather than
+/// by a special case. That costs two shifts per pixel; stage 3 replaces it with
+/// a same-format fast path once the profiler says it matters.
+pub fn blit(
+    dst: SurfaceId,
+    src: SurfaceId,
+    dx: i32,
+    dy: i32,
+    sx: usize,
+    sy: usize,
+    w: usize,
+    h: usize,
+) -> Result<(usize, usize, usize, usize), &'static str> {
+    if w == 0 || h == 0 {
+        return Err("surface: zero-area blit");
+    }
+    let _g = LOCK.lock();
+    unsafe {
+        let Some(d) = TABLE.get_mut(dst as usize).and_then(|s| s.as_mut()) else {
+            return Err("surface: destination not live");
+        };
+        let Some(s) = TABLE.get(src as usize).and_then(|s| s.as_ref()) else {
+            return Err("surface: source not live");
+        };
+        // Reject anything the SOURCE cannot supply before touching the
+        // destination. A partial read would otherwise read past the source's
+        // backing - the one memory-safety hole this function could have.
+        if sx >= s.width || sy >= s.height {
+            return Err("surface: blit source rect outside the source");
+        }
+        let rw = w.min(s.width - sx);
+        let rh = h.min(s.height - sy);
+
+        // Clip against the destination, translating the source origin by the
+        // same amount so the two stay in step.
+        let dx0 = (dx.max(0) as usize).min(d.width);
+        let dy0 = (dy.max(0) as usize).min(d.height);
+        let dx1 = ((dx.max(0) as usize).saturating_add(rw)).min(d.width);
+        let dy1 = ((dy.max(0) as usize).saturating_add(rh)).min(d.height);
+        if dx0 >= dx1 || dy0 >= dy1 {
+            return Err("surface: blit entirely clipped off the destination");
+        }
+        // Skip the clipped-off top/left margin.
+        let skip_x = dx0 - (dx.max(0) as usize);
+        let skip_y = dy0 - (dy.max(0) as usize);
+        let span_x = dx1 - dx0;
+        let span_y = dy1 - dy0;
+
+        let sva = s.va().ok_or("surface: source has no physical window")?;
+        let dva = d.va().ok_or("surface: destination has no physical window")?;
+        for row in 0..span_y {
+            let srow = sy + skip_y + row;
+            let drow = dy0 + row;
+            let sp = (sva as *const u32).add(srow * s.width + sx + skip_x);
+            let dp = (dva as *mut u32).add(drow * d.width + dx0);
+            for col in 0..span_x {
+                let raw = core::ptr::read_volatile(sp.add(col));
+                let rgb = match s.format {
+                    Format::Rgb8888 => raw & 0x00FF_FFFF,
+                    Format::B8G8R8X8 => (raw & 0xFF) << 16 | (raw & 0xFF00) | (raw >> 16),
+                };
+                let out = match d.format {
+                    Format::Rgb8888 => rgb,
+                    Format::B8G8R8X8 => (rgb & 0xFF) << 16 | (rgb & 0xFF00) | (rgb >> 16),
+                };
+                core::ptr::write_volatile(dp.add(col), out);
+            }
+        }
+        union_damage(d, dx0, dy0, span_x, span_y);
+        Ok((dx0, dy0, span_x, span_y))
+    }
+}
+
 /// Take (and clear) the accumulated damage rect, exclusive bounds.
 pub fn take_damage(id: SurfaceId) -> Option<(usize, usize, usize, usize)> {
     let _g = LOCK.lock();

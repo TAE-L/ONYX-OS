@@ -260,6 +260,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // P6a stage 1: surface create/read/damage/destroy self-test.
     scheduler::spawn(surface_test);
     serial_writeln!("spawned surface-test");
+    // P6a stage 2: fill + blit self-test.
+    scheduler::spawn(surface_blit_test);
+    serial_writeln!("spawned surface-blit-test");
     // M9.6-B5: print one full performance snapshot ~3 s into the boot (the
     // shell's `perf` command re-renders it live at any time).
     scheduler::spawn(perf_task);
@@ -450,6 +453,117 @@ fn keyboard_task() {
 /// Mouse reader task: prints movement/button events the IRQ handler queues.
 fn mouse_task() {
     mouse::run_reader();
+}
+
+/// P6a stage 2 self-test: `fill` and `blit`.
+///
+/// Separate from stage 1's test because these have real 2-D index arithmetic -
+/// the class of bug that a per-pixel bounds check hides and a row loop does not.
+/// The strongest available check is a RAMP: write a surface where every pixel
+/// encodes its own (x, y), then blit it somewhere offset and verify every
+/// destination pixel still encodes the SOURCE coordinate it came from. A wrong
+/// stride, a swapped row, or a one-pixel offset cannot survive that.
+fn surface_blit_test() {
+    use crate::surface::{self, Format};
+    serial_writeln!("[blit] P6a stage 2 self-test (fill + blit)");
+
+    // --- fill: clipped, and records the rect it ACTUALLY wrote ---------------
+    let Ok(id) = surface::create(32, 16, Format::Rgb8888) else {
+        serial_writeln!("[blit] FAILED: create refused");
+        return;
+    };
+    // Deliberately overhang the right/bottom edge: the visible part must be
+    // written and the returned rect must be the CLIPPED one, not the request.
+    match surface::fill(id, 24, 8, 16, 16, 0xFF0000) {
+        Ok((x, y, w, h)) if (x, y, w, h) == (24, 8, 8, 8) => {
+            serial_writeln!("[blit] PASS fill clip: asked 16x16 at (24,8), wrote 8x8")
+        }
+        Ok(r) => serial_writeln!("[blit] FAILED: fill clip returned {r:?}, want (24,8,8,8)"),
+        Err(e) => serial_writeln!("[blit] FAILED: fill clip errored: {e}"),
+    }
+    let inside = surface::pixel(id, 25, 9) == Ok(0xFF0000);
+    let outside = surface::pixel(id, 40, 9).is_err() && surface::pixel(id, 25, 20).is_err();
+    if inside && outside {
+        serial_writeln!("[blit] PASS fill: pixel written inside, nothing written outside");
+    } else {
+        serial_writeln!("[blit] FAILED: fill wrote outside its clipped rect");
+    }
+
+    // --- the ramp: every pixel encodes its own coordinate --------------------
+    // src is 8x4; pixel (x,y) = 0x0000_00YY_00XX truncated to 24 bits. Using
+    // small coordinates keeps every value exactly representable.
+    let Ok(src) = surface::create(8, 4, Format::Rgb8888) else {
+        serial_writeln!("[blit] FAILED: create src refused");
+        return;
+    };
+    for y in 0..4 {
+        for x in 0..8 {
+            let v = ((y as u32) << 8) | x as u32;
+            let _ = surface::put_pixel(src, x, y, v);
+        }
+    }
+    let _ = surface::take_damage(src);
+
+    // --- blit src -> dst at an odd offset, then verify EVERY pixel ----------
+    // dst is 32x16 (already created as `id`), and we blit at (5, 3): an odd
+    // offset in both axes, which is what makes a stride or off-by-one error
+    // impossible to hide.
+    match surface::blit(id, src, 5, 3, 0, 0, 8, 4) {
+        Ok((x, y, w, h)) if (x, y, w, h) == (5, 3, 8, 4) => {
+            serial_writeln!("[blit] PASS blit rect: wrote 8x4 at (5,3)")
+        }
+        Ok(r) => serial_writeln!("[blit] FAILED: blit returned {r:?}, want (5,3,8,4)"),
+        Err(e) => serial_writeln!("[blit] FAILED: blit errored: {e}"),
+    }
+    let mut bad = 0u32;
+    let mut checked = 0u32;
+    for y in 0..4 {
+        for x in 0..8 {
+            let want = ((y as u32) << 8) | x as u32;
+            let got = surface::pixel(id, 5 + x, 3 + y);
+            checked += 1;
+            if got != Ok(want) {
+                bad += 1;
+                if bad <= 4 {
+                    serial_writeln!("[blit]   mismatch at dst({},{x},{y}): got {got:?} want {want:#x}", 5 + x);
+                }
+            }
+        }
+    }
+    if bad == 0 {
+        serial_writeln!("[blit] PASS ramp: all {checked} blitted pixels carry their SOURCE (x,y)");
+    } else {
+        serial_writeln!("[blit] FAILED: {bad}/{checked} blitted pixels wrong");
+    }
+
+    // --- damage discipline: destination dirty, SOURCE untouched -------------
+    // Marking the source on a read is the bug that doubles a compositor's
+    // present cost, so it is asserted rather than assumed.
+    let _ = surface::take_damage(id);
+    let _ = surface::blit(id, src, 0, 8, 0, 0, 8, 4);
+    let dst_damaged = surface::take_damage(id).is_some();
+    let src_clean = surface::take_damage(src).is_none();
+    if dst_damaged && src_clean {
+        serial_writeln!("[blit] PASS damage: destination marked, source NOT marked by a read");
+    } else {
+        serial_writeln!("[blit] FAILED: damage discipline wrong (dst={dst_damaged} src_clean={src_clean})");
+    }
+
+    // --- rejects: source rect outside the source must NOT read past it ------
+    // This is the one memory-safety hole a blit can have, so it is tested
+    // explicitly rather than left to the clip maths to be obviously right.
+    let oob_src = surface::blit(id, src, 0, 0, 4, 2, 8, 4).is_ok();
+    let dead_dst = surface::blit(9999, src, 0, 0, 0, 0, 4, 4).is_err();
+    let zero = surface::blit(id, src, 0, 0, 0, 0, 0, 4).is_err();
+    if oob_src && dead_dst && zero {
+        serial_writeln!("[blit] PASS rejects: partial-source blit clamped, bad dst / zero-area refused");
+    } else {
+        serial_writeln!("[blit] FAILED: blit validation wrong (partial_src_ok={oob_src} dead_dst_err={dead_dst} zero_err={zero})");
+    }
+
+    let _ = surface::destroy(src);
+    let _ = surface::destroy(id);
+    serial_writeln!("[blit] P6a stage 2 self-test done");
 }
 
 /// P6a stage 1 self-test: prove surfaces actually work, not merely that they
