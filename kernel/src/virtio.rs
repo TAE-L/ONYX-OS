@@ -1727,7 +1727,6 @@ pub fn flush_loop() {
         // (wake - mark) from "how long the submit itself took" (present - wake).
         // Without this split a large response is ambiguous between a pacing
         // problem and a scheduler/wake-latency problem.
-        let wake_ns = crate::time::now_ns();
         // Sleep on the ADAPTIVE quantum, not a fixed period: short while the
         // console is active, long once it is idle. The initial frame was
         // already pushed by `present_bringup`, so there is nothing to send on
@@ -1738,6 +1737,15 @@ pub fn flush_loop() {
             FLUSH_LATENCY_QUANTUM_MS
         };
         crate::scheduler::sleep_kernel(sleep_ms);
+        // M10b 5 (CORRECTED): the wake stamp is taken HERE, AFTER the sleep
+        // returns - not before it. It used to be stamped at the top of the
+        // loop, so `wake/schedule` actually measured "the previous iteration's
+        // sleep quantum + the previous submit" and charged the flusher's own
+        // back-off to the scheduler. That is what produced the phantom ~200 ms
+        // "wake/schedule" tail attributed to tick granularity: it was present
+        // with AND without the LAPIC divisor fix, because it was never the
+        // tick. Now the metric is the real scheduling wait.
+        let wake_ns = crate::time::now_ns();
         if !PRESENT.load(Ordering::Acquire) {
             continue;
         }
