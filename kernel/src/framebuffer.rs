@@ -618,6 +618,83 @@ static HW_CURSOR: AtomicBool = AtomicBool::new(false);
 /// the cursor queue is live; `false` restores software-cursor drawing.
 pub fn set_hardware_cursor(active: bool) {
     HW_CURSOR.store(active, Ordering::Release);
+    if active {
+        // The device now owns the pointer and `move_cursor` returns early, so
+        // nothing maintains the software sprite any more. Clearing this is what
+        // stops `refresh_cursor_save` from stamping new arrows into the
+        // framebuffer behind the hardware cursor's back (see `SW_VISIBLE`).
+        SW_VISIBLE.store(false, Ordering::Release);
+    }
+}
+
+/// Whether the software sprite is CURRENTLY stamped into the framebuffer, and
+/// is therefore being maintained (saved/restored) by the console write path.
+///
+/// This is the fix for the duplicated-cursor report. Two independent paths
+/// wrote software arrows into the framebuffer while the HARDWARE cursor was
+/// live and the only pointer the user could actually see:
+///
+/// 1. `refresh_cursor_save` ran after EVERY `console_bytes` call and called
+///    `draw_arrow` unconditionally - it never consulted `HW_CURSOR`.
+/// 2. `TextConsole::scroll_up` memmoves whole rows, so any sprite pixel in
+///    the scrolled region is COPIED UPWARD with the text and orphaned. Printing
+///    line after line therefore leaves a trail of static arrows marching up the
+///    screen - exactly "duplicated upward as the text keeps coming down", with
+///    the duplicates inert and only the hardware cursor live.
+///
+/// The invariant now: the software sprite is painted only while it is the
+/// cursor. Once the hardware cursor takes over, the flag clears and every
+/// software-sprite touch below becomes a no-op, so no ghost can ever be born.
+static SW_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+/// Restore the saved background over the sprite rect, removing the software
+/// sprite from the framebuffer. The caller re-stamps it afterwards.
+///
+/// Returns `true` if the software sprite was on screen and has now been
+/// removed, so the caller knows to re-stamp it after writing.
+///
+/// Used to bracket a console write so `scroll_up` cannot memmove sprite pixels
+/// upward. A no-op when the software sprite is not currently on screen, which
+/// is the steady state once the hardware cursor is live.
+pub fn hide_software_cursor() -> bool {
+    if !SW_VISIBLE.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+    let x = CUR_X.load(Ordering::Relaxed);
+    let y = CUR_Y.load(Ordering::Relaxed);
+    let cs = CUR_SCALE.load(Ordering::Relaxed).max(1);
+    let (sw, sh) = (CURSOR_W * cs, CURSOR_H * cs);
+    {
+        let mut slot = FB.lock();
+        let Some(w) = slot.as_mut() else { return false };
+        let bpp = w.info.bytes_per_pixel as usize;
+        let stride = w.info.stride as usize;
+        unsafe {
+            let save = &*core::ptr::addr_of!(SAVE);
+            for row in 0..sh {
+                let fy = y + row;
+                if fy >= w.info.height {
+                    break;
+                }
+                for col in 0..sw {
+                    let fx = x + col;
+                    if fx >= w.info.width {
+                        break;
+                    }
+                    let i = (fy * stride + fx) * bpp;
+                    if i + bpp > w.framebuffer.len() {
+                        break;
+                    }
+                    let s = (row * sw + col) * 4;
+                    for k in 0..bpp.min(4) {
+                        w.framebuffer[i + k] = save[s + k];
+                    }
+                }
+            }
+        }
+    }
+    mark_dirty_public(x, y, sw, sh);
+    true
 }
 
 /// The cursor sprite as raw `B8G8R8A8` pixels, scaled to the active scale,
@@ -697,6 +774,9 @@ pub fn init_global(writer: FrameBufferWriter<'static>) {
         save_region(w, x, y);
         draw_arrow(w, x, y);
     }
+    // The software sprite is now on screen and must be maintained by the
+    // console write path until the hardware cursor takes over.
+    SW_VISIBLE.store(true, Ordering::Release);
     // SAFETY: fb_ptr is a 'static buffer (bootloader framebuffer); the
     // CONSOLE mutex is the sole accessor for the console view.
     let fb: &'static mut [u8] = unsafe { &mut *fb_ptr };
@@ -748,6 +828,19 @@ pub fn adopt(framebuffer: &'static mut [u8], info: FrameBufferInfo) {
     let y = (info.height / 2).min(info.height.saturating_sub(CURSOR_H));
     CUR_X.store(x, Ordering::Relaxed);
     CUR_Y.store(y, Ordering::Relaxed);
+    // Re-arm the software sprite ON THE NEW SURFACE. Without this the fresh
+    // surface has a valid cursor position but a ZEROED save buffer (adopt
+    // clears it), so the first software-mode `restore_vacated` would stamp
+    // black over the old sprite rect. It also makes the later hardware-cursor
+    // handoff a clean erase of a sprite that is genuinely on screen.
+    {
+        let mut slot = FB.lock();
+        if let Some(w) = slot.as_mut() {
+            save_region(w, x, y);
+            draw_arrow(w, x, y);
+        }
+    }
+    SW_VISIBLE.store(true, Ordering::Release);
     // SAFETY: same discipline as `init_global`: `writable` is the 'static
     // buffer just handed to the writer, and `CONSOLE` is its only other view.
     let fb: &'static mut [u8] = unsafe { &mut *writable };
@@ -849,6 +942,7 @@ pub fn move_cursor(dx: i32, dy: i32) {
         capture_save(w, nx, ny, old_x, old_y);
     }
     draw_arrow(w, nx, ny);
+    SW_VISIBLE.store(true, Ordering::Release);
     CUR_X.store(nx, Ordering::Relaxed);
     CUR_Y.store(ny, Ordering::Relaxed);
 }
@@ -1404,6 +1498,16 @@ pub fn draw_anim_frame(i: u32) {
 
 pub fn console_bytes(data: &[u8]) {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        // P6b: take the software sprite OFF the framebuffer for the duration of
+        // the write. `scroll_up` memmoves whole rows, so a sprite inside the
+        // scrolled region would be copied upward and orphaned - one static ghost
+        // per scroll. `refresh_cursor_save` below re-stamps it afterwards. Both
+        // are no-ops when the hardware cursor is live, so the steady state
+        // costs one relaxed atomic load and takes no lock.
+        //
+        // The FB mutex is taken and RELEASED here, outside the CONSOLE lock
+        // below, so no code path ever holds the two in the opposite order.
+        let was_visible = hide_software_cursor();
         {
             let mut g = CONSOLE.lock();
             let Some(c) = g.as_mut() else { return };
@@ -1412,13 +1516,23 @@ pub fn console_bytes(data: &[u8]) {
             }
             CONSOLE_BYTES.fetch_add(data.len(), Ordering::Relaxed);
         }
-        refresh_cursor_save();
+        refresh_cursor_save(was_visible);
     });
 }
 
 /// Re-capture the cursor's save region + redraw the sprite, so the
 /// save/restore pair always reflects the latest console pixels underneath.
-fn refresh_cursor_save() {
+///
+/// P6b: this MUST be a no-op once the hardware cursor owns the pointer.
+/// It used to stamp a software arrow on every console write regardless, and
+/// `scroll_up` then carried each stamp upward - a trail of static, inert
+/// arrows over a screen where only the hardware cursor responded. Gating on
+/// `SW_VISIBLE` is what makes that impossible; it also skips the FB mutex in
+/// the steady state, so console output no longer contends with the mouse IRQ.
+fn refresh_cursor_save(redraw: bool) {
+    if !redraw {
+        return;
+    }
     let cx = CUR_X.load(Ordering::Relaxed);
     let cy = CUR_Y.load(Ordering::Relaxed);
     if cy < HEADER_BAR_H + 8 {

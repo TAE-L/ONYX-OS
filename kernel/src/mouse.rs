@@ -13,6 +13,7 @@
 //! ```
 
 use crate::serial_writeln;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
@@ -45,24 +46,63 @@ static mut FLAGS: u8 = 0;
 static mut DX: i16 = 0;
 
 /// Enable the mouse and start packet streaming. Call before enabling IRQ 12.
+///
+/// P6c (user report: "click the QEMU window while it is booting and the cursor
+/// never works again until I reboot"): the sequence used to abort on the FIRST
+/// bad acknowledgement, because `?` propagated out of `init`. A single stray
+/// byte in the i8042 output buffer - and clicking the window is exactly what
+/// produces one, since the click is a motion/button packet - was enough to make
+/// `send_command` read that byte instead of the `0xFA` ack. `init` then returned
+/// early, **before `0xF4`**, so the mouse was left with packet streaming
+/// disabled: it never sent another packet, and nothing in the system ever
+/// re-ran the sequence. A dead pointer until reboot.
+///
+/// Three changes, in order of importance:
+/// 1. The steps BEFORE `0xF4` no longer abort the sequence. Only the final
+///    enable is load-bearing, so it is the only one whose result is returned.
+/// 2. Streaming is switched OFF first (`0xF5`), so the mouse cannot inject new
+///    bytes into the middle of the handshake we are running.
+/// 3. The output buffer is drained before the config-byte exchange, discarding
+///    the POST `0xAA` and any already-in-flight motion byte.
 pub fn init() -> Result<(), &'static str> {
-    // Read the controller config byte, set the "aux enable" bit (1) and clear
-    // the "disable clock" bit (5), then write it back.
-    write_command(0x20)?; // GET_STATUS_BYTE
-    let status = read_data()? | 0x02;
-    write_command(0x60)?; // SET_STATUS_BYTE
-    write_data(status & !0x20)?;
+    let _ = send_command(0xF5); // DisablePacketStreaming - stop the byte flood
+    drain_output_buffer();
 
-    // (Re)set defaults, then configure and enable packet streaming. Each
-    // mouse command is routed through `0xD4` and acknowledged with `0xFA`.
-    send_command(0xF6)?; // SetDefaults
+    // Controller config byte: enable the aux port and clear "disable clock".
+    // Best effort - a failure here is survivable, `0xF4` below is not optional.
+    if write_command(0x20).is_ok() {
+        if let Ok(status) = read_data() {
+            let _ = write_command(0x60); // SET_STATUS_BYTE
+            let _ = write_data((status | 0x02) & !0x20);
+        }
+    }
+    drain_output_buffer();
+
+    // (Re)set defaults, then configure and enable packet streaming. Each mouse
+    // command is routed through `0xD4` and acknowledged with `0xFA`.
+    let _ = send_command(0xF6); // SetDefaults
     // Sample rate 200 Hz (gaming standard for PS/2): packets arrive 3-5x
     // more often with smaller deltas -> visibly smoother cursor motion and
     // almost no catch-up drift after the hand stops.
-    send_command(0xF3)?; // SetSampleRate
-    send_command(200)?;  // 200 samples / second
-    send_command(0xF4)?; // EnablePacketStreaming
-    Ok(())
+    let _ = send_command(0xF3); // SetSampleRate
+    let _ = send_command(200); // 200 samples / second
+    // The one step that must succeed: without it the mouse is silent forever.
+    send_command(0xF4) // EnablePacketStreaming
+}
+
+/// Discard every byte currently queued in the i8042 output buffer.
+///
+/// The lock guards are taken and released one at a time (the `CMD` temporary
+/// drops at the end of its statement), so this cannot invert against
+/// `read_data`/`write_data`, which also never hold both at once.
+fn drain_output_buffer() {
+    for _ in 0..64 {
+        let full = (unsafe { CMD.lock().read() } & OUTPUT_BUFFER_FULL) != 0;
+        if !full {
+            break;
+        }
+        let _ = unsafe { DATA.lock().read() };
+    }
 }
 
 /// Called from the IRQ-12 handler: assemble the 3-byte packet.
@@ -128,6 +168,9 @@ pub fn handle_irq() {
         }
     }
     if let Some((dx, dy, buttons)) = completed {
+        // Liveness stamp for the stall watchdog in `run_reader`.
+        SAW_PKT.store(true, Ordering::Relaxed);
+        LAST_PKT_MS.store(crate::apic::ms_since_boot(), Ordering::Relaxed);
         // B4: raw mouse event into the unified input ring (screen-space
         // deltas + held-button bitmask). Pushed from IRQ context.
         crate::input::push_mouse(dx as i32, -(dy as i32), buttons);
@@ -170,10 +213,54 @@ const MOUSE_IDLE_PARK_MS: u64 = 40;
 /// Park length right after a change, so a burst of moves still reports promptly.
 const MOUSE_ACTIVE_PARK_MS: u64 = 5;
 
+/// Liveness stamps for the stall watchdog, written by the IRQ handler and read
+/// by the reader task.
+static SAW_PKT: AtomicBool = AtomicBool::new(false);
+static LAST_PKT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Silence after which a previously-working mouse is presumed dead. QEMU
+/// streams continuously, so a gap this long means the device stopped sending.
+const MOUSE_STALL_MS: u64 = 1_500;
+/// Minimum gap between recovery attempts, so a genuinely absent mouse costs a
+/// bounded amount of work instead of retrying forever.
+const MOUSE_RETRY_COOLDOWN_MS: u64 = 5_000;
+
+/// Re-run the enable sequence after a stall, so a mouse that was knocked into a
+/// silent state recovers on its own instead of needing a reboot.
+///
+/// Gated on `SAW_PKT`: on a machine with no PS/2 mouse (the headless test runs)
+/// this never fires, so the suite cannot be disturbed by it.
+fn recover_streaming(now: u64) {
+    // `init` polls the i8042 with bounded loops and takes the port mutexes;
+    // holding the KSL keeps it off the IRQ's back, and IF=0 keeps this CPU out
+    // of the handler for the duration.
+    let _ksl = crate::ksl::lock();
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let _ = init();
+    });
+    LAST_PKT_MS.store(now, Ordering::Relaxed);
+    serial_writeln!(
+        "[mouse] no packet for {MOUSE_STALL_MS}ms - re-ran the PS/2 enable sequence"
+    );
+}
+
 pub fn run_reader() {
     let mut last: (i16, i16, bool, bool) = (0, 0, false, false);
     let mut last_logged = 0u64;
+    let mut next_retry = 0u64;
     loop {
+        // Watchdog: a mouse that worked and has since gone silent is re-armed
+        // rather than left dead until reboot. This is the general safety net
+        // behind the `init` fix - it covers any future way the device can wedge.
+        if SAW_PKT.load(Ordering::Relaxed) {
+            let now = crate::apic::ms_since_boot();
+            if now.saturating_sub(LAST_PKT_MS.load(Ordering::Relaxed)) >= MOUSE_STALL_MS
+                && now >= next_retry
+            {
+                next_retry = now + MOUSE_RETRY_COOLDOWN_MS;
+                recover_streaming(now);
+            }
+        }
         let cur = read_packet();
         let moved = cur.0 != 0 || cur.1 != 0;
         let buttons = cur.2 || cur.3;
@@ -256,12 +343,18 @@ fn write_data(value: u8) -> Result<(), &'static str> {
 fn send_command(value: u8) -> Result<(), &'static str> {
     write_command(0xD4)?; // next byte goes to the aux/mouse device
     write_data(value)?;
-    let ack = read_data()?;
-    if ack == 0xFA {
-        Ok(())
-    } else {
-        Err("mouse did not ack")
+    // The ack is normally the very next byte, but a motion packet already in
+    // flight can sit in the output buffer ahead of it. Consume a few stray
+    // bytes instead of failing outright: one mis-read ack must not be able to
+    // abort the enable sequence (see `init`).
+    for _ in 0..8 {
+        match read_data() {
+            Ok(0xFA) => return Ok(()),
+            Ok(_) => continue,
+            Err(e) => return Err(e),
+        }
     }
+    Err("mouse did not ack")
 }
 
 fn read_data() -> Result<u8, &'static str> {

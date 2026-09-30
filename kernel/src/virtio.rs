@@ -2563,9 +2563,14 @@ pub fn hardware_cursor_enable() -> bool {
         return false;
     }
     crate::framebuffer::set_hardware_cursor(true);
-    // Put it where the software sprite currently is, so the handoff is
-    // invisible: the pointer does not jump.
+    // P6c: ERASE the software sprite before handing over. Those pixels are baked
+    // into the framebuffer, and the hardware cursor never touches the surface
+    // again, so without this every position the software sprite ever occupied
+    // stays on screen as a static ghost (the user reported duplicated cursors
+    // trailing upward as text was printed). The hardware cursor is then placed
+    // at the sprite's old position, so the handoff is invisible.
     let (x, y) = crate::framebuffer::cursor_pos();
+    let _ = crate::framebuffer::hide_software_cursor();
     let _ = cursor_move(0, x as u32, y as u32);
     log(&alloc::format!(
         "[vgpu] cursor: hardware cursor live on queue 1 ({w}x{h} B8G8R8A8, moved via MOVE_CURSOR - zero framebuffer damage)"
