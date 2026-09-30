@@ -36,7 +36,7 @@ use crate::smp;
 use alloc::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const STACK_SIZE: usize = 64 * 1024;
 
@@ -874,6 +874,75 @@ pub fn yield_current() {
     preempt();
 }
 
+/// Task index that was RUNNING on the flusher's CPU during the window in which
+/// the flusher was Ready-but-not-running (hop B). 0 = idle, and
+/// `CONTENDER_UNSURE` when the CPU was idle at the sample.
+///
+/// P2: hop B (the wake fired, the flusher still waited) is the whole remaining
+/// damage->present tail. Knowing WHICH task held the CPU during that wait names
+/// the contender directly, instead of inferring it from source reading - which
+/// is how the ticker spinner was finally identified after two wrong guesses.
+/// Sampling is deliberately cheap (one relaxed load) and only happens while the
+/// flusher is Ready and not Running.
+pub const CONTENDER_UNSURE: u32 = u32::MAX;
+static HOPB_CONTENDER: AtomicU32 = AtomicU32::new(CONTENDER_UNSURE);
+static HOPB_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static HOPB_IDLE: AtomicU64 = AtomicU64::new(0);
+/// Scratch flag set by the flusher while it is Ready-and-waiting, so the
+/// scheduler knows a sample is worth taking.
+static HOPB_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Called by the flusher (virtio) to open/close the hop-B attribution window.
+///
+/// `open` arms a fresh window (counters reset). `close` STOPS SAMPLING but
+/// deliberately does NOT clear the counters - the report runs much later, in
+/// `report_flush`, and clearing here (an earlier version did) meant the report
+/// always read zeros and printed nothing. Same failure shape as the stamp-order
+/// and the swap-then-load bugs: a metric that can only ever read zero.
+pub fn hopb_open() {
+    HOPB_SAMPLES.store(0, Ordering::Relaxed);
+    HOPB_IDLE.store(0, Ordering::Relaxed);
+    HOPB_CONTENDER.store(CONTENDER_UNSURE, Ordering::Relaxed);
+    HOPB_ARMED.store(true, Ordering::Relaxed);
+}
+
+/// Stop sampling; leave the accumulated window for `hopb_report` to read.
+pub fn hopb_close() {
+    HOPB_ARMED.store(false, Ordering::Relaxed);
+}
+
+/// Attribute one hop-B wait sample to whoever holds this CPU right now.
+/// Called from the scheduler's decision path (caller holds SCHED_LOCK, IF=0).
+#[inline]
+fn hopb_sample(cur: usize) {
+    if HOPB_ARMED.load(Ordering::Relaxed) {
+        HOPB_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        if cur == MAIN_INDEX {
+            HOPB_IDLE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            HOPB_CONTENDER.store(cur as u32, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Report the hop-B contender's task id and its priority for the window.
+pub fn hopb_report() -> Option<(u32, u8, u64, u64)> {
+    let n = HOPB_SAMPLES.load(Ordering::Relaxed);
+    if n == 0 {
+        return None;
+    }
+    let c = HOPB_CONTENDER.load(Ordering::Relaxed);
+    let idle = HOPB_IDLE.load(Ordering::Relaxed);
+    let prio = unsafe {
+        if (c as usize) < TASK_COUNT {
+            TASKS[c as usize].priority
+        } else {
+            0
+        }
+    };
+    Some((c, prio, n, idle))
+}
+
 /// Context switches performed on the CALLING CPU so far (M9.8-f). A test can
 /// sample this before and after a piece of code to prove that preemptions
 /// really happened while that code was running.
@@ -1322,6 +1391,11 @@ unsafe fn plan_switch(me: usize) -> Option<SwitchPlan> {
                 || rt
                 || (TASKS[cur].slice_left > 0 && best_prio >= cur_prio));
         if keep {
+            // P2 diagnostic: we are about to NOT switch even though a Ready
+            // `best` exists. If the flusher armed this, that is one tick of
+            // hop-B wait - attribute it to whoever holds the CPU right now, so
+            // the contender can be NAMED instead of guessed at.
+            hopb_sample(cur);
             // Nothing more urgent (or still within our slice): no switch.
             // The B5 stall diagnostic assumes the boot CPU's always-Ready
             // ticker, so on an AP (whose only Ready work is its own worker

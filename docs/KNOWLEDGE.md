@@ -572,3 +572,55 @@ spinner is worse than no priority scheme at all when affinity pins your real
 work next to it. And when an experiment measures worse, verify the TARGET
 before reversing - `kick_self` looked wrong only because the instrument was
 lying, and I nearly discarded a correct idea on bad data.
+
+### Naming the contender: clock_task, and a per-pixel IPI storm
+
+Added a hop-B attribution counter (`scheduler::hopb_sample`, armed by the flusher
+around its park). It records WHO holds the CPU on each tick that declines to
+switch to the flusher. Result, consistent across every window:
+
+```
+[vgpu] hopB contender: idx=4 prio=1 (samples=14, idle_samples=0)
+```
+
+Task idx 4 = `clock_task` (0 idle, 1 diag, 2 ticker, 3 mouse, 4 clock), Normal
+priority, 14 samples - dominant. That is the SAME task whose `yield_current`
+hung the boot earlier, so contention and hang share a root cause.
+
+**The mechanism:** `clock_task` -> `framebuffer::draw_clock` runs inside
+`without_interrupts` holding the `FB` lock and redraws a glyph box pixel by
+pixel. Every `set_pixel` calls `mark_dirty` -> `wake_present_on_damage` ->
+`wake_task_now` -> reschedule IPI. So a single clock redraw fired THOUSANDS of
+wake attempts and IPIs from inside an interrupts-disabled section, repeatedly
+waking the flusher mid-redraw. The empty->non-empty edge only coalesces while
+the box stays non-empty, which does not bound a whole redraw.
+
+**Fix: a consumer-side coalescing latch.** `PRESENT_WAKE_PENDING` - the first
+damage fires one wake, every subsequent pixel until the flusher runs again is a
+no-op, and `flush_loop` re-arms it. This enforces "one wake per episode" from
+the side that actually knows when the episode ended, instead of inferring it
+from producer-side box state.
+
+| | park overshoot | max park | pacing | test-para |
+|---|---|---|---|---|
+| before | 2x | ~44 ms | ~7-9 fps | x4.98 |
+| after | **1x** | **~11-33 ms** | **~8.2-8.6 fps** | **x5.24** |
+
+Throughput rose again (x4.98 -> x5.24): the IPI storm was stealing real cycles
+from the parallel benchmark as well as delaying the flusher.
+
+**A latch whose clear is conditional is a hang.** The first version released the
+latch only after a successful `take_dirty_rect`. A wake that arrived with no
+consumable damage (generation moved, box already taken) left it latched
+FOREVER, so every later mark was silently swallowed and the display froze right
+after boot - `test-latency` FAILED. Fixed by clearing it unconditionally at the
+top of the pass, before any `continue`. This is the third instance of the same
+family in this session (stamp order, swap-then-load, close-clears-counters):
+**a metric or latch whose lifetime is managed conditionally will eventually read
+or hold a value nobody intended.**
+
+**The lesson:** measurement beat inference for the third time. Reading the code
+said "the scheduler is slow"; reading it again said "the spinner is the problem"
+(right, but only the FIRST of two); the attribution counter named `clock_task`
+in a single boot. And the fix was not in the scheduler at all - it was an IPI
+storm from a per-pixel hot path.

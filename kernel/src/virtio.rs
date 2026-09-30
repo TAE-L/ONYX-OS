@@ -1497,6 +1497,63 @@ static PRESENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 /// event-driven path's contribution is visible.
 static PRESENT_WAKEUPS: AtomicU64 = AtomicU64::new(0);
 
+/// Latch: a wake is owed to the flusher and has not been delivered/acted on yet.
+///
+/// P2: the damage path fires from `set_pixel`, i.e. ONCE PER PIXEL. A full-screen
+/// redraw (`draw_clock` erases a glyph box and re-renders it under IF=0) is
+/// thousands of pixels, and the empty->non-empty edge only coalesces them while
+/// the box stays non-empty - so each redraw could still produce a burst of
+/// wake attempts and IPIs from inside an interrupts-disabled section. Measured
+/// consequence: `clock_task` (task idx 4, prio Normal) was the DOMINANT hop-B
+/// contender in every window (14 samples), because the flusher kept being
+/// re-woken while the clock's redraw was still in progress.
+///
+/// The latch makes the wake strictly coalescing: the first damage after the
+/// flusher has consumed its box fires one wake; every subsequent pixel until it
+/// runs again is a no-op. `flush_loop` clears it after it has actually picked
+/// the damage up, so the NEXT damage episode wakes again. This is the same
+/// "wake once per episode" intent as the empty->non-empty edge, but enforced by
+/// the CONSUMER side (which is the only place that knows the episode ended)
+/// rather than by the producer's box state.
+static PRESENT_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Ask for a flusher wake, at most one outstanding per damage episode.
+/// Returns true if this call actually requested a wake.
+fn request_present_wake() -> bool {
+    if PRESENT_WAKE_PENDING.swap(true, Ordering::AcqRel) {
+        return false; // already owed - coalesce
+    }
+    let id = PRESENT_TASK_ID.load(Ordering::Acquire);
+    if id == 0 {
+        // Flusher not started yet: do not leave a stale latch set, or the
+        // first real damage after it starts would be swallowed.
+        PRESENT_WAKE_PENDING.store(false, Ordering::Release);
+        return false;
+    }
+    // Stamp BEFORE the wake attempt: this is "the instant something first
+    // noticed this damage", which is the boundary between the two hops.
+    DAMAGE_WAKE_NS.store(crate::time::now_ns(), Ordering::Release);
+    let woke = crate::scheduler::wake_task_now(id);
+    if woke {
+        PRESENT_WAKEUPS.fetch_add(1, Ordering::Relaxed);
+    }
+    woke
+}
+
+/// The flusher calls this once it has finished looking at the damage for this
+/// pass, re-arming the wake for the next episode.
+///
+/// It MUST be called on EVERY exit from the pass - not only on the
+/// take-some-damage path. The first version released it only after a
+/// successful `take_dirty_rect`, which latched permanently whenever a wake
+/// arrived with no consumable damage (generation moved but box already taken);
+/// after that, EVERY later damage was silently swallowed and the display froze
+/// after boot. Any latch whose clear is conditional is a hang waiting to
+/// happen - clear it unconditionally once the pass is done with it.
+fn release_present_wake() {
+    PRESENT_WAKE_PENDING.store(false, Ordering::Release);
+}
+
 /// TSC-ns stamp of the moment `wake_present_on_damage` actually fired (0 = it
 /// has not). Lets the flusher split its `wake/schedule` wait into
 /// "damage sat before anything tried to wake me" vs "the wake fired but I did
@@ -1595,16 +1652,7 @@ pub fn spawn_present_probe() {
 /// flusher publishes its task id, and no-op when the flusher is already
 /// Running/Ready (the wake is idempotent).
 pub fn wake_present_on_damage() {
-    let id = PRESENT_TASK_ID.load(Ordering::Acquire);
-    if id == 0 {
-        return; // flusher not started yet
-    }
-    // Stamp BEFORE the wake attempt: this is "the instant something first
-    // noticed this damage", which is the boundary between the two hops.
-    DAMAGE_WAKE_NS.store(crate::time::now_ns(), Ordering::Release);
-    if crate::scheduler::wake_task_now(id) {
-        PRESENT_WAKEUPS.fetch_add(1, Ordering::Relaxed);
-    }
+    request_present_wake();
 }
 
 /// M10b 5: how long a change waited for the flusher to be *scheduled* after
@@ -1769,7 +1817,13 @@ pub fn flush_loop() {
         };
         let sleep_req_ns = sleep_ms * 1_000;
         let sleep_t0 = crate::time::now_ns();
+        // P2 diagnostic: arm the hop-B attribution window for the whole park.
+        // Every scheduler tick that declines to switch to us while we are
+        // Ready counts as one tick of "woke but waiting", attributed to
+        // whoever held the CPU. Cleared when we are actually running again.
+        crate::scheduler::hopb_open();
         crate::scheduler::sleep_kernel(sleep_ms);
+        crate::scheduler::hopb_close();
         // How long the park ACTUALLY lasted vs what we asked for: the direct
         // test of tick quantisation (see FLUSH_SLEEP_* above). Non-scheduling,
         // so it is safe to gather while the tail is still unexplained.
@@ -1822,6 +1876,13 @@ pub fn flush_loop() {
         // response — what the adaptive cadence is measured on).
         let damage_marked = crate::framebuffer::damage_marked_ns();
 
+        // P2: re-arm the coalescing wake latch UNCONDITIONALLY, at the top of
+        // the pass - before any `continue` below. This is what keeps one screen
+        // redraw from firing thousands of IPIs (the damage path runs per pixel)
+        // while guaranteeing the latch can never stick. A conditional clear
+        // froze the display after boot, because a wake with no consumable
+        // damage left it latched and every later mark was swallowed.
+        release_present_wake();
         // There IS new damage: consume the box and present exactly it.
         let Some((x0, y0, x1, y1)) = crate::framebuffer::take_dirty_rect() else {
             // The generation moved but the box was empty (a mark that was
@@ -2016,6 +2077,20 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
             n_wake,
             sum_wake / n_wake,
             max_wake
+        ));
+    }
+    // P2: NAME the task that held the CPU during the hop-B wait. This is the
+    // direct answer to "what is still costing ~150 ms", replacing inference
+    // from source reading (which produced two wrong guesses before the ticker
+    // spinner was finally identified by measurement).
+    if let Some((c, prio, n, idle)) = crate::scheduler::hopb_report() {
+        let cname = if c == crate::scheduler::CONTENDER_UNSURE {
+            alloc::format!("unknown")
+        } else {
+            alloc::format!("idx={c} prio={prio}")
+        };
+        log(&alloc::format!(
+            "[vgpu] hopB contender: {cname} (samples={n}, idle_samples={idle})"
         ));
     }
     // Split the tail at the wake boundary. A dominant HOP A means the damage
