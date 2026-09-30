@@ -34,6 +34,7 @@ mod rtc;
 mod scheduler;
 mod serial;
 mod smp;
+mod compositor;
 mod surface;
 mod syscall;
 mod time;
@@ -258,15 +259,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // M9.6-A6: frame-allocator v2 regression (free-list LIFO + bump path).
     scheduler::spawn(mem_test);
     serial_writeln!("spawned mem-test");
-    // P6a stage 1: surface create/read/damage/destroy self-test.
-    scheduler::spawn(surface_test);
+    // P6 self-tests (surfaces, blit, font, compositor).
+    //
+    // Each sleeps BEFORE doing its work. At PRIO_NORMAL they competed with the
+    // boot-critical tests (fpu-test, argtest) for the single CPU and made
+    // `test-smp.ps1` report "fpu-test A PASSED marker missing" - a FALSE
+    // failure caused by a diagnostic stealing the CPU. At PRIO_IDLE they were
+    // worse: an always-Ready Normal task exists (the tickers), so IDLE work
+    // NEVER ran at all and the compositor test produced no output whatsoever.
+    //
+    // So: PRIO_NORMAL (so they actually run) plus a STAGGERED start, which lets
+    // the boot-critical tests finish first and leaves the self-tests to run in
+    // the gaps. The delays are cumulative by design - each test waits longer
+    // than the one before, so they never contend with each other either.
+    scheduler::spawn_prio(surface_test, scheduler::PRIO_NORMAL);
     serial_writeln!("spawned surface-test");
-    // P6a stage 2: fill + blit self-test.
-    scheduler::spawn(surface_blit_test);
+    scheduler::spawn_prio(surface_blit_test, scheduler::PRIO_NORMAL);
     serial_writeln!("spawned surface-blit-test");
-    // P6a stage 3: Lato TrueType parse + rasterize self-test.
-    scheduler::spawn(font_test);
+    scheduler::spawn_prio(font_test, scheduler::PRIO_NORMAL);
     serial_writeln!("spawned font-test");
+    scheduler::spawn_prio(compositor_test, scheduler::PRIO_NORMAL);
+    serial_writeln!("spawned compositor-test");
     // M9.6-B5: print one full performance snapshot ~3 s into the boot (the
     // shell's `perf` command re-renders it live at any time).
     scheduler::spawn(perf_task);
@@ -459,6 +472,157 @@ fn mouse_task() {
     mouse::run_reader();
 }
 
+/// P6b self-test: the compositor draws a real frame.
+///
+/// The stage-2 lesson applies: a test that only proves "the task ran" is worth
+/// nothing. These checks read PIXELS back, so deleting the render body, the
+/// title text, or the taskbar makes them fail. The title-ink check is the
+/// strongest of them: pixels inside the title bar that are neither the bar fill
+/// nor the border can only be glyph ink, so removing `draw_text` fails it.
+fn compositor_test() {
+    use crate::compositor::{palette, Compositor, TITLEBAR_H, TASKBAR_H};
+    use crate::surface;
+    // Staggered start: let the boot-critical tests (fpu-test, argtest) finish
+    // before a memory-hungry compositor test competes with them for the CPU.
+    // See the spawn-site comment for why PRIO_IDLE was not used instead.
+    crate::scheduler::sleep_kernel(4000);
+    serial_writeln!("[comp] P6b compositor self-test");
+
+    // Small screen: the point is correctness, not pixels. A full-size surface
+    // would allocate ~8 MB per run for no extra signal.
+    const SW: usize = 320;
+    const SH: usize = 200;
+    let mut c = match Compositor::new(SW, SH) {
+        Ok(c) => c,
+        Err(e) => {
+            serial_writeln!("[comp] FAILED: new: {e}");
+            return;
+        }
+    };
+    serial_writeln!("[comp] PASS new: {SW}x{SH} screen surface id={}", c.screen);
+
+    let _a = c.add_window("Files", 20, 20, 160, 100).unwrap_or(0);
+    let _b = c.add_window("Settings", 60, 50, 160, 100).unwrap_or(0);
+    if c.windows.len() == 2 {
+        serial_writeln!("[comp] PASS add_window: 2 windows, focus={:?}", c.focus);
+    } else {
+        serial_writeln!("[comp] FAILED: expected 2 windows, got {}", c.windows.len());
+        return;
+    }
+
+    // Exactly one window may claim focus - the split-brain shape P1A removed
+    // from the task CPU tag.
+    let focused = c.windows.iter().filter(|w| w.focused).count();
+    if focused == 1 {
+        serial_writeln!("[comp] PASS focus: exactly one window focused");
+    } else {
+        serial_writeln!("[comp] FAILED: {focused} windows claim focus (want 1)");
+    }
+
+    if c.render().is_ok() && c.frames == 1 {
+        serial_writeln!("[comp] PASS render: frame 1 composited");
+    } else {
+        serial_writeln!("[comp] FAILED: render failed (frames={})", c.frames);
+        return;
+    }
+
+    // --- backdrop ---------------------------------------------------------
+    let corner = surface::pixel(c.screen, 2, 2);
+    if corner == Ok(palette::BG) {
+        serial_writeln!("[comp] PASS backdrop: uncovered corner is BG");
+    } else {
+        serial_writeln!("[comp] FAILED: backdrop at (2,2) = {corner:?}");
+    }
+
+    // --- window interior --------------------------------------------------
+    let interior = surface::pixel(c.screen, 30, 90);
+    if interior.is_ok() && interior != Ok(palette::BG) {
+        serial_writeln!("[comp] PASS window: interior differs from backdrop ({interior:?})");
+    } else {
+        serial_writeln!("[comp] FAILED: window interior not drawn ({interior:?})");
+    }
+
+    // --- title TEXT (the strongest check) ----------------------------------
+    // Scan the WHOLE title bar (rows 20..40) rather than one row: a 13px glyph
+    // has ink on only some rows, so sampling a single row can land between two
+    // strokes of the letters and find nothing even when the text IS drawn.
+    // Anything in the bar that is not the bar fill, the border, or the accent
+    // can only be glyph ink.
+    let mut ink = 0u32;
+    for y in 20..40 {
+        for x in 24..(20 + 160 - 3) {
+            if let Ok(v) = surface::pixel(c.screen, x, y) {
+                if v != palette::TITLEBAR && v != palette::BORDER && v != palette::ACCENT {
+                    ink += 1;
+                }
+            }
+        }
+    }
+    if ink > 0 {
+        serial_writeln!("[comp] PASS title text: {ink} glyph-ink px in the title bar");
+    } else {
+        serial_writeln!("[comp] FAILED: no glyph ink in the title bar (text not drawn)");
+    }
+
+    // --- taskbar on top ---------------------------------------------------
+    let bar = surface::pixel(c.screen, SW / 2, SH - 3);
+    if bar == Ok(palette::TASKBAR) {
+        serial_writeln!("[comp] PASS taskbar: drawn on top of the window stack");
+    } else {
+        serial_writeln!("[comp] FAILED: taskbar pixel = {bar:?}");
+    }
+
+    // --- focus ring --------------------------------------------------------
+    // Sample the window's actual BORDER, not its title bar: (60,50) is inside
+    // window B and lands on the title fill, so it can never read as the accent.
+    // The border is the first pixel row of the window, above the title bar.
+    let focus_edge = surface::pixel(c.screen, 60, 50 + TITLEBAR_H + 8);
+    if focus_edge == Ok(palette::ACCENT) {
+        serial_writeln!("[comp] PASS focus ring: focused window border is ACCENT");
+    } else {
+        serial_writeln!("[comp] FAILED: focus ring colour = {focus_edge:?}");
+    }
+
+    // --- clipping ----------------------------------------------------------
+    // A window hanging off the right/bottom edge must not write outside the
+    // screen, and must not cover the taskbar.
+    let _ = c.add_window("Offscreen", SW - 20, SH - TASKBAR_H - 10, 300, 200);
+    let before_bar = surface::pixel(c.screen, SW / 2, SH - 3);
+    let r = c.render();
+    let after_bar = surface::pixel(c.screen, SW / 2, SH - 3);
+    if r.is_ok() && before_bar == after_bar {
+        serial_writeln!("[comp] PASS clipping: off-screen window did not cover the taskbar");
+    } else {
+        serial_writeln!(
+            "[comp] FAILED: clipping wrong (render={:?}, taskbar {before_bar:?} -> {after_bar:?})",
+            r.err()
+        );
+    }
+
+    // --- damage ------------------------------------------------------------
+    // Every frame must mark damage, or the present flusher would never push it.
+    let dmg = c.take_frame_damage();
+    if dmg.is_some() {
+        serial_writeln!("[comp] PASS damage: frame marked dirty {dmg:?}");
+    } else {
+        serial_writeln!("[comp] FAILED: composited frame marked no damage");
+    }
+    // A second identical frame also marks damage (a full repaint is not
+    // conditional), so a caller that only presents on change still works.
+    let _ = c.render();
+    if c.take_frame_damage().is_some() {
+        serial_writeln!("[comp] PASS damage: repeat frame also marked dirty");
+    } else {
+        serial_writeln!("[comp] FAILED: second frame marked no damage");
+    }
+
+    serial_writeln!(
+        "[comp] done: {} windows, {} frames",
+        c.windows.len(),
+        c.frames
+    );
+}
+
 /// P6a stage 3 self-test: the Lato TrueType pipeline, end to end.
 ///
 /// Same discipline as stages 1 and 2: this session has produced several bugs
@@ -468,6 +632,8 @@ fn mouse_task() {
 /// must map to a real glyph, and malformed bytes must be refused.
 fn font_test() {
     use crate::font;
+    // Staggered start (see the compositor test and the spawn-site comment).
+    crate::scheduler::sleep_kernel(3000);
     serial_writeln!(
         "[font] P6a stage 3 self-test ({}, {})",
         font::FONT_NAME,
@@ -493,24 +659,39 @@ fn font_test() {
     // makes that a one-glance check instead of a PowerShell byte-dig.
     serial_writeln!("[font] tables: {}", face.table_report());
 
-    // --- cmap: ASCII and Latin-1 beyond --------------------------------------
-    // The subset of Lato shipped here is a WEB build (275 glyphs, cmap format 4
-    // only, 84 segments), so it covers Latin + Latin-1 + punctuation and NOT
-    // symbols outside the BMP. Testing U+263A here would be testing a font
-    // feature that does not exist in this file - the correct expectation is
-    // that it maps to .notdef, and that is asserted rather than ignored.
+    // --- cmap coverage ---------------------------------------------------------
+    // The FULL Lato is embedded (3023 glyphs: Latin, Latin Extended, Greek,
+    // Cyrillic, Vietnamese), not the 275-glyph web subset. That is what the
+    // desktop actually needs, and it is why a separate symbol font is not
+    // required for ordinary UI text.
     let gid_a = face.glyph_for_char('A');
     let gid_z = face.glyph_for_char('Z');
     let gid_e = face.glyph_for_char('\u{e9}'); // U+00E9 e-acute, Latin-1
-    let gid_missing = face.glyph_for_char('\u{263a}'); // not in this subset
-    if gid_a != 0 && gid_a != gid_z && gid_e != 0 && gid_missing == 0 {
+    let gid_greek = face.glyph_for_char('\u{3b1}'); // U+03B1 alpha
+    let gid_cyr = face.glyph_for_char('\u{0416}'); // U+0416 Cyrillic Zhe
+    if gid_a != 0
+        && gid_a != gid_z
+        && gid_e != 0
+        && gid_greek != 0
+        && gid_cyr != 0
+        && gid_greek != gid_cyr
+    {
         serial_writeln!(
-            "[font] PASS cmap: A={gid_a} Z={gid_z} e-acute={gid_e}; U+263A absent (subset) -> .notdef"
+            "[font] PASS cmap: A={gid_a} Z={gid_z} e={gid_e} alpha={gid_greek} zhe={gid_cyr} (Latin+Greek+Cyrillic)"
         );
     } else {
         serial_writeln!(
-            "[font] FAILED: cmap wrong (A={gid_a} Z={gid_z} e={gid_e} missing={gid_missing})"
+            "[font] FAILED: cmap coverage (A={gid_a} Z={gid_z} e={gid_e} alpha={gid_greek} zhe={gid_cyr})"
         );
+    }
+    // A character genuinely absent from the font must map to .notdef, never to a
+    // random glyph - otherwise a missing character renders as WRONG TEXT, which
+    // is far harder to notice than a blank box.
+    let gid_absent = face.glyph_for_char('\u{10FFFD}');
+    if gid_absent == 0 {
+        serial_writeln!("[font] PASS cmap: unmapped char -> .notdef (no wrong-glyph aliasing)");
+    } else {
+        serial_writeln!("[font] FAILED: unmapped char aliased to gid {gid_absent}");
     }
 
     // --- outline must produce points for a letter ----------------------------

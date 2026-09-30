@@ -326,6 +326,7 @@ impl Face {
         let n = be16(self.data, self.cmap.off + 2).unwrap_or(0) as usize;
         let mut best12 = None;
         let mut best4 = None;
+        let mut best6 = None;
         for i in 0..n {
             let rec = self.cmap.off + 4 + i * 8;
             // The subtable offset is a FOUR-byte field, not two. Reading it with
@@ -342,6 +343,7 @@ impl Face {
             match be16(self.data, sub) {
                 Some(12) => best12 = Some(sub),
                 Some(4) if best4.is_none() => best4 = Some(sub),
+                Some(6) if best6.is_none() => best6 = Some(sub),
                 _ => {}
             }
         }
@@ -352,6 +354,11 @@ impl Face {
         }
         if let Some(sub) = best4 {
             if let Some(g) = self.cmap4(sub, cp) {
+                return g;
+            }
+        }
+        if let Some(sub) = best6 {
+            if let Some(g) = self.cmap6(sub, cp) {
                 return g;
             }
         }
@@ -380,6 +387,22 @@ impl Face {
             }
         }
         None
+    }
+
+    /// cmap format 6: a single flat trimmed table.
+    ///
+    /// Present in the FULL Lato (platform 1 / Mac, alongside format 4) and
+    /// absent from the web subset. It is the cheapest of the three formats and
+    /// trivial to support, so it is handled rather than ignored - a face that
+    /// offers format 6 on platform 1 is a hint about which table a Mac-derived
+    /// toolchain would have preferred.
+    fn cmap6(&self, sub: usize, cp: u32) -> Option<u16> {
+        let first = be16(self.data, sub + 6)? as u32;
+        let count = be16(self.data, sub + 8)? as u32;
+        if cp < first || cp >= first + count {
+            return None;
+        }
+        be16(self.data, sub + 10 + (cp - first) as usize * 2)
     }
 
     /// cmap format 4: segmented mapping, binary-searched over endCode.
@@ -739,6 +762,7 @@ fn quad(out: &mut Vec<(i32, i32)>, p0: (i32, i32), c: (i32, i32), p1: (i32, i32)
 /// blit into a surface are the caller's job - keeping the font free of colour
 /// means it composes over any background, which is what a windowed desktop
 /// needs, and it keeps this module from depending on the surface layer.
+#[derive(Clone)]
 pub struct Glyph {
     pub w: usize,
     pub h: usize,

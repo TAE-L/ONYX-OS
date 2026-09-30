@@ -385,6 +385,216 @@ pub fn blit(
     }
 }
 
+/// Alpha-blend an 8-bit coverage mask onto a surface as `rgb`, using
+/// source-over compositing, and union the written rect into the surface damage.
+///
+/// This is the bridge that makes `font::Glyph` drawable. The font module
+/// deliberately produces a bare alpha mask with no colour, so the SAME mask
+/// composites over a light or dark background without a second rasterization -
+/// which is exactly what a desktop needs (dark title bars, light document
+/// areas, one text path).
+///
+/// The blend is `dst = src*a + dst*(1-a)` with `a` in 0..=255, computed in u32
+/// and shifted back. Doing it in u8 would truncate the low bits of the product
+/// and visibly darken every antialiased edge - the "text looks slightly grey
+/// and thin" symptom.
+///
+/// Fully transparent pixels (a == 0) are SKIPPED rather than blended: blending
+/// zero would write the destination back unchanged but still cost a read-modify-
+/// write and, more importantly, would mark damage for a region that did not
+/// change. For a run of whitespace that is the difference between "no damage at
+/// all" and "a present every time you type a space".
+///
+/// Returns the rect actually written, or `None` if the mask was entirely
+/// transparent and therefore nothing was drawn.
+pub fn blend_mask(
+    id: SurfaceId,
+    x: usize,
+    y: usize,
+    mask: &[u8],
+    mw: usize,
+    mh: usize,
+    rgb: u32,
+) -> Result<Option<(usize, usize, usize, usize)>, &'static str> {
+    if mw == 0 || mh == 0 || mask.len() != mw * mh {
+        return Err("surface: bad mask geometry");
+    }
+    // A mask with no ink at all must not create damage (see the doc comment).
+    if !mask.iter().any(|&a| a != 0) {
+        return Ok(None);
+    }
+    let _g = LOCK.lock();
+    unsafe {
+        let s = TABLE
+            .get_mut(id as usize)
+            .and_then(|s| s.as_mut())
+            .ok_or("surface: not live")?;
+        // Clip the mask rect to the surface BEFORE indexing either buffer.
+        let x0 = x.min(s.width);
+        let y0 = y.min(s.height);
+        let x1 = (x + mw).min(s.width);
+        let y1 = (y + mh).min(s.height);
+        if x0 >= x1 || y0 >= y1 {
+            return Ok(None);
+        }
+        let va = s.va().ok_or("surface: no physical window")?;
+        let src = pack(rgb, s.format);
+
+        let mut touched = false;
+        for row in y0..y1 {
+            let my = row - y0; // row within the mask
+            for col in x0..x1 {
+                let a = mask[my * mw + (col - x0)];
+                if a == 0 {
+                    continue; // fully transparent: leave the destination alone
+                }
+                let p = (va as *mut u32).add(row * s.width + col);
+                let dst = core::ptr::read_volatile(p);
+                // Source-over in u32: `(src*a + dst*(255-a) + 127) / 255`, with
+                // the +127 rounding so a 50% blend does not always land low.
+                let blended = (src as u32 * a as u32 + dst as u32 * (255 - a) as u32 + 127) / 255;
+                core::ptr::write_volatile(p, blended);
+                touched = true;
+            }
+        }
+        if !touched {
+            return Ok(None);
+        }
+        let w = x1 - x0;
+        let h = y1 - y0;
+        union_damage(s, x0, y0, w, h);
+        Ok(Some((x0, y0, w, h)))
+    }
+}
+
+/// Pack a `0xRRGGBB` colour into the surface's native word layout.
+#[inline]
+fn pack(rgb: u32, f: Format) -> u32 {
+    match f {
+        Format::Rgb8888 => rgb & 0x00FF_FFFF,
+        Format::B8G8R8X8 => (rgb & 0xFF) << 16 | (rgb & 0xFF00) | (rgb >> 16),
+    }
+}
+
+/// Ascent in pixels for a given font size, so a caller can place a baseline
+/// without depending on `font` directly. Returns 0 if the face cannot be parsed,
+/// which the caller should treat as "do not draw text" rather than guess.
+pub fn line_ascent(size: u16) -> i32 {
+    match crate::font::Face::load() {
+        Ok(f) => f.line_metrics(size).ascent,
+        Err(_) => 0,
+    }
+}
+
+/// A glyph bitmap cache keyed by `(char, size)`.
+///
+/// P6b: the compositor draws a title per window per frame. Without a cache each
+/// of those re-parses the face AND re-rasterizes the same glyph, and
+/// `rasterize` allocates a `Vec` per outline - so a frame that draws 3 titles
+/// allocated ~10 MiB of short-lived vectors and ran the heap allocator out of
+/// contiguous space. Under TCG the bump allocator's failure path is a spin, so
+/// that presented as the compositor HANGING rather than as an allocation error.
+///
+/// Caching by (char, size) makes a repeated frame allocation-free in the steady
+/// state, which is what a compositor actually needs: the same few strings are
+/// redrawn every frame, forever.
+static GLYPH_CACHE: spin::Mutex<Option<alloc::collections::BTreeMap<(u32, u16), crate::font::Glyph>>> =
+    spin::Mutex::new(None);
+
+/// Maximum cached glyphs. A UI has a small working set (a dozen labels, two or
+/// three sizes); a hard cap keeps a pathological caller - text with thousands
+/// of distinct characters, at many sizes - from growing the cache without
+/// limit. When full, the cache is simply cleared and rebuilt, which is cheap
+/// and bounded.
+const GLYPH_CACHE_MAX: usize = 256;
+
+/// A cached, rasterized glyph. The alpha mask is COPIED out of the font's
+/// per-call vector so the cache owns it; the font's copy is dropped immediately.
+fn cached_glyph(ch: char, size: u16) -> Option<crate::font::Glyph> {
+    let key = (ch as u32, size);
+    let mut guard = GLYPH_CACHE.lock();
+    if guard.is_none() {
+        *guard = Some(alloc::collections::BTreeMap::new());
+    }
+    let map = guard.as_mut()?;
+    if let Some(g) = map.get(&key) {
+        return Some(g.clone());
+    }
+    // Render outside the borrow of the existing entries.
+    let face = crate::font::Face::load().ok()?;
+    let gid = face.glyph_for_char(ch);
+    let g = crate::font::rasterize(&face, gid, size);
+    if map.len() >= GLYPH_CACHE_MAX {
+        map.clear();
+    }
+    map.insert(key, g.clone());
+    Some(g)
+}
+
+/// Draw one line of text onto a surface, compositing the glyph alpha masks.
+///
+/// This is the first consumer of BOTH the font and the surface modules, and it
+/// deliberately lives here rather than in a separate text widget: the compositor
+/// needs to label windows, the clock and the taskbar, and all of them want the
+/// same primitive. `y` is the BASELINE, matching every font API, because a
+/// caller that has to think about ascender/descender arithmetic will get it
+/// wrong at least once.
+///
+/// Returns the advance width consumed, so a caller can lay out a row without
+/// re-measuring. Damage is recorded by [`blend_mask`], so the present path picks
+/// the text up with no extra plumbing.
+pub fn draw_text(
+    id: SurfaceId,
+    x: usize,
+    baseline_y: usize,
+    text: &str,
+    size: u16,
+    rgb: u32,
+) -> Result<i32, &'static str> {
+    let face = crate::font::Face::load()?;
+    let baseline = baseline_y as i32;
+    let mut pen = x as i32;
+    for ch in text.chars() {
+        // Cache-first: see GLYPH_CACHE. Re-rasterizing per character per frame
+        // exhausted the heap and hung the compositor.
+        let g = match cached_glyph(ch, size) {
+            Some(g) => g,
+            None => {
+                // Cache unavailable (no face): fall back to the advance only, so
+                // the caller still lays out correctly even if nothing draws.
+                pen += (face.advance(face.glyph_for_char(ch)) as i32 * size as i32)
+                    / face.units_per_em() as i32;
+                continue;
+            }
+        };
+        if g.w > 0 && g.h > 0 {
+            // `bearing_y` is the distance UP from the baseline to the mask top,
+            // so the mask's first row sits at `baseline - bearing_y`.
+            let gx = pen + g.bearing_x;
+            let gy = baseline - g.bearing_y;
+            if gx >= 0 && gy >= 0 {
+                let _ = blend_mask(
+                    id,
+                    gx as usize,
+                    gy as usize,
+                    &g.alpha,
+                    g.w,
+                    g.h,
+                    rgb,
+                )?;
+            }
+        }
+        pen += g.advance;
+    }
+    Ok(pen - x as i32)
+}
+
+/// `(width, height, Format)` of a live surface - the accessor the compositor
+/// needs before it can blit anything anywhere.
+pub fn info(id: SurfaceId) -> Result<(usize, usize, Format), &'static str> {
+    geometry(id)
+}
+
 /// Take (and clear) the accumulated damage rect, exclusive bounds.
 pub fn take_damage(id: SurfaceId) -> Option<(usize, usize, usize, usize)> {
     let _g = LOCK.lock();

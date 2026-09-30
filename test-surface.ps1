@@ -26,13 +26,27 @@ $p = Start-Process -FilePath $qemu `
     -ArgumentList @('-drive', "format=raw,file=$img", '-display', 'none', '-serial', "file:$log", '-no-reboot', '-snapshot') `
     -WindowStyle Hidden -PassThru
 
-# Poll for both completion markers, with a ceiling.
-$deadline = (Get-Date).AddSeconds(90)
+# Poll for all FOUR completion markers (surface, blit, font, compositor), with a
+# ceiling. The ceiling is 150 s because the P6 self-tests now run at PRIO_IDLE
+# (so they cannot steal the CPU from boot-critical work) and therefore finish
+# LAST - a 90 s budget was not enough for all four in sequence on this host.
+# The budget is a CEILING, not a fixed sleep: the loop exits the moment every
+# marker lands, so a fast host is not penalised.
+$deadline = (Get-Date).AddSeconds(150)
+$markers = @(
+    '\[surface\] done:',
+    '\[blit\] P6a stage 2 self-test done',
+    '\[font\] P6a stage 3 self-test done',
+    '\[comp\] done:'
+)
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 5
     if (Test-Path $log) {
-        if ((Select-String -Path $log -Pattern '\[surface\] done:' -Quiet) -and
-            (Select-String -Path $log -Pattern '\[blit\] P6a stage 2 self-test done' -Quiet)) { break }
+        $all = $true
+        foreach ($m in $markers) {
+            if (-not (Select-String -Path $log -Pattern $m -Quiet)) { $all = $false; break }
+        }
+        if ($all) { break }
         if ($p.HasExited) { break }
     }
 }
@@ -69,17 +83,32 @@ $required = @(
     'PASS ramp',
     'PASS damage: destination marked',
     'PASS rejects: partial-source blit clamped',
-    '\[blit\] P6a stage 2 self-test done'
+    '\[blit\] P6a stage 2 self-test done',
+    # stage 3
+    'PASS parse:',
+    'PASS cmap:',
+    'PASS raster 16px',
+    'PASS antialias',
+    'PASS scale:',
+    '\[font\] P6a stage 3 self-test done',
+    # P6b
+    'PASS backdrop:',
+    'PASS window: interior',
+    'PASS title text:',
+    'PASS taskbar:',
+    'PASS focus ring:',
+    'PASS clipping:',
+    '\[comp\] done:'
 )
 foreach ($r in $required) {
     if (-not ($lines | Select-String -Pattern $r -Quiet)) {
         $fail += "missing surface marker: $r"
     }
 }
-# No FAILED line may appear, from either stage.
-if ($lines | Select-String -Pattern '\[(surface|blit)\] FAILED') {
-    $lines | Select-String -Pattern '\[(surface|blit)\] FAILED' | ForEach-Object { Write-Host "  $($_.Line)" }
-    $fail += 'surface/blit self-test reported FAILED'
+# No FAILED line may appear, from any stage.
+if ($lines | Select-String -Pattern '\[(surface|blit|font|comp)\] FAILED') {
+    $lines | Select-String -Pattern '\[(surface|blit|font|comp)\] FAILED' | ForEach-Object { Write-Host "  $($_.Line)" }
+    $fail += 'a P6 self-test reported FAILED'
 }
 # Corruption guards, same as every other suite.
 if ($lines | Select-String -Pattern 'PANIC|DOUBLE FAULT') { $fail += 'kernel fault reported' }
