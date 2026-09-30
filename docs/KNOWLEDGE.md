@@ -402,3 +402,39 @@ concluding that a refactor/rename broke something, check whether the symptom is
 latter is a kernel bug. `Invoke-Boot` now polls the log every 5 s until all its
 `-Wait` markers appear, with the old duration kept only as a ceiling, so a busy
 host can no longer manufacture a red suite.
+
+### The `wake/schedule` tail was a MEASUREMENT bug, then a real one
+
+`flush_loop` stamped `let wake_ns = now_ns()` at the TOP of its loop, **before**
+`sleep_kernel(sleep_ms)` - while the comment directly above it said "stamp the
+moment we come back from sleep". So the reported `wake/schedule = wake_ns -
+damage_marked` was really *"the previous iteration's sleep quantum + the previous
+submit"*: the flusher's own idle back-off, charged to the scheduler. That is the
+phantom ~200 ms tail that got attributed to tick granularity. The stamp now lives
+immediately after `sleep_kernel` returns, so the metric measures what it claims.
+
+Worth stating plainly: **fixing the metric did not shrink the tail.** Post-fix
+serial still shows `wake/schedule n=2 avg=90958 us max=181864 us` and pacing
+~6.4 fps. That is the useful outcome - the number is now honest, and the tail is
+GENUINE scheduling latency, not a measurement artifact and not the LAPIC tick
+(which cannot explain ~200 ms from a ~1-5 ms tick anyway).
+
+Where the time actually goes, from reading the code:
+
+- `mark_dirty_rect` only calls `wake_present_on_damage()` on the
+  **empty -> non-empty transition** (`framebuffer.rs:230`). A burst keeps the box
+  non-empty, so it wakes ONCE; the rest of the burst is picked up on the flusher's
+  next quantum. So most damage does not get an event-driven wake at all.
+- `wake_task_now` promotes Sleeping -> Ready and calls `smp::kick_others()`, which
+  IPIs *other* CPUs only. It deliberately does NOT reschedule the local CPU
+  (`scheduler.rs:817-825`, a conscious choice to avoid a #GP from an IPI landing
+  inside the scheduler lock). So a same-CPU damage wake waits out a full tick.
+- The affinity filter (`plan_switch:1279`) pins the flusher to its birth CPU, so
+  the local-CPU case is the COMMON case, not the rare one.
+
+**The lesson:** fix the instrument before you tune against it, and re-measure
+after - a corrected metric that does NOT move the number is a strong result,
+because it eliminates a whole class of hypothesis. Also: a metric computed
+one line away from where its comment says it is computed will quietly measure the
+wrong thing forever, and the wrong thing will look plausible enough to build a
+whole theory on.
