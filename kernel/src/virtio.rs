@@ -1497,6 +1497,15 @@ static PRESENT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 /// event-driven path's contribution is visible.
 static PRESENT_WAKEUPS: AtomicU64 = AtomicU64::new(0);
 
+/// TSC-ns stamp of the moment `wake_present_on_damage` actually fired (0 = it
+/// has not). Lets the flusher split its `wake/schedule` wait into
+/// "damage sat before anything tried to wake me" vs "the wake fired but I did
+/// not get the CPU for a long time". Without this split, a large
+/// damage->present is ambiguous between a missed wake and a slow reschedule,
+/// and both of the obvious fixes for this tail (tick divisor, local self-IPI)
+/// turned out to be wrong - so measure the hop, do not assume it.
+static DAMAGE_WAKE_NS: AtomicU64 = AtomicU64::new(0);
+
 /// M10b 8: the kernel frame clock. Draws one animated frame per tick (via
 /// `framebuffer::draw_anim_frame`) at a target cadence, so the flusher presents
 /// a continuous stream of frames. The pacing counters in the report then measure
@@ -1590,6 +1599,9 @@ pub fn wake_present_on_damage() {
     if id == 0 {
         return; // flusher not started yet
     }
+    // Stamp BEFORE the wake attempt: this is "the instant something first
+    // noticed this damage", which is the boundary between the two hops.
+    DAMAGE_WAKE_NS.store(crate::time::now_ns(), Ordering::Release);
     if crate::scheduler::wake_task_now(id) {
         PRESENT_WAKEUPS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1602,6 +1614,12 @@ pub fn wake_present_on_damage() {
 static WAKE_WAIT_SUM_US: AtomicU64 = AtomicU64::new(0);
 static WAKE_WAIT_MAX_US: AtomicU64 = AtomicU64::new(0);
 static WAKE_WAIT_N: AtomicU64 = AtomicU64::new(0);
+/// HOP A: damage sat with nobody acting on it (missed / rare wake).
+static WAKE_A_SUM_US: AtomicU64 = AtomicU64::new(0);
+static WAKE_A_MAX_US: AtomicU64 = AtomicU64::new(0);
+/// HOP B: the wake fired but the flusher did not get the CPU until now.
+static WAKE_B_SUM_US: AtomicU64 = AtomicU64::new(0);
+static WAKE_B_MAX_US: AtomicU64 = AtomicU64::new(0);
 /// How long `sleep_kernel` ACTUALLY took, versus the `sleep_ms` the flusher
 /// asked for. The scheduler's time base is the LAPIC tick, so a request is
 /// quantised to the tick period - and the tick is known to run ~5x slower than
@@ -1845,6 +1863,28 @@ pub fn flush_loop() {
                     WAKE_WAIT_N.fetch_add(1, Ordering::Relaxed);
                     WAKE_WAIT_SUM_US.fetch_add(w, Ordering::Relaxed);
                     WAKE_WAIT_MAX_US.fetch_max(w, Ordering::Relaxed);
+                    // Split the wait at the wake boundary. HOP A = damage sat
+                    // with NOBODY acting on it (a missed/rare wake - the
+                    // empty->non-empty transition means a burst gets ONE
+                    // wake). HOP B = the wake fired but the flusher did not
+                    // get the CPU until now (genuine reschedule latency).
+                    // Which hop dominates decides the fix, and guessing has
+                    // been wrong twice here.
+                    let wns = DAMAGE_WAKE_NS.load(Ordering::Acquire);
+                    if wns > damage_marked && wake_ns > wns {
+                        let a = (wns - damage_marked) / 1_000;
+                        let b = (wake_ns - wns) / 1_000;
+                        WAKE_A_SUM_US.fetch_add(a, Ordering::Relaxed);
+                        WAKE_A_MAX_US.fetch_max(a, Ordering::Relaxed);
+                        WAKE_B_SUM_US.fetch_add(b, Ordering::Relaxed);
+                        WAKE_B_MAX_US.fetch_max(b, Ordering::Relaxed);
+                    } else {
+                        // No wake stamp in this window: the damage was picked
+                        // up purely by the poll timer, so ALL of the wait is
+                        // "nobody acted on it".
+                        WAKE_A_SUM_US.fetch_add(w, Ordering::Relaxed);
+                        WAKE_A_MAX_US.fetch_max(w, Ordering::Relaxed);
+                    }
                 }
                 // M10b 4: the direct damage->present response (how long this
                 // change waited to be pushed) — the number the adaptive cadence
@@ -1976,6 +2016,25 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
             n_wake,
             sum_wake / n_wake,
             max_wake
+        ));
+    }
+    // Split the tail at the wake boundary. A dominant HOP A means the damage
+    // was never acted on promptly (a MISSED wake -> fix the wake trigger). A
+    // dominant HOP B means the wake fired and the CPU still did not come
+    // (reschedule latency -> fix the scheduler). These call for opposite
+    // changes, so this line is what picks between them.
+    // NOTE: reuse `n_wake` from the `swap` above. Re-loading the counter here
+    // would read the value that swap just ZEROED, so the split line could
+    // never print - the metric would silently report nothing.
+    if n_wake > 0 {
+        let a_sum = WAKE_A_SUM_US.swap(0, Ordering::Relaxed);
+        let a_max = WAKE_A_MAX_US.swap(0, Ordering::Relaxed);
+        let b_sum = WAKE_B_SUM_US.swap(0, Ordering::Relaxed);
+        let b_max = WAKE_B_MAX_US.swap(0, Ordering::Relaxed);
+        log(&alloc::format!(
+            "[vgpu] response: wake split n={n_wake} | A(no-wake) avg={} us max={a_max} us | B(sched) avg={} us max={b_max} us",
+            a_sum / n_wake,
+            b_sum / n_wake
         ));
     }
     // P2 decision input: requested vs ACTUAL park time. A large avg overshoot
