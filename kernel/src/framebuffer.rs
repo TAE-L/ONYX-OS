@@ -507,22 +507,87 @@ static CUR_Y: AtomicUsize = AtomicUsize::new(0);
 static mut ACC_X8: i32 = 0;
 static mut ACC_Y8: i32 = 0;
 
+/// Spike damper state, per axis, in 1/8-COUNT units (so 8 == one whole count).
+///
+/// See `apply_sensitivity`. A plain IIR low-pass, but ONLY applied while the
+/// motion is small - see that function for why the small/large split matters
+/// more than the filter coefficient.
+static mut SM_X8: i32 = 0;
+static mut SM_Y8: i32 = 0;
+
 /// Convert a raw packet delta into cursor pixels. IRQ-12 only (single writer).
 ///
-/// RAW 1:1 — NO acceleration, NO curve. The pointer stops exactly where the
-/// hand stops (the gamers' preference). Sub-pixel remainders accumulate so
-/// slow motion stays perfectly smooth and no counts are ever lost.
+/// Two stages:
+///
+/// 1. Acceleration, per axis, in fixed-point 1/8 steps:
+///    |v| <= 7   -> 1.0x   (pixel-perfect slow motion, zero loss)
+///    |v| ~ 32   -> 2.0x   (everyday desktop speed)
+///    |v| >= 96  -> 4.0x   (fast flicks cross the screen)
+/// 2. A spike damper on SMALL motion only (P6c).
+///
+/// Motion is integrated in 1/8-pixel units, so remainders carry over and no
+/// raw counts are ever dropped - slow drags glide instead of stepping.
+///
+/// P6c - WHY THE DAMPER EXISTS. The user could see "minute movements /
+/// vibrations" when the hand was nearly still. The cause is the gain curve
+/// itself: at |v| == 1 the gain is `8 + (1 >> 2)` = 8, i.e. exactly 1.0x, so a
+/// SINGLE count of sensor noise resolves to a WHOLE PIXEL, immediately. A
+/// steady hand sitting on the sensor produces a stream of +-1 counts, and each
+/// one is painted at full size - which reads as vibration. The sub-pixel
+/// accumulator cannot absorb this, because each sample already resolves to an
+/// integer pixel rather than a fraction of one.
+///
+/// The damper is a light IIR low-pass (alpha = 1/2, i.e. one-packet time
+/// constant) applied ONLY while |motion| is below 32 eighths (4 counts). While
+/// the motion is small the signal is dominated by noise, so smoothing it is
+/// nearly free of visible lag and kills the jitter: alternating +-1 counts
+/// converge to a sub-pixel value that the accumulator absorbs, and the pointer
+/// simply stops trembling.
+///
+/// Above that threshold the filter is BYPASSED (`/1`, no smoothing at all).
+/// Fast motion is dominated by real signal, not noise, and any smoothing there
+/// would be pure added lag on exactly the flicks where latency is most
+/// noticeable. So the cursor damps when it should and stays instant when it
+/// matters. The small/large split matters more here than the coefficient does.
 fn apply_sensitivity(dx: i32, dy: i32) -> (i32, i32) {
-    // Windows-style acceleration, per axis, in fixed-point 1/8 steps:
-    //   |v| <= 7   -> 1.0x   (pixel-perfect slow motion, zero loss)
-    //   |v| ~ 32   -> 2.0x   (everyday desktop speed)
-    //   |v| >= 96  -> 4.0x   (fast flicks cross the screen)
-    // Motion is integrated in 1/8-pixel units, so remainders carry over and
-    // no raw counts are ever dropped — slow drags glide instead of stepping.
-    let gain = |v: i32| -> i32 { (8 + (v.abs() >> 2)).min(32) };
+    /// Alpha = 1/2 while small, none while fast. The split is in 1/8-count
+    /// units, so 32 == 4 counts.
+    const SMOOTH_BELOW: i32 = 32;
+
+    /// Damp one axis. Returns the smoothed motion in 1/8-count units.
+    ///
+    /// Division by 2 uses `(d >> 1) + (d & 1)` rather than `/ 2`: a plain
+    /// integer halve truncates toward zero, so a steady input of 1 count
+    /// (d = 8, 4, 2, 1...) would stall at 7/8 and never converge. The
+    /// round-half-away-from-zero form always carries the last eighth, so the
+    /// filter actually reaches its target instead of asymptoting just under it.
+    fn damp(sm: *mut i32, v: i32) {
+        let t = v * 8; // counts -> 1/8-count units
+        // Raw-pointer form on purpose: this is IRQ-12 context and the statics
+        // are the caller's to name, so there is no borrow to hand out.
+        let d = t - unsafe { *sm };
+        unsafe {
+            *sm += if (*sm).abs() < SMOOTH_BELOW {
+                (d >> 1) + (d & 1)
+            } else {
+                d // large motion: no smoothing, so no added lag on a flick
+            };
+        }
+    }
+
+    let gain_of = |v8: i32| -> i32 { (8 + ((v8.abs() / 8) >> 2)).min(32) };
+
     unsafe {
-        let ax8 = *core::ptr::addr_of!(ACC_X8) + dx * gain(dx);
-        let ay8 = *core::ptr::addr_of!(ACC_Y8) + dy * gain(dy);
+        damp(core::ptr::addr_of_mut!(SM_X8), dx);
+        damp(core::ptr::addr_of_mut!(SM_Y8), dy);
+        let sx8 = *core::ptr::addr_of!(SM_X8);
+        let sy8 = *core::ptr::addr_of!(SM_Y8);
+        // sx8 is in 1/8-count units, so the count-domain gain applies after a
+        // `>> 3` back down. Kept in i64 for the multiply: a maximal i16 packet
+        // at 4.0x gain is ~1M eighths, and 8 more bits of headroom costs
+        // nothing on a path that runs once per IRQ.
+        let ax8 = *core::ptr::addr_of!(ACC_X8) + (((sx8 as i64) * (gain_of(sx8) as i64)) >> 3) as i32;
+        let ay8 = *core::ptr::addr_of!(ACC_Y8) + (((sy8 as i64) * (gain_of(sy8) as i64)) >> 3) as i32;
         let px = ax8 >> 3;
         let py = ay8 >> 3;
         *core::ptr::addr_of_mut!(ACC_X8) = ax8 & 7;
