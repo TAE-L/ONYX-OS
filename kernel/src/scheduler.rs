@@ -806,14 +806,6 @@ pub fn wake_task_now(id: u64) -> bool {
             }
         }
     }
-    // A state change must reach the OTHER cpus: without the reschedule IPI
-    // the newly-Ready task sits on the run queue until some cpu's next 1 ms
-    // timer tick happens to look at it - which is precisely the ~105 ms
-    // residual wake latency this was meant to remove. Every other state change
-    // in this file (spawn/exit/kill/set_priority) kicks for the same reason.
-    if woke {
-        smp::kick_others();
-    }
     // M10b 9: a same-CPU wake is NOT self-IPI'd here. The reschedule IPI reaches
     // this CPU's handler in arbitrary interrupt state, and a present-latency
     // micro-optimization is not worth a #GP when it can preempt a task that is
@@ -823,6 +815,16 @@ pub fn wake_task_now(id: u64) -> bool {
     // on a different core), not from shaving the same-CPU tick. Re-visit a safe
     // local-wake (e.g. a flag the timer honours) only if measurements demand
     // it.
+    //
+    // MEASURED (self-IPI added, then reverted): adding `smp::kick_self()` here
+    // made the instrumented park time WORSE, not better - avg actual sleep
+    // rose ~3770 us -> ~4750 us with no pacing improvement. So the local-CPU
+    // wake gap is NOT the tail either; the extra IPI is pure overhead. The
+    // `kick_self` helper remains in smp.rs (unwired) as the correct shape if a
+    // future change ever needs a genuinely safe local reschedule.
+    if woke {
+        smp::kick_others();
+    }
     woke
 }
 pub fn block_current_on_input() {

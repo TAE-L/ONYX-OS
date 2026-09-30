@@ -1602,6 +1602,19 @@ pub fn wake_present_on_damage() {
 static WAKE_WAIT_SUM_US: AtomicU64 = AtomicU64::new(0);
 static WAKE_WAIT_MAX_US: AtomicU64 = AtomicU64::new(0);
 static WAKE_WAIT_N: AtomicU64 = AtomicU64::new(0);
+/// How long `sleep_kernel` ACTUALLY took, versus the `sleep_ms` the flusher
+/// asked for. The scheduler's time base is the LAPIC tick, so a request is
+/// quantised to the tick period - and the tick is known to run ~5x slower than
+/// its nominal 1 ms (see the `calibrate_task` divisor bug in KNOWLEDGE.md).
+/// That makes this the direct test of "is the tail tick quantisation?": if
+/// actual ~= requested, quantisation is NOT the tail and the wake path is.
+/// If actual >> requested, quantisation IS the tail and the deadline timer
+/// (P2) is the fix. Cheap, non-scheduling, and it settles the question the
+/// previous two guesses could not.
+static FLUSH_SLEEP_N: AtomicU64 = AtomicU64::new(0);
+static FLUSH_SLEEP_REQ_US: AtomicU64 = AtomicU64::new(0);
+static FLUSH_SLEEP_ACT_US: AtomicU64 = AtomicU64::new(0);
+static FLUSH_SLEEP_ACT_MAX_US: AtomicU64 = AtomicU64::new(0);
 
 /// M10b 4 (frame pacing) — present-interval accounting. The interval between
 /// consecutive DAMAGE-driven pushes is the frame cadence the user actually
@@ -1736,7 +1749,19 @@ pub fn flush_loop() {
         } else {
             FLUSH_LATENCY_QUANTUM_MS
         };
+        let sleep_req_ns = sleep_ms * 1_000;
+        let sleep_t0 = crate::time::now_ns();
         crate::scheduler::sleep_kernel(sleep_ms);
+        // How long the park ACTUALLY lasted vs what we asked for: the direct
+        // test of tick quantisation (see FLUSH_SLEEP_* above). Non-scheduling,
+        // so it is safe to gather while the tail is still unexplained.
+        {
+            let act_us = (crate::time::now_ns() - sleep_t0) / 1_000;
+            FLUSH_SLEEP_N.fetch_add(1, Ordering::Relaxed);
+            FLUSH_SLEEP_REQ_US.fetch_add(sleep_req_ns, Ordering::Relaxed);
+            FLUSH_SLEEP_ACT_US.fetch_add(act_us, Ordering::Relaxed);
+            FLUSH_SLEEP_ACT_MAX_US.fetch_max(act_us, Ordering::Relaxed);
+        }
         // M10b 5 (CORRECTED): the wake stamp is taken HERE, AFTER the sleep
         // returns - not before it. It used to be stamped at the top of the
         // loop, so `wake/schedule` actually measured "the previous iteration's
@@ -1951,6 +1976,26 @@ fn report_flush(res: &GpuResource, ticks: u64, last_bytes: &mut u64, last_skippe
             n_wake,
             sum_wake / n_wake,
             max_wake
+        ));
+    }
+    // P2 decision input: requested vs ACTUAL park time. A large avg overshoot
+    // means the sleep is being quantised by something far coarser than the
+    // request (i.e. the tick), which is exactly the case a deadline timer
+    // fixes. A small overshoot RULES THAT OUT and points at the wake path.
+    let n_slp = FLUSH_SLEEP_N.swap(0, Ordering::Relaxed);
+    let req_slp = FLUSH_SLEEP_REQ_US.swap(0, Ordering::Relaxed);
+    let act_slp = FLUSH_SLEEP_ACT_US.swap(0, Ordering::Relaxed);
+    let max_slp = FLUSH_SLEEP_ACT_MAX_US.swap(0, Ordering::Relaxed);
+    if n_slp > 0 {
+        let req_avg = req_slp / n_slp;
+        let act_avg = act_slp / n_slp;
+        let over = if req_avg == 0 {
+            0
+        } else {
+            act_avg / req_avg
+        };
+        log(&alloc::format!(
+            "[vgpu] sleep: n={n_slp} req avg={req_avg} us, ACTUAL avg={act_avg} us max={max_slp} us ({over}x overshoot)"
         ));
     }
     // M10b 6: how many presents were driven by a damage-triggered wake (the

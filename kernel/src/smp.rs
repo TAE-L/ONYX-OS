@@ -693,6 +693,31 @@ pub fn send_ipi(dest_id: u32, vector: u8) {
     crate::apic::send_icr(dest_id, 0x0000_4000 | u32::from(vector));
 }
 
+/// Ask THIS cpu to re-run its scheduler right now.
+///
+/// A same-CPU wake is the common case for the present path, not a rare one: the
+/// affinity filter in `plan_switch` pins the flusher to its birth CPU, and the
+/// damage that wakes it is drawn by a task on that same CPU. Without this, a
+/// damage wake waits out a full LAPIC tick before the scheduler even looks at
+/// the newly-Ready task.
+///
+/// This is deliberately a reschedule IPI rather than a direct `preempt()` call.
+/// `wake_task_now` may be invoked from a drawing task that holds locks (the
+/// damage path runs under the framebuffer's DIRTY mutex), and preempting
+/// synchronously from there would switch away a task mid-critical-section. An
+/// IPI is delivered only at the next interrupt-enable point, by which time the
+/// caller has released its locks - and the handler is structurally identical to
+/// the timer IRQ, which already does exactly this 1000x a second.
+///
+/// Caller must NOT hold `SCHED_LOCK`: the IPI handler calls `preempt`, which
+/// takes it. `wake_task_now` sends this after dropping its scheduler guard.
+pub fn kick_self() {
+    let me = cpu_index();
+    let p = per_cpu_ptr(me);
+    let id = unsafe { (*p).lapic_id.load(Ordering::Relaxed) };
+    send_ipi(id, crate::apic::RESCHED_VECTOR);
+}
+
 /// Ask every other online CPU to re-run its scheduler right now (a task just
 /// became Ready). A no-op while only the BSP is online.
 pub fn kick_others() {

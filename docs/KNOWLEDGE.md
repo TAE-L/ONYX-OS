@@ -438,3 +438,45 @@ because it eliminates a whole class of hypothesis. Also: a metric computed
 one line away from where its comment says it is computed will quietly measure the
 wrong thing forever, and the wrong thing will look plausible enough to build a
 whole theory on.
+
+### Instrumented park time: tick quantisation is REAL, local-wake is NOT
+
+Added `[vgpu] sleep:` - requested vs ACTUAL `sleep_kernel` duration in the
+flusher. This is the direct test of "is the tail tick quantisation?":
+
+```
+[vgpu] sleep: n=50 req avg=1900 us, ACTUAL avg=3640 us max=31410 us (2x overshoot)
+```
+
+So quantisation IS real: a 1-16 ms request actually costs ~2x, and the 16 ms
+idle back-off really costs up to ~40-54 ms. My earlier claim that "a ~1-5 ms tick
+cannot explain a 200 ms tail" was right about magnitude and wrong to use as a
+dismissal - the overshoot compounds on every back-off sleep.
+
+But it is **not sufficient**: max park (~40 ms) is still well under max
+`wake/schedule` (~180 ms), so something else contributes too. This is why the
+P2 deadline timer is *necessary but not sufficient*.
+
+**Tried and REVERTED: self-IPI on a same-CPU wake.** The theory was strong - the
+affinity filter pins the flusher to its birth CPU, so the local-CPU case is the
+COMMON one, and `wake_task_now` deliberately declined to reschedule locally
+(`scheduler.rs:817`), so a damage wake should wait out a full tick. Added
+`smp::kick_self()` (an IPI, not a synchronous `preempt`, so it cannot abandon a
+caller's critical section) and called it from `wake_task_now`.
+
+Measured result: **worse, not better.** avg actual park rose ~3770 us ->
+~4750 us, with no pacing improvement (6.4 -> 6.5 fps, noise). The extra IPI per
+wake is pure overhead. Reverted the call; `kick_self` stays in `smp.rs` unwired,
+since it is the correct SHAPE for a safe local reschedule if a future change ever
+needs one. So the local-wake gap is NOT the tail either.
+
+That leaves the tail unexplained by either mechanism, which is the honest state.
+The next lead is `mark_dirty_rect`: it only wakes the flusher on the
+empty -> non-empty transition, so a burst of damage gets ONE wake and the rest
+waits for a poll quantum. Under a 2x-quantised tick that compounds.
+
+**The lesson:** a plausible mechanism plus a strong prior is still not evidence.
+Both of the obvious fixes here (tick divisor, local self-IPI) were wrong, and
+only the instrument separated them from the truth in one boot each. Also: a
+reverted experiment is a RESULT - write down what was tried and what it measured,
+or the next session will re-try it.
