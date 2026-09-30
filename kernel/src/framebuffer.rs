@@ -221,6 +221,27 @@ fn mark_dirty_rect(x0: usize, y0: usize, x1: usize, y1: usize) {
         None => (x0, y0, x1, y1),
     });
     drop(slot);
+    // Stamp and publish BEFORE the wake attempt, in this order, deliberately.
+    //
+    // The present path attributes latency by comparing the damage stamp
+    // against the wake stamp, so the damage stamp must be taken FIRST or the
+    // wake always looks like it happened "before" the damage and the
+    // scheduler hop measures as exactly zero. (An earlier version of this
+    // instrumentation called the wake first and reported a confident
+    // "scheduler latency is 0, the wake is never fired" - which was an
+    // artifact of this ordering, not a finding.) The generation is bumped
+    // before the wake too, so a flusher that is woken always already sees the
+    // new damage rather than having to wait for the next quantum.
+    //
+    // Stamp when this damage FIRST appeared (a burst keeps the earliest
+    // stamp), so the present path can measure how long the change waited.
+    if DIRTY_MARK_NS.load(Ordering::Acquire) == 0 {
+        DIRTY_MARK_NS.store(crate::time::now_ns(), Ordering::Release);
+    }
+    // Bump the generation AFTER releasing the lock: the present path only
+    // reads it, and bumping inside the lock would add an atomic RMW to the
+    // per-pixel hot path for no benefit.
+    DIRTY_GEN.fetch_add(1, Ordering::Relaxed);
     // M10b 6 (event-driven present): when the box transitions empty ->
     // non-empty, a NEW damage episode began; wake the flusher so it does not
     // wait out its back-off. Only on the transition (a burst keeps the box
@@ -229,15 +250,6 @@ fn mark_dirty_rect(x0: usize, y0: usize, x1: usize, y1: usize) {
     // still picked up on the flusher's next quantum via the generation change.
     if was_empty {
         crate::virtio::wake_present_on_damage();
-    }
-    // Bump the generation AFTER releasing the lock: the present path only
-    // reads it, and bumping inside the lock would add an atomic RMW to the
-    // per-pixel hot path for no benefit.
-    DIRTY_GEN.fetch_add(1, Ordering::Relaxed);
-    // Stamp when this damage FIRST appeared (a burst keeps the earliest
-    // stamp), so the present path can measure how long the change waited.
-    if DIRTY_MARK_NS.load(Ordering::Acquire) == 0 {
-        DIRTY_MARK_NS.store(crate::time::now_ns(), Ordering::Release);
     }
 }
 

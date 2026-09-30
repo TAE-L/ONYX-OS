@@ -480,3 +480,48 @@ Both of the obvious fixes here (tick divisor, local self-IPI) were wrong, and
 only the instrument separated them from the truth in one boot each. Also: a
 reverted experiment is a RESULT - write down what was tried and what it measured,
 or the next session will re-try it.
+
+### RETRACTED: "hop B is zero, the wake is never fired" was MY OWN BUG
+
+The wake-latency split first reported `A(no-wake) avg=39611..101177 us` and
+`B(sched) avg=0 us` - a clean, confident, and **completely wrong** conclusion
+that the scheduler was not the bottleneck and the wake never fired. It was an
+artifact of the order of two statements in `mark_dirty_rect`:
+
+```rust
+if was_empty { wake_present_on_damage(); }   // stamped T1
+DIRTY_GEN.fetch_add(1, ...);
+if DIRTY_MARK_NS.load(..) == 0 { DIRTY_MARK_NS.store(now_ns(), ..) }  // stamped T2
+```
+
+The damage stamp (`T2`) was taken AFTER the wake stamp (`T1`), so the guard
+`wns > damage_marked` was never true, every sample fell into the else-branch,
+and hop B was **structurally forced to zero**. Reordering the stamps (damage
+stamp first, then generation, then wake) gives the mirror-image answer:
+
+```
+[vgpu] response: wake split n=2 | A(no-wake) avg=2 us max=3 us | B(sched) avg=82611 us max=165151 us
+[vgpu] response: wake split n=4 | A(no-wake) avg=1 us max=2 us | B(sched) avg=53491 us max=213808 us
+```
+
+**The truth: the wake fires in 1-4 us, and essentially the ENTIRE tail
+(avg 53-82 ms, max ~214 ms) is HOP B - the flusher waiting to get the CPU
+back after being woken.** So the scheduler/reschedule path IS the bottleneck
+after all.
+
+This also explains the earlier confusing pair of results. The self-IPI
+(`kick_self`) was aimed at hop B, which is the right target - but it
+*increased* total IPI load and measured worse, so "worse" there was not
+evidence that hop B is unimportant; it was evidence that *that particular*
+implementation was bad. The tick divisor is likewise aimed at hop B (it
+shortens the quantum the flusher waits out) and DID regress throughput - a
+real latency-vs-throughput trade, not a wrong target.
+
+**The lesson, and it is the important one:** a metric whose guard depends on the
+ORDER of two timestamps can silently report a hard-coded zero, and a zero is
+the most convincing-looking result there is - it reads as "this dimension is
+eliminated", which is exactly the kind of claim that stops further
+investigation. This is the SAME failure shape as the `wake_ns` stamp one commit
+earlier (taken before the sleep instead of after). Before believing any
+"dimension is zero" result, ask what would make it zero *by construction*, and
+confirm the metric can print a NON-zero value at all.
