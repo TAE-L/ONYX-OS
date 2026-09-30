@@ -657,6 +657,17 @@ static SW_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// upward. A no-op when the software sprite is not currently on screen, which
 /// is the steady state once the hardware cursor is live.
 pub fn hide_software_cursor() -> bool {
+    let mut slot = FB.lock();
+    let Some(w) = slot.as_mut() else {
+        return false;
+    };
+    hide_software_cursor_locked(w)
+}
+
+/// Lock-free body of [`hide_software_cursor`]. Split out so a caller that
+/// ALREADY holds the FB lock (the console write path) can erase the sprite
+/// without dropping and re-taking it - see `console_bytes`.
+fn hide_software_cursor_locked(w: &mut FrameBufferWriter) -> bool {
     if !SW_VISIBLE.swap(false, Ordering::AcqRel) {
         return false;
     }
@@ -665,8 +676,6 @@ pub fn hide_software_cursor() -> bool {
     let cs = CUR_SCALE.load(Ordering::Relaxed).max(1);
     let (sw, sh) = (CURSOR_W * cs, CURSOR_H * cs);
     {
-        let mut slot = FB.lock();
-        let Some(w) = slot.as_mut() else { return false };
         let bpp = w.info.bytes_per_pixel as usize;
         let stride = w.info.stride as usize;
         unsafe {
@@ -1506,16 +1515,27 @@ pub fn draw_anim_frame(i: u32) {
 
 pub fn console_bytes(data: &[u8]) {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        // P6b: take the software sprite OFF the framebuffer for the duration of
+        // P6c: the sprite must come OFF the framebuffer for the duration of
         // the write. `scroll_up` memmoves whole rows, so a sprite inside the
-        // scrolled region would be copied upward and orphaned - one static ghost
-        // per scroll. `refresh_cursor_save` below re-stamps it afterwards. Both
-        // are no-ops when the hardware cursor is live, so the steady state
-        // costs one relaxed atomic load and takes no lock.
+        // scrolled region would be copied upward and orphaned - one static
+        // ghost per scroll.
         //
-        // The FB mutex is taken and RELEASED here, outside the CONSOLE lock
-        // below, so no code path ever holds the two in the opposite order.
-        let was_visible = hide_software_cursor();
+        // The erase and the re-stamp are ONE TRANSACTION under a single FB
+        // lock. They used to be two separate acquisitions, and the present
+        // thread could copy the framebuffer in the gap and push a cursor-less
+        // frame to scanout - the mouse blinked out for ~1-2 ms on every line
+        // printed. Holding FB across hide->write->refresh makes that state
+        // unobservable: the presenter sees the sprite either before or after,
+        // never missing.
+        //
+        // Lock order is FB -> CONSOLE, which is the order already established
+        // by `init`/`adopt` (both take FB before CONSOLE). Taking them the
+        // other way round here would be an inversion.
+        let mut slot = FB.lock();
+        let Some(w) = slot.as_mut() else {
+            return;
+        };
+        let was_visible = hide_software_cursor_locked(w);
         {
             let mut g = CONSOLE.lock();
             let Some(c) = g.as_mut() else { return };
@@ -1524,7 +1544,9 @@ pub fn console_bytes(data: &[u8]) {
             }
             CONSOLE_BYTES.fetch_add(data.len(), Ordering::Relaxed);
         }
-        refresh_cursor_save(was_visible);
+        if was_visible {
+            refresh_cursor_save_locked(w);
+        }
     });
 }
 
@@ -1541,15 +1563,19 @@ fn refresh_cursor_save(redraw: bool) {
     if !redraw {
         return;
     }
+    let mut slot = FB.lock();
+    let Some(w) = slot.as_mut() else {
+        return;
+    };
+    refresh_cursor_save_locked(w);
+}
+
+/// Lock-free body of [`refresh_cursor_save`]; the caller already holds FB.
+fn refresh_cursor_save_locked(w: &mut FrameBufferWriter) {
     let cx = CUR_X.load(Ordering::Relaxed);
     let cy = CUR_Y.load(Ordering::Relaxed);
-    {
-        let mut slot = FB.lock();
-        if let Some(w) = slot.as_mut() {
-            save_region(w, cx, cy);
-            draw_arrow(w, cx, cy);
-        }
-    }
+    save_region(w, cx, cy);
+    draw_arrow(w, cx, cy);
     // P6c: re-arm the flag. `hide_software_cursor` clears it, so without this
     // the invariant decays to "flag false while the sprite is on screen" after
     // the very first write - and then `scroll_up` happily memmoves a LIVE
