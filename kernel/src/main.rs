@@ -17,6 +17,7 @@ mod ext2;
 mod fat;
 mod fpu;
 mod framebuffer;
+mod font;
 mod gdt;
 mod gpu;
 mod input;
@@ -263,6 +264,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // P6a stage 2: fill + blit self-test.
     scheduler::spawn(surface_blit_test);
     serial_writeln!("spawned surface-blit-test");
+    // P6a stage 3: Lato TrueType parse + rasterize self-test.
+    scheduler::spawn(font_test);
+    serial_writeln!("spawned font-test");
     // M9.6-B5: print one full performance snapshot ~3 s into the boot (the
     // shell's `perf` command re-renders it live at any time).
     scheduler::spawn(perf_task);
@@ -453,6 +457,213 @@ fn keyboard_task() {
 /// Mouse reader task: prints movement/button events the IRQ handler queues.
 fn mouse_task() {
     mouse::run_reader();
+}
+
+/// P6a stage 3 self-test: the Lato TrueType pipeline, end to end.
+///
+/// Same discipline as stages 1 and 2: this session has produced several bugs
+/// that compiled cleanly and looked correct. These checks are chosen to FAIL if
+/// the interesting work is removed - ink must be non-trivial, 2x size must
+/// roughly double the area, coverage must be antialiased, Unicode beyond ASCII
+/// must map to a real glyph, and malformed bytes must be refused.
+fn font_test() {
+    use crate::font;
+    serial_writeln!(
+        "[font] P6a stage 3 self-test ({}, {})",
+        font::FONT_NAME,
+        font::FONT_LICENSE
+    );
+
+    let face = match font::Face::load() {
+        Ok(f) => f,
+        Err(e) => {
+            serial_writeln!("[font] FAILED: parse: {e}");
+            return;
+        }
+    };
+    serial_writeln!(
+        "[font] PASS parse: {} glyphs, upem={}, asc={} desc={}",
+        face.glyph_count(),
+        face.units_per_em(),
+        face.ascender(),
+        face.descender()
+    );
+    // Report the raw table offsets the parser resolved. Every remaining bug in
+    // this stage has been "the offsets are subtly wrong", and printing them
+    // makes that a one-glance check instead of a PowerShell byte-dig.
+    serial_writeln!("[font] tables: {}", face.table_report());
+
+    // --- cmap: ASCII and Latin-1 beyond --------------------------------------
+    // The subset of Lato shipped here is a WEB build (275 glyphs, cmap format 4
+    // only, 84 segments), so it covers Latin + Latin-1 + punctuation and NOT
+    // symbols outside the BMP. Testing U+263A here would be testing a font
+    // feature that does not exist in this file - the correct expectation is
+    // that it maps to .notdef, and that is asserted rather than ignored.
+    let gid_a = face.glyph_for_char('A');
+    let gid_z = face.glyph_for_char('Z');
+    let gid_e = face.glyph_for_char('\u{e9}'); // U+00E9 e-acute, Latin-1
+    let gid_missing = face.glyph_for_char('\u{263a}'); // not in this subset
+    if gid_a != 0 && gid_a != gid_z && gid_e != 0 && gid_missing == 0 {
+        serial_writeln!(
+            "[font] PASS cmap: A={gid_a} Z={gid_z} e-acute={gid_e}; U+263A absent (subset) -> .notdef"
+        );
+    } else {
+        serial_writeln!(
+            "[font] FAILED: cmap wrong (A={gid_a} Z={gid_z} e={gid_e} missing={gid_missing})"
+        );
+    }
+
+    // --- outline must produce points for a letter ----------------------------
+    // Printed as a diagnostic before the raster checks: if the glyph has no
+    // outline the raster cannot have ink, and knowing WHICH stage failed turns
+    // a vague "text is blank" into a specific one.
+    let mut polys: Vec<Vec<(i32, i32)>> = Vec::new();
+    face.outline(gid_a, &mut polys);
+    let npts: usize = polys.iter().map(|p| p.len()).sum();
+    if polys.is_empty() {
+        serial_writeln!("[font] FAILED: outline('A') produced NO polygons");
+        return;
+    }
+    serial_writeln!(
+        "[font] outline('A'): {} contours, {npts} flattened points",
+        polys.len()
+    );
+
+    // The glyph header the PARSER resolved. Hand-decoding the TTF in PowerShell
+    // to compare against was itself error-prone (three wrong readings in one
+    // session: byte order, 16-bit sign extension, a base offset), so the kernel
+    // is made the single source of truth for what it actually read.
+    serial_writeln!("[font] A(gid {gid_a}) -> {}", face.glyph_debug(gid_a));
+
+    // --- outline must produce points for a letter ----------------------------
+    // Printed before the raster checks: if the glyph has no outline the raster
+    // cannot have ink, and knowing WHICH stage failed turns a vague "text is
+    // blank" into a specific one.
+    let mut polys: Vec<Vec<(i32, i32)>> = Vec::new();
+    face.outline(gid_a, &mut polys);
+    if polys.is_empty() {
+        serial_writeln!("[font] FAILED: outline('A') produced NO polygons");
+        return;
+    }
+    let npts: usize = polys.iter().map(|p| p.len()).sum();
+    let (mut lo_x, mut hi_x, mut lo_y, mut hi_y) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+    for p in &polys {
+        for &(x, y) in p {
+            lo_x = lo_x.min(x);
+            hi_x = hi_x.max(x);
+            lo_y = lo_y.min(y);
+            hi_y = hi_y.max(y);
+        }
+    }
+    serial_writeln!(
+        "[font] outline('A'): {} contours, {npts} pts, bbox x[{lo_x}..{hi_x}] y[{lo_y}..{hi_y}] (upem={})",
+        polys.len(),
+        face.units_per_em()
+    );
+
+    // --- rasterize at 16px: must have ink ----------------------------------
+    let g16 = font::rasterize(&face, gid_a, 16);
+    let ink16 = g16.alpha.iter().filter(|&&v| v > 0).count() as u32;
+    let solid16 = g16.alpha.iter().filter(|&&v| v >= 250).count() as u32;
+    if g16.w > 0 && g16.h > 0 && g16.alpha.len() == g16.w * g16.h && solid16 > 0 {
+        serial_writeln!(
+            "[font] PASS raster 16px: {}x{}, {ink16} ink px, {solid16} solid",
+            g16.w, g16.h
+        );
+    } else {
+        serial_writeln!(
+            "[font] FAILED: raster 16px degenerate ({}x{}, len={}, solid={solid16})",
+            g16.w, g16.h, g16.alpha.len()
+        );
+        return;
+    }
+
+    // --- antialiasing --------------------------------------------------------
+    // A rasterizer with no AA produces only 0 and 255, so this distinguishes
+    // "has edges" from "is a hard-edged mask".
+    let partial = g16.alpha.iter().filter(|&&v| v > 0 && v < 250).count() as u32;
+    if partial > 0 {
+        serial_writeln!("[font] PASS antialias: {partial} partial-coverage px");
+    } else {
+        serial_writeln!("[font] FAILED: no antialiasing ({partial} partial px)");
+    }
+
+    // --- scale: 32px must be substantially bigger than 16px -----------------
+    // If the scale factor were ignored both sizes would raster identically and
+    // text would be stuck at one size - exactly what a bitmap atlas forces, and
+    // the reason this stage exists.
+    let g32 = font::rasterize(&face, gid_a, 32);
+    let ink32 = g32.alpha.iter().filter(|&&v| v > 0).count() as u32;
+    if g32.w > g16.w && g32.h > g16.h && ink32 > ink16 * 2 {
+        serial_writeln!(
+            "[font] PASS scale: 32px = {ink32} ink px vs {ink16} at 16px ({}x{} vs {}x{})",
+            g32.w, g32.h, g16.w, g16.h
+        );
+    } else {
+        serial_writeln!(
+            "[font] FAILED: scaling broken (16px {ink16}px, 32px {ink32}px, {}x{} vs {}x{})",
+            g16.w, g16.h, g32.w, g32.h
+        );
+    }
+
+    // --- advance must be positive and grow with size ------------------------
+    let (a16, a32) = (g16.advance, g32.advance);
+    if a16 > 0 && a32 > a16 {
+        serial_writeln!("[font] PASS advance: {a16}px @16, {a32}px @32");
+    } else {
+        serial_writeln!("[font] FAILED: advance wrong ({a16} @16, {a32} @32)");
+    }
+
+    // --- measure() must equal the sum of advances ---------------------------
+    let w = font::measure(&face, "AAA", 16);
+    if w == a16 * 3 {
+        serial_writeln!("[font] PASS measure: 'AAA' @16 = {w}px = 3 x {a16}");
+    } else {
+        serial_writeln!("[font] FAILED: measure 'AAA' = {w}, want {}", a16 * 3);
+    }
+
+    // --- line metrics --------------------------------------------------------
+    let lm = face.line_metrics(16);
+    if lm.ascent > 0 && lm.descent > 0 && lm.line_height > lm.ascent {
+        serial_writeln!(
+            "[font] PASS metrics: asc={} desc={} line={}",
+            lm.ascent, lm.descent, lm.line_height
+        );
+    } else {
+        serial_writeln!(
+            "[font] FAILED: metrics asc={} desc={} line={}",
+            lm.ascent, lm.descent, lm.line_height
+        );
+    }
+
+    // --- a space must rasterize to nothing WITHOUT being an error -----------
+    let gsp = font::rasterize(&face, face.glyph_for_char(' '), 16);
+    if gsp.alpha.is_empty() && gsp.advance > 0 {
+        serial_writeln!("[font] PASS space: no ink, advance {}px", gsp.advance);
+    } else {
+        serial_writeln!(
+            "[font] FAILED: space wrong ({} px ink, advance {})",
+            gsp.alpha.len(),
+            gsp.advance
+        );
+    }
+
+    // --- malformed input must be REJECTED, not panic -------------------------
+    // `panic = "abort"` means a parser bug here takes the WHOLE system down over
+    // a bad byte. The only way to know it refuses is to actually hand it junk.
+    let junk: &'static [u8] = &[0u8; 32];
+    if font::Face::parse(junk).is_err() {
+        serial_writeln!("[font] PASS rejects: malformed font refused cleanly");
+    } else {
+        serial_writeln!("[font] FAILED: malformed font was accepted");
+    }
+    if font::Face::parse(&font::LATO_BYTES[..64]).is_err() {
+        serial_writeln!("[font] PASS rejects: truncated font refused cleanly");
+    } else {
+        serial_writeln!("[font] FAILED: truncated font was accepted");
+    }
+
+    serial_writeln!("[font] P6a stage 3 self-test done");
 }
 
 /// P6a stage 2 self-test: `fill` and `blit`.

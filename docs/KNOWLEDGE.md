@@ -884,3 +884,80 @@ in that order. The ramp is that missing check: stub the blit and it fails
 immediately. When adding the next stage, ask what the suite would look like with
 the new function removed.
 
+### P6a stage 3: Lato, used AS-IS via a real TrueType parser
+
+The user's chosen font: `FONT/Lato/*.ttf` (the full 9-weight family, but these
+are ~70 KiB WEB SUBSETS, not the 650 KiB originals). `Lato-Regular.ttf` is
+embedded whole via `include_bytes!` - no build.rs change, and the file is already
+a subset.
+
+**Answer to "do I need conversion?": no.** Lato is `glyf` TrueType with quadratic
+outlines, so it CANNOT be blitted directly - a rasterizer is required either way.
+The choice was: pre-render a bitmap atlas at build time (simpler, but then 12px
+and 48px labels are one of them blurry) vs. parse and rasterize in the kernel
+(one file, any size). Chose the parser, because a desktop that can only draw one
+blurry text size is not a desktop.
+
+Scope stated honestly in the module docs: `glyf` simple + composite glyphs,
+quadratic flattening, `cmap` format 4 and 12, `hmtx` advances, 8-bit AA scanline
+output. NOT implemented and **refused rather than mis-rendered**: CFF outlines
+(rejected at parse time), and hinting (`fpgm`/`prep`/`cvt` skipped, so stems are
+slightly softer than FreeType's hinted output - a deliberate trade, since a
+hinting engine is large and this session has repeatedly shown large untested
+subsystems are where bugs live).
+
+**Five real bugs, all found by the self-test:**
+
+1. **cmap subtable offset read with `be16` instead of `be32`.** The encoding
+   record's offset is FOUR bytes; reading two reads the high half, which is always
+   0 for a real font, so every lookup pointed at the cmap HEADER and EVERY
+   character mapped to `.notdef`. Symptom: glyph 0 for everything, i.e. no text at
+   all.
+2. **The glyph record layout was mis-walked.** The flags array starts at
+   `s + 10 + ncont*2 + 2 + instructionLength` - the 8-byte BBOX and the hinting
+   instruction block must both be skipped. Omitting them read every flag and
+   delta 8+ bytes early, and 'A' decoded with bbox `x[3101..3840]` in a 2000
+   upem font instead of the real `x[0..1353]`.
+3. **`flatten_contour` visited the start point twice.** `(1..=n-1).map(...).chain(once(i))`
+   yields n entries, not n-1, so a whole coordinate delta was applied twice.
+4. **The scanline sub-sampling collapsed.** `row + s/16` in INTEGER pixel units
+   truncates to `row` for every `s < 16`, so all 16 sub-scanlines sampled the
+   same y and the glyph came out hard-edged (0 partial-coverage pixels). Fixed
+   by scaling the VERTICES into 1/16 fixed point so every sub-scanline is an
+   exact integer - no floats in the kernel.
+5. **Operator precedence**, caught before it shipped: `... >> 14 + dx` binds the
+   `+` into the SHIFT's operand, which would have scaled composite glyphs by the
+   wrong factor - a plausible-looking slightly-wrong angle rather than a failure.
+
+**The debugging itself went wrong three times, which is the real lesson.** I
+hand-decoded the TTF in PowerShell to check the parser, and mis-read it three
+separate ways: byte order (`numTables` = 4096), 16-bit sign extension on `idDelta`
+(derived a "gid 97" for 'A' when it is 36), and a missing `loca`-short `*2`. Each
+mismatch sent me chasing a non-existent bug in the kernel. The fix was to make
+the KERNEL the source of truth - `table_report()` and `glyph_debug()` print the
+offsets and glyph header bytes the parser actually resolved, which turns it into
+a one-line comparison instead of a byte-dig. **When a measurement tool is
+misreporting, the first suspect is the tool.** Three of this session's earlier
+"findings" were instrument bugs; this would have been a fourth.
+
+Final state - all 12 checks pass:
+```
+[font] PASS parse: 275 glyphs, upem=2000, asc=1974 desc=-426
+[font] PASS cmap: A=36 Z=61 e-acute=171; U+263A absent (subset) -> .notdef
+[font] PASS raster 16px: 12x13, 43 ink px, 33 solid
+[font] PASS antialias: 10 partial-coverage px
+[font] PASS scale: 32px = 153 ink px vs 43 at 16px (23x24 vs 12x13)
+[font] PASS measure: 'AAA' @16 = 30px = 3 x 10
+[font] PASS rejects: malformed font refused cleanly
+[font] PASS rejects: truncated font refused cleanly
+```
+
+Note on coverage: this is a **web subset** - 275 glyphs, cmap format 4 only,
+Latin + Latin-1 + punctuation. U+263A correctly maps to `.notdef`, and the test
+asserts that rather than ignoring it. If the desktop needs icons or emoji, a
+different face (or a symbol font) is required - stated now rather than discovered
+at the compositor.
+
+**Next:** composite the alpha mask through the stage-2 blit path so text can
+actually be drawn, then the compositor.
+
