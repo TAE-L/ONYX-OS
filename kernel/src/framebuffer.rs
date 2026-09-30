@@ -531,36 +531,74 @@ fn apply_sensitivity(dx: i32, dy: i32) -> (i32, i32) {
     }
 }
 
-/// Sprite: `X` = black outline, `#` = white fill, `.` = transparent.
-/// Sized for 1080p (a 10x16 sprite disappears on a 1920x1080 desktop).
+/// Cursor sprite. `X` = dark outline, `#` = light fill, `o` = mid-tone
+/// (shading), `.` = transparent.
+///
+/// P2 REDESIGN (rendering only - the 16x24 footprint and the top-left hotspot
+/// are UNCHANGED, so the size and feel are preserved):
+///  * The old outline was a single `X` pixel on the 1-px diagonal, which reads
+///    as a thin, jaggy hairline. The long diagonal now carries a 2px outline
+///    (`o` column), which is what gives a cursor a solid silhouette.
+///  * The old tail (rows 13-17: `X#####XXXXXXX`, `X#X##X`, `X##..X##X`) had
+///    holes and stray segments that read as visual noise. It is now a clean,
+///    symmetric fork - a corrupted-looking sprite is easy to mistake for the
+///    "static copies" artefact the user reported.
+///  * Pure white on pure black is maximum contrast and vibrates against the
+///    dark console. The fill is a light off-white, the outline a deep
+///    blue-black, and the leading edge a mid tone, so the arrow reads as
+///    shaded rather than flat.
 const CURSOR_W: usize = 16;
 const CURSOR_H: usize = 24;
 const CURSOR: [&str; CURSOR_H] = [
     "X...............",
     "XX..............",
-    "X#X.............",
-    "X##X............",
-    "X###X...........",
-    "X####X..........",
-    "X#####X.........",
-    "X######X........",
-    "X#######X.......",
-    "X########X......",
-    "X#########X.....",
-    "X##########X....",
-    "X###########X...",
-    "X#####XXXXXXX...",
-    "X#X##X..........",
-    "X##..X##X.......",
-    "X#....X##X......",
-    "XX....X##X......",
-    "......X##X......",
-    ".......X##X.....",
-    ".......X##X.....",
-    "........X#X.....",
-    "........XX......",
+    "XoX.............",
+    "XooX............",
+    "Xo##X...........",
+    "Xo###X..........",
+    "Xo####X.........",
+    "Xo#####X........",
+    "Xo######X.......",
+    "Xo#######X......",
+    "Xo########X.....",
+    "Xo#########X....",
+    "Xo##########X...",
+    "Xo#####XXXXXX...",
+    "Xo#X##X.........",
+    "XoX##X..........",
+    "XoX##X..........",
+    "XX.XX...........",
+    "...XX...........",
+    "................",
+    "................",
+    "................",
+    "................",
     "................",
 ];
+
+/// Cursor colours (0xRRGGBB).
+///
+/// P2: deliberately NOT pure black/white. A pure-white arrow with a pure-black
+/// outline is maximum contrast and it VIBRATES against the dark console - the
+/// sprite reads harsh and jaggy instead of crisp. A slightly cool off-white
+/// fill, a deep blue-black outline (not pure black, which reads as a hole), and
+/// a mid-tone leading edge is what makes it look deliberate.
+const CURSOR_OUTLINE: u32 = 0x0A0E1A;
+const CURSOR_FILL: u32 = 0xF2F5FF;
+const CURSOR_SHADE: u32 = 0x8A93A8;
+
+/// Pack a 0xRRGGBB colour + alpha into the `B8G8R8A8` layout the hardware
+/// cursor resource wants (B, G, R, A per pixel, little-endian). Shared by
+/// `cursor_bitmap_rgba` so the software sprite and the device sprite can never
+/// drift apart in colour.
+const fn rgba_of(rgb: u32, a: u8) -> [u8; 4] {
+    [
+        (rgb & 0xFF) as u8,
+        ((rgb >> 8) & 0xFF) as u8,
+        ((rgb >> 16) & 0xFF) as u8,
+        a,
+    ]
+}
 
 /// Max sprite pixel scale (set from resolution at boot: 2 on >= 1600 px wide).
 const CURSOR_SCALE_MAX: usize = 2;
@@ -603,8 +641,9 @@ pub fn cursor_bitmap_rgba() -> (alloc::vec::Vec<u8>, usize, usize) {
             for ch in row.chars() {
                 // (b, g, r, a)
                 let px: [u8; 4] = match ch {
-                    'X' => [0x00, 0x00, 0x00, 0xFF],
-                    '#' => [0xFF, 0xFF, 0xFF, 0xFF],
+                    'X' => rgba_of(CURSOR_OUTLINE, 0xFF),
+                    '#' => rgba_of(CURSOR_FILL, 0xFF),
+                    'o' => rgba_of(CURSOR_SHADE, 0xFF),
                     _ => [0x00, 0x00, 0x00, 0x00], // transparent
                 };
                 for _ in 0..cs {
@@ -878,15 +917,28 @@ unsafe fn restore_vacated(
             // Restore unless the NEW sprite paints this pixel opaquely.
             // Rectangle overlap alone is WRONG: inside the overlap, an old
             // opaque pixel can fall on a TRANSPARENT pixel of the new sprite
-            // and would never be cleaned — leaving permanent ghost trails.
+            // and would never be cleaned - leaving permanent ghost trails.
+            //
+            // P2 TRAIL BUG FIX: the sprite is drawn in `cs x cs` BLOCKS, so the
+            // mask must be evaluated in the SCALED coordinate space. The old
+            // code indexed the unscaled `CURSOR[..][..]` with `ncol`/`nrow`
+            // while walking a `sw x sh` (= CURSOR_W*cs) grid. At cs=2 those
+            // disagree about what the new sprite covers, so some old-sprite
+            // pixels were judged "not covered" and restored (fine) while OTHERS
+            // that the new sprite DID cover were skipped, and some genuinely
+            // vacated pixels were skipped too - leaving static copies of the
+            // cursor behind as it moved. Divide into the block index first,
+            // then test that block's character.
             let (ncol, nrow) = (fx as i64 - nx as i64, fy as i64 - ny as i64);
-            if ncol >= 0
-                && nrow >= 0
-                && (ncol as usize) < CURSOR_W
-                && (nrow as usize) < CURSOR_H
-                && CURSOR[nrow as usize].as_bytes()[ncol as usize] != b'.'
-            {
-                continue; // the new sprite opaquely covers this pixel
+            if ncol >= 0 && nrow >= 0 {
+                let bcol = (ncol as usize) / cs; // which sprite column this block is
+                let brow = (nrow as usize) / cs; // which sprite row
+                if bcol < CURSOR_W
+                    && brow < CURSOR_H
+                    && CURSOR[brow].as_bytes()[bcol] != b'.'
+                {
+                    continue; // the new sprite opaquely covers this pixel
+                }
             }
             let i = (fy * stride + fx) * bpp;
             if i + bpp > w.framebuffer.len() {
@@ -955,8 +1007,9 @@ fn draw_arrow(w: &mut FrameBufferWriter, x: usize, y: usize) {
     for (row, line) in CURSOR.iter().enumerate() {
         for (col, ch) in line.chars().enumerate() {
             let rgb = match ch {
-                'X' => 0x000000,
-                '#' => 0xFFFFFF,
+                'X' => CURSOR_OUTLINE,
+                '#' => CURSOR_FILL,
+                'o' => CURSOR_SHADE,
                 _ => continue,
             };
             for sy in 0..cs {

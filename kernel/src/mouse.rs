@@ -143,26 +143,69 @@ pub fn handle_irq() {
 /// framebuffer cursor's ABSOLUTE coordinates, so the serial log directly
 /// shows the cursor animation: `pos` must track the injected mouse deltas
 /// (verifiable headless via `test-input.ps1`).
+///
+/// P2 - THIS USED TO BE A BUSY-SPIN AND A REAL BOTTLENECK. Three problems, all
+/// fixed here:
+///
+///  1. `loop { ... spin_loop() }` never blocked, so this was an always-runnable
+///     Normal task permanently occupying a CPU - the same starvation shape as
+///     `ticker_task`, found by the hop-B attribution counter. Moving the mouse
+///     made it WORSE, because the faster the input the more it looped.
+///  2. It printed on EVERY packet. `serial_writeln!` takes a global lock and
+///     pushes bytes out the UART one at a time, so a fast mouse could spend a
+///     measurable fraction of the CPU inside the serial driver.
+///  3. It woke on nothing - it just re-read the ring, so the "work" was
+///     re-doing the same comparison thousands of times per millisecond.
+///
+/// Now it parks instead of spinning. The sleep is a real block (not a yield),
+/// which is safe here: this task owns no lock and holds no critical section
+/// across the park. Button state is reported IMMEDIATELY and
+/// unconditionally (a press must never be dropped or delayed - `test-input.ps1`
+/// asserts on it); only the high-frequency position stream is rate-limited.
+const MOUSE_LOG_INTERVAL_MS: u64 = 100;
+/// Park length when nothing changed at all. Long, because there is nothing to
+/// observe until the next move - the hardware cursor moves on the IRQ, this
+/// task only REPORTS.
+const MOUSE_IDLE_PARK_MS: u64 = 40;
+/// Park length right after a change, so a burst of moves still reports promptly.
+const MOUSE_ACTIVE_PARK_MS: u64 = 5;
+
 pub fn run_reader() {
     let mut last: (i16, i16, bool, bool) = (0, 0, false, false);
+    let mut last_logged = 0u64;
     loop {
         let cur = read_packet();
-        if cur != last {
+        let moved = cur.0 != 0 || cur.1 != 0;
+        let buttons = cur.2 || cur.3;
+        let changed = cur != last;
+        if changed {
             last = cur;
-            if cur.0 != 0 || cur.1 != 0 || cur.2 || cur.3 {
+            if moved || buttons {
                 let (x, y) = crate::framebuffer::cursor_pos();
-                serial_writeln!(
-                    "[mouse] pos=({},{}) dx={} dy={} L={} R={}",
-                    x,
-                    y,
-                    cur.0,
-                    cur.1,
-                    cur.2 as u8,
-                    cur.3 as u8
-                );
+                let now = crate::apic::ms_since_boot();
+                // Rate-limit the POSITION stream only. A button press/release is
+                // rare and semantically important, so it always reports at once
+                // even inside the quiet window.
+                let due = now.saturating_sub(last_logged) >= MOUSE_LOG_INTERVAL_MS;
+                if buttons || due {
+                    last_logged = now;
+                    serial_writeln!(
+                        "[mouse] pos=({},{}) dx={} dy={} L={} R={}",
+                        x,
+                        y,
+                        cur.0,
+                        cur.1,
+                        cur.2 as u8,
+                        cur.3 as u8
+                    );
+                }
             }
         }
-        core::hint::spin_loop();
+        crate::scheduler::sleep_kernel(if changed {
+            MOUSE_ACTIVE_PARK_MS
+        } else {
+            MOUSE_IDLE_PARK_MS
+        });
     }
 }
 

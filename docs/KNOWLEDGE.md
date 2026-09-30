@@ -675,3 +675,57 @@ anyway, so the tick rate now bounds only worst-case lateness, not the requested
 duration. Also: "this constant is obviously wrong" is not sufficient reason to
 change it - this one was wrong AND load-bearing, and only an A/B on both metrics
 revealed that.
+
+### Mouse: a third busy-spin, and a real cursor trail bug
+
+Three separate problems, all confirmed by reading the code and then measured.
+
+**1. `mouse::run_reader` was a busy-spin** - `loop { ... spin_loop() }` with no
+sleep and no block, so it was an always-runnable Normal task permanently
+occupying a CPU. The same starvation shape as `ticker_task`, and the user
+spotted it independently ("the scheduler prints its position every tick"). It
+also printed on EVERY packet: `serial_writeln!` takes a global lock and pushes
+bytes out the UART one at a time, so a fast mouse burned real CPU inside the
+serial driver - and moving the mouse made it WORSE, because faster input meant
+more looping. Now it parks (40 ms idle / 5 ms after a change) and rate-limits
+the POSITION stream to 10 Hz; BUTTON events always report immediately, because
+a press must never be dropped (`test-input.ps1` asserts on them). Measured: 29
+`[mouse]` lines -> 6, with all button transitions preserved.
+
+**2. The "static copies" were a REAL BUG, not a cosmetic complaint.** In
+`restore_vacated`, the sprite mask was evaluated in the UNSCALED coordinate
+space (`CURSOR[..][ncol/nrow]` bounded by `CURSOR_W`/`CURSOR_H`) while the loop
+walked the SCALED grid (`sw`/`sh` = `CURSOR_W * cs`). At cs=2 those disagree
+about what the new sprite covers, so pixels the new sprite did cover were
+skipped AND some genuinely-vacated pixels were skipped - leaving static copies
+of the arrow behind. Fixed by dividing into the block index (`ncol / cs`) before
+testing the character. This is the bug class that makes a cursor look
+"corrupted", and it is a correctness fix, not cosmetics.
+
+**3. The cursor art.** Reworked the sprite with the SAME 16x24 footprint and the
+SAME top-left hotspot (the size and feel the user liked are preserved), because
+every complaint was about rendering, not geometry:
+  * the outline was a 1-px diagonal hairline -> now a 2px outline on the long
+    diagonal, which is what gives a cursor a solid silhouette;
+  * the tail (rows 13-17: `X#####XXXXXXX`, `X#X##X`, `X##..X##X`) had holes and
+    stray segments that read as noise - now a clean symmetric fork;
+  * pure white on pure black is max contrast and VIBRATES against the dark
+    console - now off-white fill `0xF2F5FF`, deep blue-black outline `0x0A0E1A`
+    (pure black reads as a hole), and a new mid tone `o` = `0x8A93A8` for the
+    leading edge so the arrow reads shaded rather than flat.
+
+Colours are now shared constants, and `rgba_of()` packs them for the B8G8R8A8
+hardware-cursor resource, so the software sprite and the device sprite CANNOT
+drift apart in colour.
+
+| | pacing | min interval | test-para | serial baseline |
+|---|---|---|---|---|
+| before | ~10.7 fps | 281 us | x3.86 | 618 ms |
+| after | **~12.5-14.5 fps** | **347 us** | **x4.54** | **517 ms** |
+
+**The lesson:** three of the user's four observations were real, and the one
+that sounded most cosmetic ("static copies") was the most serious - an
+off-by-`cs` in a sprite mask. Performance bugs and correctness bugs often share
+a hotspot: the per-pixel cursor path that looked expensive was the same path
+that corrupted the screen. Fix the mask and the art in one change, but treat
+them as different classes of problem.
