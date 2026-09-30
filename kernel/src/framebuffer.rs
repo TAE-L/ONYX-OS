@@ -1097,6 +1097,14 @@ unsafe fn capture_save(
 /// `cs × cs` block so the cursor's apparent size tracks the resolution
 /// (2× on a 1920-wide panel — same physical size as 1× on 960-wide).
 fn draw_arrow(w: &mut FrameBufferWriter, x: usize, y: usize) {
+    // P6c: STRUCTURAL guard. The flag bookkeeping can only be as good as every
+    // call site; this makes the class of bug impossible. Once the device owns
+    // the pointer, no code path may stamp a software arrow into the framebuffer,
+    // because the hardware cursor draws with no framebuffer traffic and could
+    // never erase it - the arrow would be stranded for the rest of the session.
+    if HW_CURSOR.load(Ordering::Acquire) {
+        return;
+    }
     let cs = CUR_SCALE.load(Ordering::Relaxed).max(1);
     for (row, line) in CURSOR.iter().enumerate() {
         for (col, ch) in line.chars().enumerate() {
@@ -1535,14 +1543,18 @@ fn refresh_cursor_save(redraw: bool) {
     }
     let cx = CUR_X.load(Ordering::Relaxed);
     let cy = CUR_Y.load(Ordering::Relaxed);
-    if cy < HEADER_BAR_H + 8 {
-        return; // cursor outside the console region: nothing to refresh
+    {
+        let mut slot = FB.lock();
+        if let Some(w) = slot.as_mut() {
+            save_region(w, cx, cy);
+            draw_arrow(w, cx, cy);
+        }
     }
-    let mut slot = FB.lock();
-    if let Some(w) = slot.as_mut() {
-        save_region(w, cx, cy);
-        draw_arrow(w, cx, cy);
-    }
+    // P6c: re-arm the flag. `hide_software_cursor` clears it, so without this
+    // the invariant decays to "flag false while the sprite is on screen" after
+    // the very first write - and then `scroll_up` happily memmoves a LIVE
+    // sprite upward again. That was the residue of the ghost-arrow report.
+    SW_VISIBLE.store(true, Ordering::Release);
 }
 
 /// Total bytes mirrored to the console (serial-observable liveness proof).

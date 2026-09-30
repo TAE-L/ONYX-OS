@@ -2562,15 +2562,14 @@ pub fn hardware_cursor_enable() -> bool {
         log(&alloc::format!("[vgpu] cursor: UPDATE_CURSOR refused ({e}) - software cursor kept"));
         return false;
     }
-    crate::framebuffer::set_hardware_cursor(true);
-    // P6c: ERASE the software sprite before handing over. Those pixels are baked
-    // into the framebuffer, and the hardware cursor never touches the surface
-    // again, so without this every position the software sprite ever occupied
-    // stays on screen as a static ghost (the user reported duplicated cursors
-    // trailing upward as text was printed). The hardware cursor is then placed
-    // at the sprite's old position, so the handoff is invisible.
+    // P6c: ERASE the software sprite BEFORE handing over, while the flag still
+    // says it is on screen. The order matters: `set_hardware_cursor` clears that
+    // flag, so erasing afterwards would silently do nothing and strand the
+    // sprite in the framebuffer. The hardware cursor draws with no framebuffer
+    // traffic, so it could never erase it - a permanent static arrow.
     let (x, y) = crate::framebuffer::cursor_pos();
     let _ = crate::framebuffer::hide_software_cursor();
+    crate::framebuffer::set_hardware_cursor(true);
     let _ = cursor_move(0, x as u32, y as u32);
     log(&alloc::format!(
         "[vgpu] cursor: hardware cursor live on queue 1 ({w}x{h} B8G8R8A8, moved via MOVE_CURSOR - zero framebuffer damage)"
