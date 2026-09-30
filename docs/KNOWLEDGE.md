@@ -961,3 +961,72 @@ at the compositor.
 **Next:** composite the alpha mask through the stage-2 blit path so text can
 actually be drawn, then the compositor.
 
+### P6b: the compositor, and a heap-exhaustion HANG
+
+`kernel/src/compositor.rs`: a real (small) compositor - screen surface, ordered
+window list, backdrop, window chrome, title text, taskbar, focus ring, composed
+back-to-front. Not a window server yet (no IPC, no client damage, no per-window
+GPU resource); the shape is arranged so those slot in rather than needing a
+rewrite.
+
+**Text became drawable first.** `surface::blend_mask` alpha-composites a glyph
+coverage mask (source-over, u32 math with a +127 rounding - u8 truncates the low
+bits and visibly darkens every antialiased edge), and `surface::draw_text` walks
+a string. The font module deliberately emits a bare alpha mask with no colour,
+so the SAME mask composites over dark title bars and light document areas
+without a second rasterization. Fully transparent pixels are skipped entirely, so
+a run of whitespace marks no damage - otherwise every typed space would trigger a
+present.
+
+Two design points worth stating because a future window manager depends on them:
+* **Damage is recorded on the destination only.** A blit READS the source, so the
+  source did not change; marking it would double a frame's present cost.
+* **Focus is an INDEX into the window list, not a per-window flag** - the same
+  single-authority reasoning P1A applied to the task CPU tag. The self-test
+  asserts exactly one window claims focus.
+
+**The bug that cost the most time: a HANG, from heap exhaustion.** The
+compositor stopped mid-test with no panic, no `#DF`, and a healthy-looking log.
+Cause: `draw_text` called `Face::load()` and `rasterize()` per CHARACTER per
+frame, and `rasterize` allocates a `Vec` per outline - a 3023-glyph face makes
+that expensive, and a frame drawing three titles allocated ~10 MiB of
+short-lived vectors. Under TCG the bump allocator's failure path is a SPIN, so
+memory exhaustion presented as an infinite hang rather than an error.
+
+Fixed with `GLYPH_CACHE`, a `BTreeMap<(char, size), Glyph>` behind one lock
+(capped at 256, cleared when full). A repeated frame is now allocation-free,
+which is what a compositor actually needs - the same few strings are redrawn
+forever. **An allocator that spins on failure converts every memory bug into an
+unexplainable hang**, which is worth remembering before blaming the scheduler.
+
+Also fixed while chasing it: `visible_rect` clamped only the far edge, so a
+window positioned past the screen edge made `x1 - x0` UNDERFLOW in `usize` into
+a ~4-billion-pixel fill. Both edges are clamped now, and the title-bar maths
+derives every coordinate from the CLIPPED rect.
+
+And a false failure I caused: at `PRIO_NORMAL` the P6 self-tests stole the single
+CPU from the boot-critical ones, and `test-smp.ps1` reported "fpu-test A PASSED
+marker missing" - my diagnostics breaking a real test. `PRIO_IDLE` was worse (an
+always-Ready Normal task exists, so IDLE work NEVER ran and the compositor test
+produced no output at all). The fix is `PRIO_NORMAL` plus a STAGGERED start
+(each test sleeps before working), so boot-critical tests finish first. **A
+self-test that can break a real test is itself a bug** - diagnostics must yield.
+
+The 13 compositor checks read PIXELS back - the strongest being "pixels in the
+title bar that are neither the bar fill nor the border can only be glyph ink",
+which fails if `draw_text` is removed. The clock was NOT reintroduced as a
+per-pixel redraw; the header clock is the compositor's job.
+
+```
+[comp] PASS title text: 74 glyph-ink px in the title bar
+[comp] PASS clipping: off-screen window did not cover the taskbar
+[comp] PASS damage: frame marked dirty Some((0, 0, 320, 200))
+[comp] done: 3 windows, 3 frames
+```
+
+Also in this stage: the FULL Lato (3023 glyphs, Latin + Greek + Cyrillic)
+replaced the 275-glyph web subset that was in `FONT/`, `FONT/` itself was
+committed (the build REQUIRES it - a fresh clone would not have built), and cmap
+format 6 was added because the full face ships one. All 13 font checks pass
+including Greek/Cyrillic lookups and an "unmapped char -> .notdef" assertion.
+
