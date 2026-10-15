@@ -46,6 +46,64 @@ impl DateTime {
     pub fn secs_of_day(&self) -> u32 {
         u32::from(self.hour) * 3600 + u32::from(self.minute) * 60 + u32::from(self.second)
     }
+
+    /// Seconds since the Unix epoch (1970-01-01T00:00:00Z), or `None` when
+    /// this reads as "no RTC" (`year == 0`).
+    ///
+    /// P16-1.3. Filesystem timestamps are stored as Unix seconds because that is
+    /// what the ring-3 ABI exposes and what `stat` consumers expect; FAT and
+    /// ext2 both need converting to and from it. `None` rather than a bogus
+    /// number is deliberate: a zeroed RTC must not silently stamp every file
+    /// 1970-01-01, which looks like real data to every consumer.
+    pub fn to_unix(&self) -> Option<i64> {
+        if self.year == 0 || self.month == 0 || self.day == 0 {
+            return None;
+        }
+        Some(self.days_from_civil() * 86_400 + i64::from(self.secs_of_day()))
+    }
+
+    /// Days since 1970-01-01 (Howard Hinnant's `days_from_civil`), valid for the
+    /// whole proleptic Gregorian calendar rather than only the FAT 1980..2107
+    /// window. Exact integer arithmetic throughout, so there is no rounding to
+    /// get wrong at midnight.
+    fn days_from_civil(&self) -> i64 {
+        let y = i64::from(self.year) - i64::from(self.month <= 2);
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400; // [0, 399]
+        let m = i64::from(self.month);
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(self.day) - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+}
+
+/// Inverse of `days_from_civil`: Unix seconds -> `DateTime` (UTC).
+///
+/// P16-1.3. Needed to read FAT/ext2 timestamps back out. `secs == 0` yields the
+/// zeroed value, which callers must treat as "no timestamp".
+pub fn from_unix(secs: i64) -> DateTime {
+    if secs <= 0 {
+        return DateTime::ZEROED;
+    }
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400) as u32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    DateTime {
+        second: (sod % 60) as u8,
+        minute: (sod / 60 % 60) as u8,
+        hour: (sod / 3600) as u8,
+        day: d as u8,
+        month: m as u8,
+        year: (if m <= 2 { y + 1 } else { y }) as u16,
+    }
 }
 
 /// Wall-clock timestamp captured at boot (written once by `init`).

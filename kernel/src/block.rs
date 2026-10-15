@@ -123,7 +123,12 @@ pub fn init() {
     let write_ok = if info.total_sectors == 0 {
         false
     } else {
-        let last = (info.total_sectors - 1).min(u64::from(0x0FFF_FFFFu32)) as u32;
+        // P16-1.1: no longer clamped to `LBA28_MAX`. That clamp existed only
+        // because the driver could not address higher; writing to the real last
+        // sector of the disk is the point of a write-verify, and on an LBA28-only
+        // drive `total_sectors` is already the 28-bit capacity, so `last` is
+        // always in range.
+        let last = info.total_sectors - 1;
         let mut before = [0u8; SECTOR_SIZE];
         let mut after = [0u8; SECTOR_SIZE];
         drive.read_sectors_raw(last, 1, &mut before).is_ok()
@@ -310,7 +315,7 @@ fn scan_gpt(
         let chunk = remaining.min(255) as u8;
         let off = (want_sectors - remaining) as usize * SECTOR_SIZE;
         if drive
-            .read_sectors(lba as u32, chunk, &mut table[off..off + chunk as usize * SECTOR_SIZE])
+            .read_sectors(lba, chunk, &mut table[off..off + chunk as usize * SECTOR_SIZE])
             .is_err()
         {
             serial_writeln!("M5: failed to read GPT entry array");

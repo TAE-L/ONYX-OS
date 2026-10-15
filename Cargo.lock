@@ -190,6 +190,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fatfs-verify"
+version = "0.1.0"
+dependencies = [
+ "fatfs",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

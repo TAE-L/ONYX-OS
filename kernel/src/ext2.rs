@@ -35,7 +35,7 @@ const MODE_DIR: u16 = 0x4000;
 const MODE_REG: u16 = 0x8000;
 
 pub struct Ext2 {
-    part_start: u32,
+    part_start: u64,
     blocks_count: u32,
     inodes_count: u32,
     blocks_per_group: u32,
@@ -57,6 +57,11 @@ struct Inode {
     size: u32,
     /// `i_blocks`: 512-byte sectors occupied (including indirect blocks).
     sectors: u32,
+    /// P16-1.3: `i_atime`/`i_ctime`/`i_mtime` at inode offsets 8/12/16 (rev 1).
+    /// Unix seconds, `0` = "not recorded", matching the FAT driver's convention.
+    atime: u32,
+    ctime: u32,
+    mtime: u32,
     /// `i_block[0..15]`.
     blocks: [u32; 15],
 }
@@ -71,10 +76,19 @@ struct DirEnt {
     offset: u32,
 }
 
+/// Wall clock as Unix seconds, clamped to the ext2 field width.
+///
+/// P16-1.3. ext2 stores 32-bit seconds, so this saturates rather than wrapping:
+/// a wrapped timestamp would read as a date in 1970 or 2106 and silently
+/// reorder the user's files.
+fn ext2_now() -> u32 {
+    crate::rtc::now_utc().to_unix().unwrap_or(0).clamp(0, u32::MAX as i64) as u32
+}
+
 impl Ext2 {
     /// Parse and validate the superblock + group descriptor 0 of the
     /// partition at `part_start` (LBA units, 512-byte sectors).
-    pub fn mount(dev: &mut AtaDrive, part_start: u32) -> Result<Self, FsError> {
+    pub fn mount(dev: &mut AtaDrive, part_start: u64) -> Result<Self, FsError> {
         // The superblock lives 1024 bytes into the partition: block 1 for
         // 1 KiB blocks (LBA part_start + 2).
         let mut sb = [0u8; BLOCK];
@@ -153,11 +167,11 @@ impl Ext2 {
 /// into `out` (must be ≥ 1024 bytes; extra bytes are untouched).
 fn read_part_block(
     dev: &mut AtaDrive,
-    part_start: u32,
+    part_start: u64,
     block: u32,
     out: &mut [u8],
 ) -> Result<(), FsError> {
-    let lba = part_start + block * 2;
+    let lba = part_start + u64::from(block) * 2;
     dev.read_sectors(lba, 2, &mut out[..BLOCK])
         .map_err(FsError::Io)
 }
@@ -168,7 +182,7 @@ impl Ext2 {
     }
 
     fn write_block(&self, dev: &mut AtaDrive, block: u32, data: &[u8; BLOCK]) -> Result<(), FsError> {
-        let lba = self.part_start + block * 2;
+        let lba = self.part_start + u64::from(block) * 2;
         dev.write_sectors(lba, 2, &data[..])
             .map_err(FsError::Io)
     }
@@ -193,6 +207,9 @@ impl Ext2 {
             mode: u16::from_le_bytes(p[0..2].try_into().unwrap()),
             size: u32::from_le_bytes(p[4..8].try_into().unwrap()),
             sectors: u32::from_le_bytes(p[28..32].try_into().unwrap()),
+            atime: u32::from_le_bytes(p[8..12].try_into().unwrap()),
+            ctime: u32::from_le_bytes(p[12..16].try_into().unwrap()),
+            mtime: u32::from_le_bytes(p[16..20].try_into().unwrap()),
             blocks,
         })
     }
@@ -208,6 +225,9 @@ impl Ext2 {
         p[0..2].copy_from_slice(&ino.mode.to_le_bytes());
         p[4..8].copy_from_slice(&ino.size.to_le_bytes());
         p[28..32].copy_from_slice(&ino.sectors.to_le_bytes());
+        p[8..12].copy_from_slice(&ino.atime.to_le_bytes());
+        p[12..16].copy_from_slice(&ino.ctime.to_le_bytes());
+        p[16..20].copy_from_slice(&ino.mtime.to_le_bytes());
         for (i, v) in ino.blocks.iter().enumerate() {
             p[40 + i * 4..44 + i * 4].copy_from_slice(&v.to_le_bytes());
         }
@@ -576,11 +596,15 @@ impl Ext2 {
             return Err(FsError::NotSupported);
         }
         let num = self.alloc_inode(dev)?;
+        let now = ext2_now();
         let ino = Inode {
             ino: num,
             mode: MODE_REG,
             size: 0,
             sectors: 0,
+            atime: now,
+            ctime: now,
+            mtime: now,
             blocks: [0u32; 15],
         };
         self.write_inode(dev, &ino)?;
@@ -608,6 +632,9 @@ impl Ext2 {
             mode: MODE_DIR,
             size: 0,
             sectors: 0,
+            atime: ext2_now(),
+            ctime: ext2_now(),
+            mtime: ext2_now(),
             blocks: [0u32; 15],
         };
         let phys = self.ensure_block(dev, &mut ino, 0)?;
@@ -741,6 +768,15 @@ impl Ext2 {
         if new_end as u64 > ino.size as u64 {
             ino.size = new_end as u32;
         }
+        // P16-1.3: a write is a modification of content AND of metadata (the size
+        // may have just changed), so mtime and ctime both advance; atime tracks
+        // the access that immediately preceded the write.
+        let now = ext2_now();
+        if now != 0 {
+            ino.mtime = now;
+            ino.ctime = now;
+            ino.atime = now;
+        }
         self.write_inode(dev, &ino)?;
         Ok(buf.len())
     }
@@ -757,9 +793,31 @@ impl Ext2 {
             Some(i) => Ok(crate::vfs::FileStat {
                 size: i.size as u64,
                 is_dir: i.mode & 0xF000 == MODE_DIR,
+                atime: u64::from(i.atime),
+                mtime: u64::from(i.mtime),
+                ctime: u64::from(i.ctime),
             }),
             None => Err(FsError::NotFound),
         }
+    }
+
+    /// P16-1.4: make this file's metadata durable.
+    ///
+    /// Same reasoning as the FAT32 driver: the block cache is write-through, so
+    /// the data blocks are already on the device. What matters here is re-issuing
+    /// the inode write and then dropping the cached copy so a later read is
+    /// served from disk rather than from a pre-sync image of the block.
+    ///
+    /// This is durability, not crash consistency. ext2 here is revision 1 with no
+    /// journal, so a power cut mid-update can still leave the volume inconsistent
+    /// -- `fsync` orders our writes, it cannot undo a torn one.
+    pub fn fsync(&self, dev: &mut AtaDrive, path: &str) -> Result<(), FsError> {
+        let ino = self
+            .resolve(dev, path)?
+            .ok_or(FsError::NotFound)?;
+        self.write_inode(dev, &ino)?;
+        crate::blkcache::flush();
+        Ok(())
     }
 
     /// Collect every physical block owned by `ino` (data + indirect tables)
@@ -952,6 +1010,10 @@ impl crate::vfs::FileSystem for Ext2 {
         Ext2::stat(self, dev, path)
     }
 
+    fn fsync(&mut self, dev: &mut AtaDrive, path: &str) -> Result<(), FsError> {
+        Ext2::fsync(self, dev, path)
+    }
+
     fn unlink(&mut self, dev: &mut AtaDrive, path: &str) -> Result<(), FsError> {
         Ext2::unlink(self, dev, path)
     }
@@ -973,7 +1035,7 @@ pub fn init() {
             crate::serial_writeln!("M7: no Linux (0x83) partition found on boot disk");
             return None;
         };
-        match Ext2::mount(&mut disk.drive, part.start_lba as u32) {
+        match Ext2::mount(&mut disk.drive, part.start_lba) {
             Ok(mut fs) => {
                 crate::serial_writeln!(
                     "M7: ext2 mounted (LBA {}): {}",

@@ -233,8 +233,12 @@ pub fn init(boot_info: &'static mut BootInfo) -> OffsetPageTable<'static> {
     // post-boot time (SYS_SPAWN context).
     PHYS_OFFSET.store(phys_offset.as_u64(), Ordering::Relaxed);
 
-    let level_4_table = unsafe { active_level_4_table(phys_offset) };
-    unsafe { OffsetPageTable::new(level_4_table, phys_offset) }
+        let level_4_table = unsafe { active_level_4_ptr(phys_offset) };
+    // SAFETY: the boot path is single-threaded and this is the ONE `&mut` to the
+    // level-4 table handed to `OffsetPageTable`, which owns it for the kernel's
+    // lifetime. Every later reader uses a shared `&` (see `page_flags`) or a raw
+    // pointer, so no second `&mut` to this allocation ever exists.
+    unsafe { OffsetPageTable::new(&mut *level_4_table, phys_offset) }
 }
 
 /// The physical-memory virtual offset recorded at boot (0 = not initialized).
@@ -249,8 +253,14 @@ pub fn runtime_mapper() -> Option<OffsetPageTable<'static>> {
     if off == 0 {
         return None;
     }
-    let level_4_table = unsafe { active_level_4_table(VirtAddr::new(off)) };
-    Some(unsafe { OffsetPageTable::new(level_4_table, VirtAddr::new(off)) })
+        let level_4_table = unsafe { active_level_4_ptr(VirtAddr::new(off)) };
+    // SAFETY: same single-owner argument as `init` — the kernel runs ONE
+    // address space, so this re-derives the same level-4 table. The returned
+    // mapper ALIASES the boot-time one rather than owning a second `&mut`;
+    // that is why every caller must hold the kernel-service lock (see
+    // `with_global_frames`), and why the crate's own `OffsetPageTable` carries
+    // the responsibility of not being used concurrently with this one.
+    Some(unsafe { OffsetPageTable::new(&mut *level_4_table, VirtAddr::new(off)) })
 }
 
 /// Post-boot frame allocator snapshot (moved here by `main` once boot-time
@@ -300,21 +310,30 @@ pub fn alloc_contiguous(count: u64) -> Option<u64> {
 }
 
 
-/// Returns a mutable reference to the active level 4 page table, using the
-/// physical-memory offset to translate its (physical) address into the virtual
-/// address space.
+/// Raw pointer to the active level-4 page table, translated through the
+/// physical-memory window into the virtual address space.
+///
+/// P16-0.2: this used to return `&'static mut PageTable`, which is unsound: the
+/// level-4 table is ONE allocation that `OffsetPageTable` already holds a
+/// `&mut` to for the lifetime of the kernel, so `page_flags` minting a second
+/// `&'static mut` to the same bytes is two mutable references to one place —
+/// undefined behaviour even though both callers are careful today. A raw
+/// pointer states the truth (this memory is shared) and lets each caller take
+/// the *weakest* reference its access needs: `&mut` for the one-time
+/// `OffsetPageTable::new`, `&` for the read-only walk in [`page_flags`].
 ///
 /// # Safety
 /// `physical_memory_offset` must be the offset configured in the bootloader so
-/// that `offset + phys` correctly maps physical memory.
-unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
+/// that `offset + phys` correctly maps physical memory. The result is only
+/// valid as long as that mapping stays in place, and must not be dereferenced
+/// while the address space is being mutated concurrently.
+unsafe fn active_level_4_ptr(physical_memory_offset: VirtAddr) -> *mut PageTable {
     use x86_64::registers::control::Cr3;
 
     let (level_4_frame, _flags) = Cr3::read();
     let phys = level_4_frame.start_address();
     let virt = physical_memory_offset + phys.as_u64();
-    let ptr: *mut PageTable = virt.as_mut_ptr();
-    &mut *ptr
+    virt.as_mut_ptr::<PageTable>()
 }
 
 /// Where the bootloader mapped the complete physical memory (`Some(off)` =
@@ -331,11 +350,16 @@ pub fn phys_offset() -> Option<u64> {
     }
 }
 
-/// Page-table at `phys`, seen through the physical-memory window.
+/// Raw pointer to the page table physically at `phys`, seen through the
+/// physical-memory window.
+///
+/// P16-0.2: raw rather than `&'static mut`, for the same reason as
+/// [`active_level_4_ptr`] — these tables are shared, and the only caller
+/// ([`page_flags`]) merely READS them, so it takes `&`.
 /// # Safety: caller guarantees `off` is the live physical-memory offset.
-unsafe fn table_at(off: u64, phys: PhysAddr) -> Option<&'static mut PageTable> {
+unsafe fn table_ptr(off: u64, phys: PhysAddr) -> Option<*const PageTable> {
     let virt = off.checked_add(phys.as_u64())?;
-    Some(&mut *(VirtAddr::new(virt).as_mut_ptr::<PageTable>()))
+    Some(VirtAddr::new(virt).as_ptr::<PageTable>())
 }
 
 /// Page-table flags of the 4 KiB page containing `vaddr` in the *active*
@@ -344,32 +368,44 @@ unsafe fn table_at(off: u64, phys: PhysAddr) -> Option<&'static mut PageTable> {
 /// them). Used by the syscall layer to validate user pointers before the
 /// kernel dereferences them. Syscall context (IF=0) only — the walk assumes
 /// the address space cannot change underneath it.
+///
+/// P16-0.2: the walk now takes shared `&` references (via raw pointers) rather
+/// than minting a `&mut` to each level. It only READS, and `&mut` here would
+/// alias the `&mut` `OffsetPageTable` holds to the same level-4 allocation.
 pub fn page_flags(vaddr: VirtAddr) -> Option<PageTableFlags> {
     let off = PHYS_OFFSET.load(Ordering::Relaxed);
     if off == 0 {
         return None;
     }
     unsafe {
-        let p4 = active_level_4_table(VirtAddr::new(off));
+        let p4 = active_level_4_ptr(VirtAddr::new(off));
+        // Bind a SHARED reference explicitly rather than indexing `(*p4)`
+        // directly: `&(*p4)[i]` is an "implicit autoref" and this lint (a
+        // hard error) exists precisely because it can quietly turn into a
+        // borrow that outlives what the raw pointer guarantees.
+        let p4: &PageTable = &*p4;
         let p4e = &p4[vaddr.p4_index()];
         if !p4e.flags().contains(PageTableFlags::PRESENT) {
             return None;
         }
-        let p3 = table_at(off, p4e.frame().ok()?.start_address())?;
+        let p3 = table_ptr(off, p4e.frame().ok()?.start_address())?;
+        let p3: &PageTable = &*p3;
         let p3e = &p3[vaddr.p3_index()];
         if !p3e.flags().contains(PageTableFlags::PRESENT)
             || p3e.flags().contains(PageTableFlags::HUGE_PAGE)
         {
             return None;
         }
-        let p2 = table_at(off, p3e.frame().ok()?.start_address())?;
+        let p2 = table_ptr(off, p3e.frame().ok()?.start_address())?;
+        let p2: &PageTable = &*p2;
         let p2e = &p2[vaddr.p2_index()];
         if !p2e.flags().contains(PageTableFlags::PRESENT)
             || p2e.flags().contains(PageTableFlags::HUGE_PAGE)
         {
             return None;
         }
-        let p1 = table_at(off, p2e.frame().ok()?.start_address())?;
+        let p1 = table_ptr(off, p2e.frame().ok()?.start_address())?;
+        let p1: &PageTable = &*p1;
         let p1e = &p1[vaddr.p1_index()];
         if !p1e.flags().contains(PageTableFlags::PRESENT) {
             return None;

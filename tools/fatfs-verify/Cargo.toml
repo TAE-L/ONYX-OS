@@ -1,0 +1,15 @@
+[package]
+name = "fatfs-verify"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fatfs-verify"
+path = "src/main.rs"
+
+[dependencies]
+# The well-known third-party `fatfs` crate, used as an INDEPENDENT READER of
+# images this kernel wrote. Caveat worth stating plainly: it is the same crate
+# build.rs uses to *create* the volume, so it is independent of our kernel and
+# of tests/fat32-verify.ps1, but not of mkfat. See docs/OPEN_ISSUES.md A2.
+fatfs = "0.3"

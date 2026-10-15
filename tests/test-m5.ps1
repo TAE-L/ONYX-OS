@@ -1,0 +1,27 @@
+# test-m5.ps1 - boots the kernel headless and prints the M5 (block layer) markers.
+$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$qemu = Join-Path $root '.toolchain\qemu\qemu-system-x86_64.exe'
+
+$tmp = Join-Path $env:TEMP 'onyx-boot'
+New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+$img = Join-Path $tmp 'bios.img'
+$log = Join-Path $root 'logs\test-m5\serial.log'
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
+Copy-Item (Join-Path $root 'target\debug\images\bios.img') $img -Force
+Remove-Item $log -ErrorAction SilentlyContinue
+
+$p = Start-Process -FilePath $qemu `
+    -ArgumentList @('-drive', "format=raw,file=$img", '-display', 'none', '-serial', "file:$log", '-no-reboot', '-snapshot') `
+    -WindowStyle Hidden -PassThru
+
+Start-Sleep -Seconds 6
+if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+Start-Sleep -Milliseconds 500
+
+Write-Host '=== M5 / syscall markers ==='
+Get-Content $log -ErrorAction SilentlyContinue |
+    Select-String -Pattern 'M5|ATA|hello from ring|user exited|PANIC|EXCEPTION' |
+    Select-Object -Last 30 | ForEach-Object { $_.Line }
+
+Write-Host '=== last 8 lines (liveness) ==='
+Get-Content $log -ErrorAction SilentlyContinue | Select-Object -Last 8

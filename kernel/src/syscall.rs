@@ -24,8 +24,6 @@
 //!                                 reuses the SYS_EXIT frame rewrite
 //!  16 = SYS_INPUT_READ(buf,len,blocking) — raw input events (24-byte
 //!                                 records, see the `input` module)
-//!  16 = SYS_INPUT_READ(buf,len,blocking) — raw input events (24-byte
-//!                                 records, see the `input` module)
 //!  17 = SYS_PERF()              — print the performance snapshot
 //!  18 = SYS_STAT(path,len,out)  — 16-byte size/is_dir record into `out`
 //!  19 = SYS_SEEK(fd,off,whence) — move a file fd's cursor (SET/CUR/END)
@@ -118,6 +116,12 @@ pub const SYS_UNLINK: u64 = 20;
 /// The 4th argument rides in r8 — `syscall` only clobbers rcx (RIP) and r11
 /// (RFLAGS), so r8 survives into the saved frame untouched.
 pub const SYS_RENAME: u64 = 21;
+/// P16-1.4: fsync(fd) -- push a file's metadata to the device.
+/// P16-1.4: fdatasync(fd) -- same here, because there is no separate metadata
+/// cache to skip. The distinction only earns its keep once a filesystem does
+/// journal replay, so both share one implementation deliberately.
+pub const SYS_FSYNC: u64 = 22;
+pub const SYS_FDATASYNC: u64 = 23;
 
 /// Scratch area for the syscall entry stub.
 ///
@@ -190,6 +194,20 @@ pub struct SyscallFrame {
     pub r15: u64,
 }
 
+/// Does the syscall stub implement the STAC idiom (an explicit AC-set window
+/// around `dispatch`)?
+///
+/// P16-0.1. Set by `program_msrs` to whatever was actually INSTALLED in LSTAR,
+/// not to what the author intended: the SMAP build installs `syscall_entry_smap`
+/// (`STAC` … `CLAC`) and every other build installs the plain stub. That makes
+/// this flag a statement about the running kernel rather than an aspiration.
+///
+/// It is `false` on a CPU without SMAP, and that is correct rather than a gap:
+/// with no SMAP there is nothing to bypass. On a CPU WITH SMAP it is `true`, and
+/// `sec::init` only enables SMAP after this is settled.
+pub static SYSCALL_STAC_FRAMES: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Program the SYSCALL/SYSRET MSRs for the CURRENT CPU. Called once per CPU:
 /// `init` on the boot CPU (after `gdt::init`), `init_ap` on each AP.
 ///
@@ -205,11 +223,29 @@ fn program_msrs() {
     assert_eq!(user_code - user_data, 8, "GDT: user data/code not adjacent");
     let star = ((user_code - 16) << 48) | (kernel_cs << 32);
 
-    let entry_addr = syscall_entry as *const () as u64;
+    // Pick the entry stub that matches this CPU's SMAP state.
+    //
+    // `stac` raises `#UD` on a CPU without SMAP, so the STAC-bearing stub must
+    // not be installed there. `sec::smap_enabled()` is already settled by the
+    // time `program_msrs` runs (`sec::init` is called before `syscall::init` in
+    // the boot path), so this is a plain read of a decided answer.
+    let smap = crate::sec::smap_enabled();
+    let entry_addr = if smap {
+        syscall_entry_smap as *const () as u64
+    } else {
+        syscall_entry as *const () as u64
+    };
     msr_write(Star::MSR, star);
     msr_write(LStar::MSR, entry_addr);
     // Clear TF/IF/DF/NT/IOPL/AC/VIP/VIF on entry (Linux's proven mask);
-    // notably IF=0 gives the kernel an interrupt-free entry window.
+    // notably IF=0 gives the kernel an interrupt-free entry window, and the
+    // AC (alignment check) bit in this mask is what keeps SMEP/SMAP enforced:
+    // the user's RFLAGS land in R11 with AC preserved, and an AC=1 entry would
+    // make the CPU skip SMAP/SMEP checks for architectural accesses.
+    //
+    // P16-0.1 caveat: `SFMASK` clears the *live* RFLAGS on entry but does NOT
+    // clear the R11 image that `sysretq` later loads, so AC can still be set in
+    // the RFLAGS ring-3 runs with. See `SYSCALL_STAC_FRAMES` and `sec.rs`.
     msr_write(SFMask::MSR, 0x257FD5);
 
     // EFER.SCE (bit 0): enable the `syscall` instruction.
@@ -224,7 +260,14 @@ fn program_msrs() {
         SCRATCH.dispatch_ptr = dispatch as *const () as u64;
     }
 
-    serial_writeln!("syscall: STAR={star:#x} LSTAR={entry_addr:#x} SFMASK=0x257fd5 EFER.SCE=1");
+    serial_writeln!(
+        "syscall: STAR={star:#x} LSTAR={entry_addr:#x} SFMASK=0x257fd5 EFER.SCE=1 \
+         (entry={})",
+        if smap { "smap/stac" } else { "plain" }
+    );
+    // The stub that is actually installed now decides whether the AC/SM bypass
+    // of SMEP/SMAP is closed for the duration of `dispatch`.
+    SYSCALL_STAC_FRAMES.store(smap, core::sync::atomic::Ordering::Release);
 }
 
 /// Program the SYSCALL MSRs on the boot CPU (after `gdt::init`).
@@ -258,53 +301,92 @@ pub fn set_kernel_stack_top(top: u64) {
     crate::smp::set_kstack_top(top);
 }
 
-/// SYSCALL entry. On arrival: RSP = user RSP (untouched by `syscall`),
-/// RCX = user RIP, R11 = user RFLAGS, IF = 0 (SFMASK). All user state is
-/// captured in a `SyscallFrame`, `dispatch` runs, then everything is restored
-/// and `sysretq` jumps back to ring 3.
+/// Body of the SYSCALL entry stub, with an optional SMAP window.
+///
+/// `$stac` / `$clac` are the two instructions that bracket `dispatch` with an
+/// explicit AC-set window (see `sec`). They are *parameters* rather than always
+/// emitted because `STAC` raises `#UD` on a CPU without SMAP — the non-SMAP
+/// build must contain no `stac` instruction at all, or every syscall from a
+/// ring-3 program would fault.
+///
+/// Macro-expanded before `naked_asm!` sees it, so the proc-macro receives a
+/// plain list of string literals.
+macro_rules! syscall_entry_asm {
+    ($stac:expr, $clac:expr) => {
+        naked_asm!(
+            // Park the true user RSP in this CPU's slot, then switch to the
+            // current task's kernel stack from this CPU's slot. SFMASK cleared IF
+            // on entry, so no interrupt can run between the two — and the slots
+            // are private to this CPU, so a concurrent syscall on another core
+            // cannot clobber them.
+            "mov qword ptr gs:[40], rsp",
+            "mov rsp, qword ptr gs:[32]",
+            // Open the SMAP window (empty string when the CPU has no SMAP).
+            // Every deliberate kernel->user write in `dispatch` — return
+            // values, the `copy_to_user` equivalents — is a supervisor access to
+            // a user-accessible page, which SMAP correctly refuses without it.
+            $stac,
+            // Save all user registers (frame layout matches `SyscallFrame`).
+            "push r15", "push r14", "push r13", "push r12",
+            "push r11", "push r10", "push r9", "push r8",
+            "push rbp", "push rdi", "push rsi", "push rdx",
+            "push rcx", "push rbx", "push rax",
+            // Frame padding for 16-byte alignment (kstack_top is 16-aligned).
+            "sub rsp, 24",
+            // Store the true user_rsp at frame offset 16.
+            "mov rax, qword ptr gs:[40]",
+            "mov [rsp + 16], rax",
+            // dispatch(&mut frame) — global function pointer in SCRATCH.
+            "mov rdi, rsp",
+            "mov rax, [rip + SCRATCH + 16]",
+            "call rax",
+            // Close the window immediately: nothing past this point is a
+            // deliberate user access, and leaving it open would blanket-bypass
+            // SMAP for the rest of the return path as well.
+            $clac,
+            // Restore registers.
+            "add rsp, 24",
+            "pop rax", "pop rbx", "pop rcx", "pop rdx",
+            "pop rsi", "pop rdi", "pop rbp", "pop r8",
+            "pop r9", "pop r10", "pop r11", "pop r12",
+            "pop r13", "pop r14", "pop r15",
+            // Back to the user stack: the true user RSP lives in THIS frame at
+            // [frame+16] = [rsp_after_pops - 128] — reading it from the frame
+            // (not a shared slot) makes a suspended syscall resume safely even if
+            // other tasks ran their own syscalls meanwhile.
+            "mov rsp, [rsp - 128]",
+            "sysretq",
+        )
+    };
+}
+
+/// SYSCALL entry for a CPU **without** SMAP. Contains no `stac`/`clac`.
+///
+/// On arrival: RSP = user RSP (untouched by `syscall`), RCX = user RIP,
+/// R11 = user RFLAGS, IF = 0 (SFMASK). All user state is captured in a
+/// `SyscallFrame`, `dispatch` runs, then everything is restored and `sysretq`
+/// jumps back to ring 3.
 ///
 /// Naked (no prologue) so RSP is still the user RSP on entry. M9.8: the
 /// kernel-stack top and the parked user RSP live in the CALLING CPU's block
 /// (`gs:[32]`, `gs:[40]` — see `smp::PerCpu`); `dispatch` is a plain global
 /// read via RIP-relative addressing to the `no_mangle` symbol.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
-    naked_asm!(
-        // Park the true user RSP in this CPU's slot, then switch to the
-        // current task's kernel stack from this CPU's slot. SFMASK cleared IF
-        // on entry, so no interrupt can run between the two — and the slots
-        // are private to this CPU, so a concurrent syscall on another core
-        // cannot clobber them.
-        "mov qword ptr gs:[40], rsp",
-        "mov rsp, qword ptr gs:[32]",
-        // Save all user registers (frame layout matches `SyscallFrame`).
-        "push r15", "push r14", "push r13", "push r12",
-        "push r11", "push r10", "push r9", "push r8",
-        "push rbp", "push rdi", "push rsi", "push rdx",
-        "push rcx", "push rbx", "push rax",
-        // Frame padding for 16-byte alignment (kstack_top is 16-aligned).
-        "sub rsp, 24",
-        // Store the true user_rsp at frame offset 16.
-        "mov rax, qword ptr gs:[40]",
-        "mov [rsp + 16], rax",
-        // dispatch(&mut frame) — global function pointer in SCRATCH.
-        "mov rdi, rsp",
-        "mov rax, [rip + SCRATCH + 16]",
-        "call rax",
-        // Restore registers.
-        "add rsp, 24",
-        "pop rax", "pop rbx", "pop rcx", "pop rdx",
-        "pop rsi", "pop rdi", "pop rbp", "pop r8",
-        "pop r9", "pop r10", "pop r11", "pop r12",
-        "pop r13", "pop r14", "pop r15",
-        // Back to the user stack: the true user RSP lives in THIS frame at
-        // [frame+16] = [rsp_after_pops - 128] — reading it from the frame
-        // (not a shared slot) makes a suspended syscall resume safely even if
-        // other tasks ran their own syscalls meanwhile.
-        "mov rsp, [rsp - 128]",
-        "sysretq",
-    );
+    syscall_entry_asm!("", "");
+}
+
+/// SYSCALL entry for a CPU **with** SMAP: brackets `dispatch` in
+/// `STAC`/`CLAC` so deliberate kernel->user writes are permitted.
+///
+/// A separate symbol rather than a runtime branch, because `stac` must not
+/// merely be *skipped* on an older CPU — it must not be PRESENT there, or it
+/// raises `#UD`. `program_msrs` points LSTAR at whichever matches this CPU.
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+unsafe extern "C" fn syscall_entry_smap() {
+    syscall_entry_asm!("stac", "clac");
 }
 
 /// Syscall dispatcher. Runs with IF=0 on the current task's kernel stack.
@@ -345,6 +427,7 @@ extern "C" fn dispatch(f: &mut SyscallFrame) {
         SYS_SEEK => f.rax = sys_seek(f.rdi, f.rsi, f.rdx),
         SYS_UNLINK => f.rax = sys_unlink(f.rdi, f.rsi),
         SYS_RENAME => f.rax = sys_rename(f.rdi, f.rsi, f.rdx, f.r8),
+    SYS_FSYNC | SYS_FDATASYNC => f.rax = sys_fsync(f.rdi),
         _ => f.rax = errno::err(errno::ENOSYS), // unknown syscall number
     }
     crate::perf::syscall_exit(t0);
@@ -875,21 +958,57 @@ fn sys_ls(path: u64, len: u64) -> u64 {
 }
 
 /// stat(path, len, out): write a 16-byte `Stat` record into the validated
-/// user buffer at `out` (`u64 size` at +0 little-endian, `u8 is_dir` at +8).
+/// fsync(fd) / fdatasync(fd): push the file's metadata to the device.
+///
+/// P16-1.4. The fd is resolved back to its PATH rather than acting on the fd
+/// table entry directly: the fd table stores a name and a position, not a
+/// filesystem, so the path is the only thing that can select a backend.
+///
+/// Bad fd -> -EBADF. A path that no longer resolves -> -ENOENT.
+fn sys_fsync(fd: u64) -> u64 {
+    if fd < 3 {
+        return errno::err(errno::EBADF);
+    }
+    let name = match with_fd(fd as usize, |e| e.name.clone()) {
+        Some(n) => n,
+        None => return errno::err(errno::EBADF),
+    };
+    match vfs::fsync(&name) {
+        Ok(()) => 0,
+        Err(e) => fs_err(e),
+    }
+}
+
+/// user buffer at `out`, 40 bytes:
+///
+/// ```text
+///   +0   u64 size
+///   +8   u64 atime   (Unix seconds; 0 = not recorded)
+///   +16  u64 mtime
+///   +24  u64 ctime
+///   +32  u64 flags   (bit 0 = is_dir)
+/// ```
+///
+/// P16-1.3: this grew from 16 bytes. The old layout had `is_dir` as a single byte
+/// at +8 with 7 bytes of padding, so the three timestamps did not fit and were
+/// dropped on the floor. There are no external consumers of this ABI yet, and
+/// padding it out now is cheaper than ever being able to remove it.
 fn sys_stat(path: u64, len: u64, out: u64) -> u64 {
     let path = match user_path(path, len) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    if !user_buf_ok(out, 16, true) {
+    if !user_buf_ok(out, 40, true) {
         return errno::err(errno::EFAULT);
     }
     match vfs::stat(&path) {
         Ok(st) => {
-            let buf = unsafe { core::slice::from_raw_parts_mut(out as *mut u8, 16) };
+            let buf = unsafe { core::slice::from_raw_parts_mut(out as *mut u8, 40) };
             buf[0..8].copy_from_slice(&st.size.to_le_bytes());
-            buf[8] = u8::from(st.is_dir);
-            buf[9..16].fill(0);
+            buf[8..16].copy_from_slice(&st.atime.to_le_bytes());
+            buf[16..24].copy_from_slice(&st.mtime.to_le_bytes());
+            buf[24..32].copy_from_slice(&st.ctime.to_le_bytes());
+            buf[32..40].copy_from_slice(&u64::from(st.is_dir).to_le_bytes());
             0
         }
         Err(e) => fs_err(e),

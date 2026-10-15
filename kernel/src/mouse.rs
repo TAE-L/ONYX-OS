@@ -40,6 +40,16 @@ struct Packet {
 
 static mut PACKET: Packet = Packet { dx: 0, dy: 0, left: false, right: false };
 
+/// Left-button state as of the PREVIOUS completed packet.
+///
+/// P6c: button EDGE detection for the sign-in screen. It cannot be derived from
+/// `PACKET.left`, because that field has already been overwritten with the new
+/// packet's state by the time anything outside the assembly section runs — so
+/// comparing against it would always read "no change" and no click would ever
+/// be delivered. This is captured before the overwrite, while the previous
+/// value is still intact, and is ISR-only like the rest of the packet state.
+static mut PREV_LEFT: bool = false;
+
 // Packet assembly state (ISR only, interrupts off).
 static mut IDX: usize = 0;
 static mut FLAGS: u8 = 0;
@@ -117,7 +127,7 @@ pub fn handle_irq() {
         let mut data = DATA.lock();
         unsafe { data.read() }
     };
-    let mut completed: Option<(i16, i16, u8)> = None;
+    let mut completed: Option<(i16, i16, u8, bool)> = None;
     {
         let _ksl = crate::ksl::lock();
         unsafe {
@@ -147,8 +157,13 @@ pub fn handle_irq() {
                     };
                     PACKET.dx = DX;
                     PACKET.dy = dy;
+                    // Snapshot the button state BEFORE overwriting it, so the
+                    // edge check below sees the transition rather than
+                    // comparing the new state against itself.
+                    let left_was_down = PREV_LEFT;
                     PACKET.left = (FLAGS & 0x01) != 0;
                     PACKET.right = (FLAGS & 0x02) != 0;
+                    PREV_LEFT = PACKET.left;
                     IDX = 0;
                     // Button bitmask for the input ring, computed here while
                     // the assembly state is still owned by this section.
@@ -161,13 +176,13 @@ pub fn handle_irq() {
                     } else {
                         0
                     });
-                    completed = Some((DX, dy, buttons));
+                    completed = Some((DX, dy, buttons, left_was_down));
                 }
                 _ => IDX = 0,
             }
         }
     }
-    if let Some((dx, dy, buttons)) = completed {
+    if let Some((dx, dy, buttons, left_was_down)) = completed {
         // Liveness stamp for the stall watchdog in `run_reader`.
         SAW_PKT.store(true, Ordering::Relaxed);
         LAST_PKT_MS.store(crate::apic::ms_since_boot(), Ordering::Relaxed);
@@ -179,6 +194,21 @@ pub fn handle_irq() {
         // "up" as positive Y, but screen coordinates grow downward — negate Y
         // to match. X is already correct.
         crate::framebuffer::move_cursor(dx as i32, -(dy as i32));
+        // P6c: route a button PRESS to the sign-in screen.
+        //
+        // The edge is (was-up -> now-down) against `left_was_down`, the state
+        // captured BEFORE this packet overwrote it. Detecting only the press
+        // (not the release) is what stops one physical click from toggling the
+        // power menu twice.
+        //
+        // The click is QUEUED, not acted on here: `signin::on_click` repaints
+        // the whole screen, and doing that in IRQ context would hold the
+        // framebuffer lock across a full-screen redraw with interrupts off.
+        // `signin::run_pending`, a task, drains the queue.
+        if (buttons & crate::input::BTN_LEFT) != 0 && !left_was_down {
+            let (cx, cy) = crate::framebuffer::cursor_pos();
+            crate::signin::queue_click(cx, cy);
+        }
     }
 }
 

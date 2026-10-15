@@ -24,6 +24,9 @@ const SYS_STAT: u64 = 18;
 const SYS_SEEK: u64 = 19;
 const SYS_UNLINK: u64 = 20;
 const SYS_RENAME: u64 = 21;
+// P16-1.4: fsync / fdatasync. Both take an fd.
+const SYS_FSYNC: u64 = 22;
+const SYS_FDATASYNC: u64 = 23;
 
 const DIR: &[u8] = b"/SUBDIR";
 const PATH: &[u8] = b"/SUBDIR/NOTE.TXT";
@@ -38,6 +41,12 @@ const FAIL: &[u8] = b"fstest: FAILED\n";
 const RF: &[u8] = b"/C3REN.DAT";
 const RF2: &[u8] = b"/C3REN2.DAT";
 const RF3: &[u8] = b"/C3REN3.DAT";
+// P16-1.4: durability fixture. `tests/test-fsync.ps1` boots WITHOUT -snapshot,
+// so whatever this writes must be visible on the raw image afterwards, read back
+// by an INDEPENDENT host-side reader. That is the only real proof that fsync did
+// something -- asking the kernel whether it fsynced proves nothing at all.
+const FSYNC_FILE: &[u8] = b"/Fsync Durability Probe.txt";
+const FSYNC_BODY: &[u8] = b"fsync durability payload 0123456789abcdef\n";
 const MP: &[u8] = b"/NO3/C3MISSING.TXT";
 const KHEAP: u64 = 0x4444_4444_0000;
 
@@ -206,6 +215,59 @@ pub extern "C" fn _start() -> ! {
 
         // C2: errno normalization — each failure class returns its specific
         // -errno (not just any negative value).
+        // ---------------------------------------------------------------------
+        // P16-1.4: fsync / fdatasync.
+        // ---------------------------------------------------------------------
+        // The file is deliberately NOT removed at the end: `test-fsync.ps1`
+        // boots without -snapshot and an independent host-side reader looks for
+        // this exact name, size and payload in the raw image after the guest is
+        // gone. Deleting it here would leave nothing to verify.
+        let fsync_checks = {
+            let fd = syscall3(SYS_OPEN, FSYNC_FILE.as_ptr() as u64, FSYNC_FILE.len() as u64, 0);
+            if is_err(fd) {
+                say(b"fstest: fsync BAD (open)\n");
+                false
+            } else {
+                let w = syscall3(
+                    SYS_WRITE,
+                    fd,
+                    FSYNC_BODY.as_ptr() as u64,
+                    FSYNC_BODY.len() as u64,
+                );
+                let s1 = syscall3(SYS_FSYNC, fd, 0, 0);
+                let s2 = syscall3(SYS_FDATASYNC, fd, 0, 0);
+                let bad = syscall3(SYS_FSYNC, 99, 0, 0); // not a live fd
+                let _ = syscall3(SYS_CLOSE, fd, 0, 0);
+
+                let wrote = !is_err(w) && w == FSYNC_BODY.len() as u64;
+                // Re-read it back through a fresh fd: proves the sync did not
+                // leave the cache holding something the disk never got.
+                let rf = syscall3(SYS_OPEN, FSYNC_FILE.as_ptr() as u64, FSYNC_FILE.len() as u64, 0);
+                let mut buf = [0u8; 64];
+                let mut n = 0u64;
+                if !is_err(rf) {
+                    n = syscall3(SYS_READ, rf, buf.as_mut_ptr() as u64, FSYNC_BODY.len() as u64);
+                    let _ = syscall3(SYS_CLOSE, rf, 0, 0);
+                }
+                let mut same = n as usize == FSYNC_BODY.len();
+                if same {
+                    for i in 0..FSYNC_BODY.len() {
+                        if buf[i] != FSYNC_BODY[i] {
+                            same = false;
+                            break;
+                        }
+                    }
+                }
+                let ok = wrote && s1 == 0 && s2 == 0 && bad == err(EBADF) && same;
+                say(if ok {
+                    b"fstest: fsync OK\n"
+                } else {
+                    b"fstest: fsync BAD\n"
+                });
+                ok
+            }
+        };
+
         let errno_checks = {
             let missing = b"/NO/SUCH.TXT";
             let op = syscall3(SYS_OPEN, missing.as_ptr() as u64, missing.len() as u64, 0);
@@ -247,20 +309,39 @@ pub extern "C" fn _start() -> ! {
         // ---------------------------------------------------------------------
         let c3_checks = {
             // stat on the file written at the top (size must match, not a dir).
-            let mut st = [0u8; 16];
+            // P16-1.3: the buffer grew from 16 to 40 bytes -- size, atime, mtime,
+            // ctime, flags -- and `is_dir` moved into flags bit 0, so the old
+            // `st[8] != 0` test is now reading the low byte of atime.
+            let mut st = [0u8; 40];
             let sret = syscall3(
                 SYS_STAT,
                 PATH.as_ptr() as u64,
                 PATH.len() as u64,
                 st.as_mut_ptr() as u64,
             );
-            let st_size = u64::from_le_bytes([st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]]);
+            let rd64 = |b: &[u8; 40], o: usize| {
+                u64::from_le_bytes([
+                    b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+                ])
+            };
+            let st_size = rd64(&st, 0);
             let mut stat_ok =
-                sret == 0 && st_size == MSG.len() as u64 && st[8] == 0;
+                sret == 0 && st_size == MSG.len() as u64 && rd64(&st, 32) & 1 == 0;
+
+            // P16-1.3: this file was written moments ago, so all three timestamps
+            // must be plausible present-day Unix seconds. The bounds are chosen so
+            // that a zeroed stamp (no RTC), a 1970 default, and FAT's 2107 ceiling
+            // all fail -- a round-trip test that only checks "non-zero" would pass
+            // a driver that wrote garbage.
+            const TS_LO: u64 = 1_600_000_000; // 2020-09-13
+            const TS_HI: u64 = 4_000_000_000; // 2096, under FAT's 2107 limit
+            let ts_ok = [(rd64(&st, 8)), (rd64(&st, 16)), (rd64(&st, 24))]
+                .iter()
+                .all(|&t| (TS_LO..TS_HI).contains(&t));
 
             // stat on a directory sets is_dir; missing -> -ENOENT; invalid
             // out-pointer -> -EFAULT.
-            let mut ds = [0u8; 16];
+            let mut ds = [0u8; 40];
             let dsret = syscall3(
                 SYS_STAT,
                 DIR.as_ptr() as u64,
@@ -276,7 +357,7 @@ pub extern "C" fn _start() -> ! {
             let esret = syscall3(SYS_STAT, DIR.as_ptr() as u64, DIR.len() as u64, KHEAP);
             stat_ok = stat_ok
                 && dsret == 0
-                && ds[8] != 0
+                && rd64(&ds, 32) & 1 != 0
                 && msret == err(ENOENT)
                 && esret == err(EFAULT);
 
@@ -335,17 +416,18 @@ pub extern "C" fn _start() -> ! {
             let un_ok = unh0 && unh1 && und && unm;
 
             say(if stat_ok { b"fstest: stat OK\n" } else { b"fstest: stat BAD\n" });
+            say(if ts_ok { b"fstest: timestamps OK\n" } else { b"fstest: timestamps BAD\n" });
             say(if seek_ok { b"fstest: seek OK\n" } else { b"fstest: seek BAD\n" });
             say(if ren_ok { b"fstest: rename OK\n" } else { b"fstest: rename BAD\n" });
             say(if un_ok { b"fstest: unlink OK\n" } else { b"fstest: unlink BAD\n" });
             // RF2 is left behind holding DEEPMSG after the successful rename.
-            stat_ok && seek_ok && ren_ok && un_ok
+            stat_ok && ts_ok && seek_ok && ren_ok && un_ok
         };
 
-        say(if ok && ok2 && badptr_checks && ok4 && errno_checks && c3_checks { PASS } else { FAIL });
+        say(if ok && ok2 && badptr_checks && ok4 && errno_checks && c3_checks && fsync_checks { PASS } else { FAIL });
         syscall3(
             SYS_EXIT,
-            if ok && ok2 && badptr_checks && ok4 && errno_checks && c3_checks { 0 } else { 1 },
+            if ok && ok2 && badptr_checks && ok4 && errno_checks && c3_checks && fsync_checks { 0 } else { 1 },
             0,
             0,
         );

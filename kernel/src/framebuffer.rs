@@ -103,7 +103,14 @@ impl<'a> FrameBufferWriter<'a> {
         self.y_pos += 10 * self.scale; // (8px glyph + 2px spacing) × scale
     }
 
-    fn set_pixel(&mut self, x: usize, y: usize, rgb: u32) {
+    /// Write one pixel as `0xRRGGBB`, ignoring out-of-bounds coordinates.
+    ///
+    /// P6c: made public so the sign-in screen can draw through the same writer
+    /// the console uses, with the same pixel-format handling. It deliberately
+    /// stays the ONLY format-aware write in this type — a second pixel path that
+    /// forgot the BGR byte swap is exactly the bug that shows up as a screen of
+    /// wrong-coloured text.
+    pub fn set_pixel(&mut self, x: usize, y: usize, rgb: u32) {
         if x >= self.info.width || y >= self.info.height {
             return;
         }
@@ -133,6 +140,108 @@ impl<'a> FrameBufferWriter<'a> {
             // `PixelFormat` is non-exhaustive (foreign crate): must cover future variants.
             _ => {}
         }
+    }
+
+    /// Read one pixel back as `0xRRGGBB`, or `None` when out of bounds.
+    ///
+    /// P6c: added for the sign-in screen, which blends antialiased glyph alpha
+    /// against whatever is already there and therefore cannot do that blind.
+    /// It lives next to `set_pixel` so the format handling can never drift
+    /// between the two - `U8` in particular is lossy on the way out and must be
+    /// decoded with the same weighting `set_pixel` encodes with.
+    pub fn get_pixel(&self, x: usize, y: usize) -> Option<u32> {
+        if x >= self.info.width || y >= self.info.height {
+            return None;
+        }
+        let i = (y * self.info.stride + x) * self.info.bytes_per_pixel;
+        if i + 3 > self.framebuffer.len() {
+            return None;
+        }
+        let (a, b, c) = (
+            self.framebuffer[i] as u32,
+            self.framebuffer[i + 1] as u32,
+            self.framebuffer[i + 2] as u32,
+        );
+        Some(match self.info.pixel_format {
+            PixelFormat::Bgr => (c << 16) | (b << 8) | a,
+            // `U8` stores a luma average; invert that weighting so a blend
+            // round-trips instead of drifting on every composite.
+            PixelFormat::U8 => {
+                let v = (a * 3).min(255);
+                (v << 16) | (v << 8) | v
+            }
+            _ => (a << 16) | (b << 8) | c,
+        })
+    }
+
+    /// Fill one whole scanline with a single colour.
+    ///
+    /// P6c: the sign-in backdrop is a vertical gradient, and expressing it as
+    /// N full-width row writes keeps the inner loop a straight byte fill. It
+    /// deliberately does NOT take a width: a caller that passes a width and a
+    /// stride that disagree gets a partial row, which is a bug that shows up
+    /// as a seam rather than as a crash.
+    pub fn fill_row(&mut self, y: usize, rgb: u32, width: usize) {
+        if y >= self.info.height {
+            return;
+        }
+        let width = width.min(self.info.width);
+        // P16-0.3: hoist the row base and the channel bytes, then write the
+        // pixels directly instead of calling `set_pixel` per pixel.
+        //
+        // This is the sign-in screen's backdrop - 1920 rows x 1920 px = 3.7 M
+        // calls to `set_pixel`, each re-doing FOUR bounds checks (x, y, and the
+        // buffer-length test twice) plus a `PixelFormat` match, for a colour that
+        // is constant across the whole row. `fill_row` is only ever called with
+        // a row that has already been bounds-checked by the caller and by the
+        // `width.min(...)` above, so those checks were pure overhead.
+        //
+        // The format handling is duplicated from `set_pixel` deliberately and
+        // is the one thing that must NOT drift: a change to `set_pixel` has to
+        // be mirrored here, which the comment marks.
+        let bpp = self.info.bytes_per_pixel;
+        let stride = self.info.stride;
+        let row = y * stride;
+        if (row + width) * bpp + 3 > self.framebuffer.len() {
+            return;
+        }
+        let base = row * bpp;
+        let (r, g, b) = (
+            ((rgb >> 16) & 0xff) as u8,
+            ((rgb >> 8) & 0xff) as u8,
+            (rgb & 0xff) as u8,
+        );
+        let fb = &mut self.framebuffer[base..base + width * bpp];
+        match self.info.pixel_format {
+            PixelFormat::Rgb => {
+                for px in fb.chunks_exact_mut(bpp) {
+                    px[0] = r;
+                    px[1] = g;
+                    px[2] = b;
+                }
+            }
+            PixelFormat::Bgr => {
+                for px in fb.chunks_exact_mut(bpp) {
+                    px[0] = b;
+                    px[1] = g;
+                    px[2] = r;
+                }
+            }
+            PixelFormat::U8 => {
+                // Luma average — the same lossy encoding `set_pixel` uses.
+                let v = ((r as u32 + g as u32 + b as u32) / 3) as u8;
+                for px in fb.chunks_exact_mut(bpp) {
+                    px[0] = v;
+                }
+            }
+            // `PixelFormat` is non-exhaustive (foreign crate): must cover future variants.
+            _ => {}
+        }
+    }
+
+    /// Screen dimensions, for callers that need geometry without the writer.
+    pub fn dims(&self) -> (usize, usize) {
+        (self.info.width, self.info.height)
     }
 }
 
@@ -890,6 +999,95 @@ pub fn current_geometry() -> (usize, usize, usize) {
     }
 }
 
+/// Run `f` with exclusive access to the framebuffer writer, then mark the
+/// surface fully damaged so the change reaches scanout.
+///
+/// P6c: this is how a module OUTSIDE this file draws (the sign-in screen). It
+/// exists as a single chokepoint for three rules that are easy to get wrong
+/// individually and impossible to get wrong here:
+///
+///  1. **One acquisition per call.** `f` never re-enters, so there is no way to
+///     deadlock against this module's own spin lock.
+///  2. **Interrupts off while `FB` is held.** The mouse IRQ handler
+///     (`move_cursor`) takes the same lock; with interrupts ON, a task holding
+///     `FB` could be preempted by that handler, which would then spin forever
+///     on a lock the suspended task can never release. Every other draw path
+///     here uses `without_interrupts` for the same reason.
+///  3. **Damage is marked AFTER the lock is released.** `mark_dirty_rect` takes
+///     the DIRTY mutex, and taking two locks in one critical section is how
+///     lock-order inversions start.
+///
+/// It also does two things every caller would otherwise get wrong:
+///
+///  * **Re-arms the software cursor.** The sprite caches the background pixels
+///    it covers (`SAVE`) so a move can restore them, and only `move_cursor`
+///    refreshes that cache. A caller that repaints the surface — which is all a
+///    caller of this function can do — leaves `SAVE` describing the PREVIOUS
+///    contents of those pixels. The next mouse move then restores that stale
+///    content over the new frame, which is what made the sign-in screen appear
+///    to flicker: it flashed the boot text back through the pointer on every
+///    move. Gating on `SW_VISIBLE` keeps this a no-op once the hardware cursor
+///    owns the pointer, so it can never stamp an orphan arrow.
+///  * **Reads the geometry once**, rather than letting each caller call
+///    `current_geometry` (which re-takes the lock) to find the screen size.
+///
+/// `f` receives the writer and its `(width, height)`. `None` means no writer is
+/// installed (headless / before `init_global`), which callers must tolerate.
+pub fn with_writer<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut FrameBufferWriter, usize, usize) -> R,
+{
+    with_writer_region(f, None)
+}
+
+/// As [`with_writer`], but damage only `region` (inclusive bounds) instead of
+/// the whole surface.
+///
+/// P6c: this exists because a FULL-surface repaint is not merely wasteful on the
+/// dispi backend — it is visible. That backend maps the linear framebuffer
+/// directly, so QEMU scans out the very memory the console is writing. Painting
+/// 2 M pixels row by row therefore shows up on screen as a top-to-bottom wipe,
+/// which looked exactly like a flicker. Toggling a 400x150 menu must repaint
+/// 400x150 pixels, not the whole screen.
+///
+/// `None` means "mark everything" (the original behaviour).
+pub fn with_writer_region<F, R>(f: F, region: Option<(usize, usize, usize, usize)>) -> Option<R>
+where
+    F: FnOnce(&mut FrameBufferWriter, usize, usize) -> R,
+{
+    let out = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut slot = FB.lock();
+        let w = slot.as_mut()?;
+        let (width, height) = (w.info.width, w.info.height);
+        let drawn = f(w, width, height);
+        // Re-capture the background under the pointer and re-stamp the sprite,
+        // now that the pixels under it are final. Lock-free body: FB is already
+        // held here, and the cursor must not be moved between the repaint and
+        // this re-capture.
+        if SW_VISIBLE.load(Ordering::Acquire) {
+            refresh_cursor_save_locked(w);
+        }
+        Some((drawn, width, height))
+    })?;
+    // Outside the IF=0 window and with FB released: see rule 3.
+    let (drawn, width, height) = out;
+    match region {
+        // Clamp to the surface: a stale or oversized box would otherwise address
+        // outside the backing, and a zero-area box is not damage at all.
+        Some((x0, y0, x1, y1)) => {
+            let x0 = x0.min(width.saturating_sub(1));
+            let y0 = y0.min(height.saturating_sub(1));
+            let x1 = x1.min(width.saturating_sub(1));
+            let y1 = y1.min(height.saturating_sub(1));
+            if x1 >= x0 && y1 >= y0 {
+                mark_dirty_rect(x0, y0, x1, y1);
+            }
+        }
+        None => mark_all_dirty(width, height),
+    }
+    Some(drawn)
+}
+
 /// Apply a mouse delta and redraw. Called from IRQ 12 — keep it allocation-
 /// free and fast (it is ~500 byte writes for a full-sprite move).
 pub fn move_cursor(dx: i32, dy: i32) {
@@ -1560,7 +1758,42 @@ pub fn draw_anim_frame(i: u32) {
     mark_dirty_rect(x0, y0, x1, y1);
 }
 
+/// Whether ring-3 console output is mirrored onto the framebuffer.
+///
+/// P6c: this started out `true` (the M8 shell's typed keys and output were drawn
+/// as a live terminal). Once the sign-in screen took over the framebuffer, that
+/// mirroring became the noise problem: the shell kept printing its prompt and
+/// command results straight over the sign-in screen, so the screen the user
+/// signs into was never actually visible.
+///
+/// The default is now `false`. `SYS_WRITE` still reaches serial in full, so
+/// every test script and the boot log are unaffected — this gate ONLY decides
+/// whether those bytes are also painted to the display.
+static CONSOLE_MIRROR: AtomicBool = AtomicBool::new(false);
+
+/// Turn the on-screen terminal mirror on or off.
+///
+/// Setting it false stops painting but keeps `CONSOLE_BYTES` counting, so the
+/// liveness counters and `[clock]` serial lines still prove the path is alive.
+pub fn set_console_mirror(on: bool) {
+    CONSOLE_MIRROR.store(on, Ordering::Release);
+}
+
+/// Is the on-screen terminal mirror currently on?
+pub fn console_mirror() -> bool {
+    CONSOLE_MIRROR.load(Ordering::Acquire)
+}
+
 pub fn console_bytes(data: &[u8]) {
+    // P6c: when the mirror is off (the default, now that the sign-in screen owns
+    // the framebuffer) count the bytes and stop. Skipping the whole locked
+    // section is the point: taking FB + CONSOLE for output that is then thrown
+    // away is pure contention against the screen that IS visible, and it would
+    // repaint the cursor sprite over the sign-in screen for nothing.
+    if !console_mirror() {
+        CONSOLE_BYTES.fetch_add(data.len(), Ordering::Relaxed);
+        return;
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         // P6c: the sprite must come OFF the framebuffer for the duration of
         // the write. `scroll_up` memmoves whole rows, so a sprite inside the

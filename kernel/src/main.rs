@@ -12,6 +12,7 @@ mod ata;
 mod bench;
 mod blkcache;
 mod block;
+mod desktop;
 mod errno;
 mod ext2;
 mod fat;
@@ -30,9 +31,12 @@ mod pci;
 mod perf;
 mod pic;
 mod pit;
+mod power;
 mod rtc;
 mod scheduler;
+mod sec;
 mod serial;
+mod signin;
 mod smp;
 mod compositor;
 mod surface;
@@ -63,9 +67,15 @@ const CONFIG: bootloader_api::BootloaderConfig = {
 
 entry_point!(kernel_main, config = &CONFIG);
 
-/// Text drawn to the framebuffer (visible in the QEMU window). The text
-/// cursor starts just below the header bar drawn by `draw_header`.
-const SCREEN_TEXT: &str = "    Hello from OnyxOS 0.1!\n    M7: ext2 + FAT32 live - RTC clock in the header - move the mouse!";
+/// Text drawn to the framebuffer at boot, under the header bar.
+///
+/// P6c: this was a two-line "Hello from OnyxOS" banner. The sign-in screen now
+/// owns the framebuffer, so the only thing that should be visible during boot is
+/// a single quiet progress line — the detailed boot log still goes to serial in
+/// full, which is where the test scripts read it from. Keeping verbose text on
+/// screen only produced text the sign-in screen had to paint over a moment
+/// later.
+const SCREEN_TEXT: &str = "    Starting OnyxOS...";
 
 /// Kernel entry point. `boot_info` contains the memory map, framebuffer
 /// and other information gathered by the bootloader.
@@ -84,6 +94,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // fresh task areas hold a valid (exceptions-masked) image.
     fpu::init();
     serial_writeln!("fpu: x87/SSE state management ready (eager fxsave/fxrstor on switch)");
+
+    // --- P16-0.1: SMEP + SMAP ---
+    //
+    // Runs here, with interrupts still off and before any ring-3 task exists,
+    // so nothing can fault while the bits are being set. After `fpu::init`
+    // (CPUID-based feature detection already established) and before
+    // `interrupts::enable`.
+    let sec = crate::sec::init();
+    crate::sec::report();
+    if sec.smap_enabled && !sec.syscall_stac_safe {
+        // Not fatal, and deliberately not a halt: AC/SM bypass only matters if
+        // user code actually sets RFLAGS.AC, and OnyxOS never does. Enabling the
+        // bits is still a large win (it stops kernel code executing or reading
+        // user pages), so this is a logged caveat rather than a refusal — but it
+        // is logged, because "enabled" without the STAC idiom is a known open
+        // gap and a silent success line would hide it.
+        serial_writeln!(
+            "[sec] note: SMAP on without the syscall STAC idiom (RFLAGS.AC is only \
+             set if user code sets it; see sec.rs for why this is a caveat, not a block)"
+        );
+    }
 
     // Draw directly onto the framebuffer so the OS is visible on screen.
     // The writer is kept alive globally: the mouse IRQ uses it for the cursor.
@@ -280,6 +311,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_writeln!("spawned font-test");
     scheduler::spawn_prio(compositor_test, scheduler::PRIO_NORMAL);
     serial_writeln!("spawned compositor-test");
+    // P6c: the sign-in screen — the first thing the user sees.
+    //
+    // PRIO_NORMAL + a STAGGERED start, for the reason spelled out above: at
+    // PRIO_IDLE this work NEVER RUNS AT ALL, because always-runnable Normal
+    // tasks exist (the tickers), so an IDLE task is starved indefinitely. That
+    // is not theoretical - it is exactly what happened the first time this was
+    // spawned at IDLE, and the symptom was a test that timed out with zero
+    // `[signin]` output rather than a crash.
+    //
+    // The long sleep lets every boot-critical and P6 test above finish first;
+    // this screen owns the framebuffer, so it must not start repainting until
+    // nothing else wants those pixels.
+    //
+    // The self-test runs before `signin_task` paints, and it deliberately never
+    // fires a power action (that would power off the VM mid-assertion).
+    scheduler::spawn_prio(signin::signin_test, scheduler::PRIO_NORMAL);
+    crate::serial_writeln!("spawned signin-test");
+    scheduler::spawn_prio(signin::signin_task, scheduler::PRIO_NORMAL);
+    crate::serial_writeln!("spawned signin screen");
     // M9.6-B5: print one full performance snapshot ~3 s into the boot (the
     // shell's `perf` command re-renders it live at any time).
     scheduler::spawn(perf_task);
@@ -1508,14 +1558,14 @@ fn blk_test() {
     let ra_ok = crate::block::with_disk(|disk| {
         crate::blkcache::flush();
         crate::blkcache::reset_stats();
-        let base = 8192u32;
+        let base = 8192u64;
         let mut b1 = [0u8; 2048];
         let mut b2 = [0u8; 2048];
         let r1 = disk.drive.read_sectors(base, 4, &mut b1);
         let r2 = disk.drive.read_sectors(base + 4, 4, &mut b2);
         r1.is_ok()
             && r2.is_ok()
-            && (0..crate::blkcache::READ_AHEAD as u32)
+            && (0..crate::blkcache::READ_AHEAD as u64)
                 .all(|k| crate::blkcache::is_cached(base + 8 + k))
     })
     .unwrap_or(false);

@@ -920,11 +920,27 @@ pub fn rasterize(face: &Face, gid: u16, pixel_size: u16) -> Glyph {
         .map(|&c| ((c * 255) / SUBSAMPLE_SCALE) as u8)
         .collect();
 
+    // `bearing_y` is the distance UP from the baseline to the TOP of the mask, and
+    // the top of the mask is `min_y` — in the flipped space y grows DOWNWARD, so
+    // "up" is `-min_y`.
+    //
+    // This used to be `max_y` (the glyph's BOTTOM). That looks plausible and is
+    // wrong: a caller places the mask's first row at `baseline - bearing_y`, so
+    // using the bottom means each glyph is positioned by its own bbox bottom
+    // rather than by the shared baseline. For a letter that sits on the baseline
+    // (`A`, `H`) `max_y` is ~0, so the mask landed ON the baseline and hung
+    // below it; for a descender (`p`, `g`) `max_y` is positive, so it landed
+    // higher. The visible result was exactly what was reported: letters in one
+    // word sitting at different heights, with spacing that looked wrong because
+    // the glyphs were not on a common line.
+    //
+    // `bearing_x` was already correct (`min_x`): the leftmost outline point is
+    // the left edge, and x is not flipped.
     Glyph {
         w,
         h,
         bearing_x: min_x,
-        bearing_y: max_y,
+        bearing_y: -min_y,
         advance: adv,
         alpha: cov,
     }

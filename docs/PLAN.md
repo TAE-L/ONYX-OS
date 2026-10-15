@@ -63,6 +63,760 @@ Two signature goals beyond "a working hobby OS":
 
 ---
 
+## P16: architecture audit + modernisation roadmap (2026-10-01)
+
+> ### ⚠️ NOT SHIPPED — read this first
+>
+> Everything in this section was **attempted or proposed and did NOT land in the
+> kernel**. It is recorded here because an audit that only lists successes is
+> misleading. Nothing below is a claim about the running system.
+>
+> **Written but reverted (the code exists only as a comment explaining why not):**
+>
+> | # | Change | Why it did not land |
+> |---|---|---|
+> | 0.4 | `surface::blit` same-format → `copy_nonoverlapping` fast path | **Failed the existing ramp self-test**: `31/32 blitted pixels wrong`, every destination reading back as `0` while the returned rect was correct. `copy_nonoverlapping` asserts non-overlap and nothing in `Surface` enforces it; and the loop's accesses are `volatile` (mapped windows, not Rust-owned memory), so non-volatile bulk moves are an unanswerable ordering question here. The per-pixel formatted loop still ships, unchanged in behaviour. |
+> | 0.6 | `static mut TABLE` → `SyncUnsafeCell` in `surface.rs` | **Blocked on the toolchain.** On this nightly `SyncUnsafeCell::get_mut` takes `&mut self`, so it cannot back a `static` without a wrapper — and `LOCK` is already held by every caller, so a second lock nests or deadlocks. Two real options remain: wait for `get_mut(&self)` to stabilise, or fold `LOCK` and the table into one `spin::Mutex<[Option<Surface>; MAX_SURFACES]>` (the honest end state, too large for Phase 0). |
+>
+> **Also NOT done — identified in the audit, never started:**
+>
+> * **No networking at all** (finding B): no NIC, no stack, no `SYS_SOCKET`. `virtio.rs` probes one device class, GPU. Phase 4.
+> * **No process isolation** (finding A): every ring-3 program shares one address space. Phase 3.1.
+> * **No `mmap`/`munmap`/`mprotect`/`madvise`**, no shared memory (finding F). Phase 3.2/3.3.
+> * **No `fsync`/`fdatasync`** (finding G): acknowledged writes are not durable, and with an unjournaled ext2 that is a corruption path. Phase 1.4.
+> * **No huge pages** (finding L): `Size2MiB` is unused; 4-level paging only. Phase 2.1.
+> * **Scheduler migration still disabled** (finding M): `Task::owner_cpu` is still the single CPU authority. Phase 3.4.
+> * **KPTI never implemented** (finding C, partial): SMEP/SMAP shipped in 0.1, but Meltdown's page-table leak is unmitigated. No plan slot — it needs per-process address spaces (3.1) before it means anything.
+> * **The STAC window around `dispatch` is coarse.** It covers the whole dispatcher rather than per-`copy_to_user`, so SMAP is disabled for more of the syscall path than necessary. Correct today, weaker than it should be.
+>
+> **Unmeasured claims:** the 0.3 `fill_row` speedup is *reasoned*, not
+> benchmarked. No number in this document should be quoted as a measurement
+> unless it says "measured".
+
+---
+
+### Findings, by severity
+A full audit of the 16,110-line kernel against the stated vision (*modern
+gaming OS, modern standards, daily use*) found **no craftsmanship problems and
+several architectural ones**. The code quality is genuinely good — comments
+explain *why*, failures are documented rather than hidden, self-tests read real
+pixels. The issue is **layering**: the kernel was built bottom-up (boot →
+interrupts → paging → filesystems → graphics), which is right for learning and
+wrong for a product. The result is ~4,700 lines of graphics work sitting on top
+of a layer that does not exist yet.
+
+### Findings, by severity
+
+**Blocking the vision**
+
+| # | Finding | Evidence |
+|---|---|---|
+| A | **No process memory isolation.** All ring-3 programs share one address space | `userspace.rs:26` — *"Per-process CR3 switching retires this in a later milestone"* |
+| B | **No networking whatsoever** — no NIC, no stack, no `SYS_SOCKET` | `socket/tcp/udp/ethernet/virtio-net` = 0 hits; `virtio.rs` probes GPU only |
+| C | **No SMEP / SMAP / KPTI** — ring-3 may execute kernel pages | `SMEP/SMAP/KPTI/clac` = 0 hits |
+| D | **ext2 is pre-1.0 and unjournal** — a power cut corrupts the volume | `ext2.rs:1-16` (rev 1, 1 KiB blocks, single group, no journal, no extents) |
+
+**Modern-standards gaps**
+
+| # | Finding | Evidence |
+|---|---|---|
+| E | Block I/O is **ATA PIO, LBA28 only** (128 GiB ceiling); no NVMe/AHCI/DMA | `ata.rs:1-20` |
+| F | **No `mmap`/`munmap`/`mprotect`/`madvise`**, no shared memory | 22 syscalls, none of these |
+| G | **No `fsync`/`fdatasync`** — acknowledged writes are not durable | syscall table |
+| H | **FAT32 cannot write long filenames** — breaks Windows round-trip | `fat.rs:7` |
+| I | **Graphics: `dispi` is live, virtio-gpu is not.** dispi maps the LFB directly, which is why full-screen repaints are visible top-to-bottom | serial log: `[gpu] mapping: 8100 KiB at 0x040000000000 -> 0xfd000000` |
+| J | **surface damage and present damage are separate accumulators** — a composited frame never reaches scanout | `Surface::take_damage` vs `framebuffer::take_dirty_rect` |
+| K | **`blit` is per-pixel formatted, not a memcpy** | `surface.rs:365-382` |
+| L | No huge pages (`Size2MiB` = 0 hits); 4-level paging only | — |
+| M | Scheduler **migration disabled**; `Task::owner_cpu` still authoritative | `scheduler.rs:88` |
+
+### Why this order
+
+The phases below are ordered **fastest to implement first, hardest last** —
+the opposite of severity order. That is deliberate: nothing in Phases 0–1 is
+throwaway, and the cheap work de-risks everything after it. The honest cost is
+that **after Phase 2 the OS is still not safe to ship to a daily user**; Phases
+3–4 are what buy "safe to ship", not "capable of more development".
+
+#### Phase 0 — Free wins (~1 week, no dependencies)
+
+- **0.1 SMEP + SMAP** — ✅ **done** (see below)
+- **0.2 unsound `&'static mut` page-table view** — ✅ **done**
+- **0.3 `fill_row` per-pixel → bulk write** — ✅ **done**
+- **0.4 `blit` same-format fast path** — ❌ **reverted** (see below)
+- **0.5 duplicate `SYS_INPUT_READ` doc** — ✅ **done**
+- **0.6 `static mut` → `SyncUnsafeCell`** — ❌ **blocked** (see below)
+
+##### Phase 0.1 result — SMEP + SMAP (finding C)
+
+New `kernel/src/sec.rs`; detection via `CPUID.07H:EBX[7|20]`, enable via
+`Cr4::read()` + `Cr4::write()` (preserves the bootloader's PE/PAE), then **CR4 is
+read back** so "enabled" is verified rather than assumed. Three `[sec]` lines in
+the boot log; `test-sec.ps1` asserts them under `-cpu max`.
+
+**It was not 20 lines, and that is the interesting part.** SMAP immediately
+faulted the boot — proving the feature was needed by finding four kernel writes
+to USER_ACCESSIBLE pages that had never been declared anywhere:
+
+| Site | What it writes |
+|---|---|
+| `userspace::init` | the `EB FE` ring-3 exit trampoline |
+| `load_elf` | ELF PT_LOAD segments + the zeroed BSS tail |
+| `build_initial_stack` | argv/envp/auxv strings and the process-start block |
+| `apply_relative_relocations` | R_X86_64_RELATIVE/GLOB_DAT/JUMP_SLOT fixups |
+
+Each now runs inside an explicit `sec::with_stac` window (`STAC`/`CLAC`, which
+toggle *only* RFLAGS.AC — a `pushfq`/`popfq` pair would round-trip every other
+flag and could resurrect bits the kernel cleared). The syscall entry stub was
+split in two: `syscall_entry` and `syscall_entry_smap` (`STAC` … `CLAC` around
+`dispatch`), because `stac` raises `#UD` on a CPU without SMAP, so it must not
+merely be skipped — it must not be *present*.
+
+**Verified** (`test-sec.ps1`, `-cpu max -smp 2`): `SMEP cpu=yes cr4=on`,
+`SMAP cpu=yes cr4=on`, `entry=smap/stac`, `fstest: PASSED`, no `#PF`/`#DF`/panic.
+
+**Two known gaps, deliberately not hidden:**
+
+1. The STAC window around `dispatch` is **coarse** — it covers the whole
+   dispatcher, not per-`copy_to_user`. Narrowing it is planned work.
+2. QEMU's default `qemu64` does **not** advertise SMEP/SMAP, so on the default
+   test invocation the bits are detected as absent and nothing is enabled. That
+   is correct behaviour, not a silent failure — which is exactly why
+   `test-sec.ps1` runs `-cpu max`.
+
+##### 0.2 — page-table aliasing (soundness)
+
+`active_level_4_table` returned `&'static mut PageTable`. The level-4 table is
+ONE allocation that `OffsetPageTable` already holds a `&mut` to for the kernel's
+whole life, so `page_flags` minting a second `&'static mut` to the same bytes was
+two mutable references to one place — UB even though both callers are careful.
+
+Now `active_level_4_ptr` / `table_ptr` hand out **raw pointers**, and each caller
+takes the weakest reference its access needs: `&mut` only for the one-time
+`OffsetPageTable::new`, and a **shared `&`** for the read-only walk in
+`page_flags`. (The walk needed explicit `let p: &PageTable = &*p;` bindings —
+`&(*p)[i]` is an *implicit autoref*, which is a hard error precisely because it
+can quietly create a borrow that outlives what a raw pointer guarantees.)
+
+##### 0.3 — `fill_row` bulk write
+
+Was 1920 calls to `set_pixel` per row — each redoing four bounds checks and a
+`PixelFormat` match for a colour that is constant across the row. The sign-in
+backdrop is 1920×1920 = 3.7 M of those. Now the row base and channel bytes are
+hoisted and pixels are written directly through a `chunks_exact_mut` loop; the
+guard is computed once. The format handling is intentionally duplicated from
+`set_pixel` and the comment marks it as the thing that must not drift.
+
+*(Not benchmarked — this is a reasoned change, not a measured one. It should be
+measured on the host before anyone quotes a speedup.)*
+
+##### 0.4 REVERTED — the `blit` fast path does not work
+
+The obvious optimisation: when `s.format == d.format` the two `Format` matches
+in the per-pixel loop are no-ops and the byte pattern is identical, so the copy
+should collapse to `copy_nonoverlapping`. **It was written and it failed the
+existing ramp self-test: `31/32 blitted pixels wrong`, every destination reading
+back as 0** while the returned rect was correct.
+
+Two reasons it is unsafe as written, which is why this is a revert and not a
+fix-in-place:
+
+1. `copy_nonoverlapping` **asserts** the ranges do not overlap. Two `Surface`s
+   are separate allocations today, but nothing in the types enforces it — and an
+   overlapping "blit" is exactly the UB that yields silent zeroes.
+2. The loop's reads/writes are `volatile` (the surfaces are mapped windows, not
+   Rust-owned memory), and swapping them for non-volatile bulk moves is an
+   ordering question this file has no answer for.
+
+The per-pixel formatted loop stays, with a comment saying so. A correct bulk
+path needs the backing-store/overlap invariant stated first — which is the same
+surface→scanout bridge as Phase 2.2.
+
+##### 0.6 BLOCKED — `SyncUnsafeCell` on this toolchain
+
+`static mut TABLE` in `surface.rs` is correctly guarded (every access is under
+`LOCK`) but nothing in the type system says so, and `static mut` hands out
+`&mut` to the whole array even for read-only access. The correct replacement
+(`SyncUnsafeCell`) was attempted and abandoned: on this nightly
+`SyncUnsafeCell::get_mut` takes `&mut self`, so it cannot back a `static`
+without a wrapper — and `LOCK` is already held by every caller, so a second lock
+would nest or deadlock. Either wait for `get_mut(&self)` to stabilise, or fold
+`LOCK` and the table into one `spin::Mutex<[Option<Surface>; MAX_SURFACES]>`.
+The reason is recorded in the source so it is not re-attempted blindly.
+
+**Phase 0 gate — met.** `test-sec` PASSED · `test-signin` 17/17 ·
+`test-surface` PASSED · `test-input` PASSED.
+
+*Boot-to-signin-verified is ~20 s on a quiesced host* (measured 2026-10-01).
+Every earlier "timeout" was a leftover QEMU from a previous run eating the CPU:
+every `test-*.ps1` starts with `Stop-Process qemu-system-x86_64`, so two scripts
+at once kill each other's VM and produce failures that look exactly like
+regressions. Run them sequentially, and check nothing is still running first.
+
+#### Phase 1 — Cheap correctness (~2–3 weeks)
+
+- **1.1 ATA LBA48 — `u64` LBA end-to-end** — ✅ **done**
+- **1.2 FAT32 LFN write** — ✅ **done**
+- 1.2.1 `rename` that rewrites the LFN run — ✅ **done** (see the result below; it
+  also uncovered a data-loss bug in `create_entry`)
+- 1.3 File timestamps in `FileStat` — ✅ **done** (see the result below)
+- **1.5 Independent FAT32 interop verification** — ✅ **done, and it found two
+  shipped-breaking bugs** (see the result below). This was inserted ahead of 1.4
+  precisely because it could invalidate work already marked complete.
+- 1.4 **`fsync`/`fdatasync` + cache coherency** — the durability hole — ✅ **done**
+  (see the result below)
+
+> Everything in this roadmap that is marked done but not finished — deliberate
+> deferrals, known-bad upstream tooling, and the "reported but not enforced"
+> findings — is tracked separately in **`docs/OPEN_ISSUES.md`**. That file is the
+> handoff list; this one is the plan.
+
+##### Phase 1.4 result — `fsync`, and why the test had to run outside the guest
+
+The obvious test — call `fsync`, check it returned 0 — proves nothing. A kernel
+that implemented `fsync` as `return 0` would pass it, because the only thing
+asked is whether the kernel remembers what it already knew. So
+`tests/test-fsync.ps1` verifies the claim **from outside the guest**: boot
+**without `-snapshot`**, have `fstest` write `/Fsync Durability Probe.txt` and
+sync it, kill QEMU (an abrupt end is the closest thing here to a power cut),
+then read the raw image back with the independent PowerShell FAT32 reader and
+require the exact name, size and date to be present. The checker never ran
+inside the kernel it is checking.
+
+The stack is `SYS_FSYNC`(22) / `SYS_FDATASYNC`(23) → `sys_fsync` →
+`vfs::fsync` → `Fs::fsync`. Two decisions worth keeping:
+
+- **The fd is resolved back to its path**, because the fd table stores a name
+  and a position, not a filesystem — the path is the only thing that selects a
+  backend. Bad fd → `-EBADF`, unresolvable path → `-ENOENT`.
+- **`fdatasync` deliberately shares `fsync`'s body.** There is no separate
+  metadata cache to skip yet; the distinction only earns its keep once a
+  filesystem does journal replay. One implementation, not two.
+
+The trait default is `Ok(())`, with the limit stated in the code rather than
+implied: this makes a write durable *to the device*, it does **not** make an
+unjournaled ext2 crash-consistent. A power cut mid-metadata-update still
+corrupts the volume; only 2.4 (ext4) fixes that.
+
+**Two bugs, both in my own code, both caught by taking the test seriously:**
+
+1. **`fstest` called a function that did not exist.** The new block used
+   `sayln(...)`, but that binary only defines `say` and every caller embeds the
+   newline itself. `cargo build` failed. Small, but it is the reason nothing was
+   committed before the build was green: a broken tree is not a working version.
+2. **The durability test hardcoded the wrong payload size** — it asserted
+   `size=40` while the payload is 42 bytes (`fsync durability payload ` = 25,
+   `0123456789abcdef` = 16, `\n` = 1). The kernel had written the **correct**
+   size, so the suite failed against correct code. The size is now derived from
+   the payload literal instead of repeated by hand. The generalisable version:
+   a number duplicated in two places is a bug waiting to happen, and a failing
+   test is not automatically evidence the code is wrong — it can equally be
+   evidence the checker is.
+
+**Result:** `test-fsync` passes, and the host-side listing shows
+`lfnSlots=2 size=42` — the long name and the exact byte count survived an
+abrupt guest termination, confirmed by a reader that is not our kernel.
+
+**Limit carried forward:** this proves durability across a QEMU process kill,
+which flushes nothing special — the image file is the device. It does **not**
+prove anything about a real power cut on real hardware, and it does not make
+the metadata path crash-consistent on ext2. Both are recorded in
+`docs/OPEN_ISSUES.md`.
+
+##### Phase 1.5 result — the checker that was not the kernel, and what it caught
+
+1.2 and 1.2.1 were both "done" with green tests, and 1.2 shipped a real bug that
+no test in the project could see. `tests/fat32-verify.ps1` is a second
+implementation of the FAT32 on-disk format, in PowerShell, written from the
+specification, sharing no code with the kernel. `tests/test-fatinterop.ps1` boots
+the guest **without `-snapshot`** so its writes survive, then hands the image to
+that reader.
+
+**RETRACTED, kept so the mistake is visible:** this section originally claimed
+two shipped bugs, the first being "the LFN checksum was not the checksum".
+**That claim was false** â€” the checksum is a rotate and always was â€” and the
+fix it prompted would have broken every long filename. See the corrected list
+below, and `docs/OPEN_ISSUES.md` A2.
+
+**One real bug found, one false alarm — and the false one is the more useful.**
+
+1. **LFN chunks were stored in reverse (REAL, fixed).** `lfn_slots` put the *last*
+   13 characters in the highest-numbered slot and `lfn_name` sorted ascending to
+   match. The spec has sequence *N* — physically furthest from the short entry —
+   holding characters `[(N-1)*13 .. N*13)`, i.e. the *first* 13, confirmed against
+   a real on-disk dump in the FAT documentation. Again perfectly self-consistent,
+   and again invisible: any name over 13 characters would have appeared in Windows
+   **transposed**. The verifier surfaced it by decoding
+   `InteropTwentyCharsLong` as `CharsLong`.
+2. **The checksum was reported as broken, and was not (reverted).** The first
+   version of the verifier computed the LFN checksum as a plain sum of the 11
+   short-name bytes, "found" the kernel's value mismatched, and the kernel was
+   changed to match it. **That change was wrong.** The FAT checksum is the original
+   MS-DOS `ChkSum` — *"NOTE: The operation is an unsigned char rotate right"* —
+   and both the Linux kernel and the `fatfs` crate implement the rotate. The
+   kernel has been reverted to it and the verifier corrected. Had this shipped,
+   every long filename would have been unreadable on real hardware.
+
+**A third oracle settled it.** `tools/fatfs-verify` reads an image with the
+third-party `fatfs` crate — which `mkfat` also uses to build our volumes. It
+agreed with neither variant until the rotate was restored. It carries a
+`--selftest` mode that makes the crate write and re-read its own multi-slot names,
+so the oracle is proven valid before its verdict is trusted.
+
+**Result: 13 checks passed** on the PowerShell verifier, which enforces sequence
+order, `LAST_LONG` placement, checksum and attribute **on kernel-written entries
+only**.
+
+**Unresolved, and deliberately left open:** the `fatfs` oracle reads our
+single-slot long names but returns only the 8.3 alias for multi-slot ones, even
+though it reads back its own. Checksum and chunk order are both confirmed correct,
+so something else in the slots still differs. Tracked as **A5** in
+`docs/OPEN_ISSUES.md`; the oracle's verdict is reported loudly rather than
+enforced, because enforcing a checker we know disagrees with us is worse than
+saying so.
+
+**Known limits of 1.5 — all recorded in `docs/OPEN_ISSUES.md`, not fixed here:**
+
+- **Windows itself still has not read these images.** `Mount-DiskImage` refuses
+  the raw image on this host. "Interop verified" currently means *a second
+  implementation agrees*, which is much better than it was and is **not** the
+  same claim.
+- **`mkfat` (the `fatfs` crate) writes non-conformant LFN entries** — every
+  seeded file has a bad checksum and attribute `0x00`. Reported, not enforced;
+  it is upstream, and our reader already tolerates it.
+- **ext2 has no equivalent verifier.** The bug class fixed twice here is still
+  unproven absent in `ext2.rs`.
+- **A duplicate directory entry was observed** (`InteropVeryLong…` twice, both
+  aliased `INTERO~2`). Reported, not enforced: it is not a format error and needs
+  a separate debugging pass.
+- The verifier checks the **root directory only**, and validates *structure* —
+  it does not follow data chains to confirm file contents.
+
+##### Phase 1.1 result — LBA48, and the estimate was wrong
+
+The plan said "~0.5 day, 50 lines". It was not: LBA was `u32` in **five** modules,
+so lifting the ceiling meant widening all of them — `ata` (the driver), `blkcache`
+(the **cache key**, plus `last_seq_end`, which would otherwise wrap and make
+sequential detection silently wrong above 128 GiB), `block`, `ext2`
+(`part_start`), and `fat` (`part_start`, `cluster_lba`, FAT-sector maths). A
+half-measure that only touched `ata.rs` would have added the capability while the
+ceiling stayed in place everywhere else — i.e. it would have looked done and
+changed nothing.
+
+Two bugs found on the way, both by the existing suites rather than by me:
+
+1. **The EXT path broke every filesystem.** Taking the 48-bit route whenever the
+   drive advertised it sent `SET HIGH LBA` + `CMD_READ_EXT` even for LBA 0 on the
+   40 MiB test image, and the whole stack stopped finding its partition table
+   (`M5: LBA0 has no 0x55AA signature`). Fixed by taking the 48-bit path **only
+   when the address actually exceeds 28 bits** — the EXT sequence is a second,
+   less-exercised path that added risk for zero benefit under 128 GiB, and this
+   way a bug in it can only affect disks that actually need it.
+2. **The register layout was wrong anyway.** The high-half writes used
+   `(lba>>32)/(lba>>40)/(lba>>44)` and put `LBA[24:28]` in the device/head
+   nibble. ATA-6 is `LBA_LO←[39:32]`, `LBA_MID←[47:40]`,
+   `LBA_HI←[51:48]`, device/head bits 3:0 ← `LBA[44:40]`. Corrected, with the
+   reason left in the source.
+
+Also removed a now-wrong clamp: `block.rs` pinned the write-verify to
+`LBA28_MAX`, which existed only because the driver could not address higher.
+
+**Verified:** `test-fs` PASSED (stat/seek/rename/unlink all OK) ·
+`test-block` PASSED (cache hits 172 / misses 4, read-ahead +672× cold/hot) ·
+`test-fs-corrupt` PASSED · `test-surface` PASSED · `test-sec` PASSED.
+
+**Still not done — this is address width, not transfer mechanism.** The drive is
+still **PIO**: every byte goes through CPU port I/O. LBA48 means "a 4 TB disk is
+addressable", not "a 4 TB disk is fast". Replacing PIO is Phase 3.5 (virtio-blk),
+and until then large-disk performance is worse than useless.
+
+##### Phase 1.3 result — timestamps, and a rule about what `0` means
+
+**The change.** `rtc::DateTime` gained `to_unix()` and a free `from_unix()`
+(Hinnant's `days_from_civil` / `civil_from_days`, exact integer arithmetic over
+the whole proleptic calendar rather than only FAT's 1980–2107 window). Both
+drivers now stamp and read real times:
+
+| | FAT32 | ext2 |
+|---|---|---|
+| create | `ctime`+`mtime`+access-date | `i_ctime`/`i_mtime`/`i_atime` |
+| write | write-time, write-date, access-date | `i_mtime`+`i_ctime`+`i_atime` |
+| rename | **carried over verbatim** | n/a (rename is FAT-only today) |
+
+FAT byte layout, which is the part that invites mistakes: create time 14..16,
+create date 16..18, access date 18..20, **write time 22..24, write date 24..26** —
+with the low cluster at 26..28 sitting *between* them. The fields are not
+contiguous, which is exactly the shape of bug that writes a cluster number into a
+date and still round-trips through our own reader.
+
+**Three decisions worth stating, because they are the ones a later reader will
+otherwise "fix" wrongly:**
+
+1. **`0` means "no timestamp recorded", never "1970-01-01".** `to_unix()`
+   returns `Option`, and a zeroed RTC yields `None` rather than a number, so the
+   failure mode is an honest blank instead of a plausible lie. Every test
+   therefore asserts a *range* (2020-09-13 … 2096) rather than "non-zero" — a
+   range chosen so a missing RTC, a 1970 default and FAT's 2107 ceiling all fail
+   it.
+2. **A rename is not an edit.** Rename copies the times across untouched. It is
+   tempting to stamp "now" because rename writes a brand-new directory slot, and
+   the self-test would still pass if mtime only ever moves forward — so the test
+   asserts `mtime_after_rename == mtime_after_write` exactly.
+3. **The `stat` ABI grew from 16 to 40 bytes** (size, atime, mtime, ctime,
+   flags). It had to: the old layout spent 7 bytes on padding with `is_dir` as a
+   single byte at +8. `is_dir` is now flags bit 0 at +32. There were no external
+   consumers, and this is far cheaper to pad out now than to remove later.
+
+FAT's 2-second time granularity is a format limit, not a rounding bug, so the
+self-test claims `mtime_after_write >= mtime_before` rather than a strict
+increase — an advance inside the same tick is genuinely invisible.
+
+**Verification.** Boot self-test now **9 passed, 0 bad**; `test-fs` PASSED
+(including a new `fstest: timestamps OK` gate that checks the range from ring 3);
+`test-block`, `test-fs-corrupt`, `test-m7` (ext2), `test-shell`, `test-lnx`,
+`test-sec`, `test-signin`, `test-surface`, `test-input`, `test-time`, `test-rtc`
+and `test-proc` all PASS.
+
+**Known limits of 1.3:**
+
+- **Still never validated against an outside reader.** Everything here is our
+  encoder meeting our decoder. A host-side `dir /T` on a written image is the
+  check that is still missing, and 1.3 is precisely the phase where it becomes
+  checkable — the FAT date/time words are now the only thing standing between us
+  and a real interop verdict.
+- **FAT cannot represent odd seconds** (2-second granularity) and has no
+  separate ctime, so creation doubles as ctime and rename cannot record that it
+  happened.
+- **Directory timestamps are only stamped at creation.** A file added to or
+  removed from a directory does not bump the directory's mtime, so a recursive
+  "what changed" scan will miss it. Real `ls -lt` on both filesystems needs this.
+- **ext2 atime only moves on write, not on read.** Updating it per read would
+  mean a directory-entry write on every read; the usual compromise is a once-a-
+  day atime, and neither is implemented.
+- **`utimensat`/`futimens` do not exist**, so a user cannot set a time, only read
+  one. Everything above is kernel-driven.
+- Still no durability (1.4) and no Windows-verified interop.
+
+##### Phase 1.2.1 result — rename keeps the long name, and a silent data-loss bug
+
+Closing a one-line inconsistency (`rename` degraded any long target to 8.3) turned
+into the most valuable bug find of the phase, because rename is the only operation
+that **allocates a new directory slot adjacent to existing ones**.
+
+**What changed.** `create_entry` and `rename` now share three helpers —
+`derive_name` (short alias + LFN slots, with the collision probe able to *exclude
+the entry's own alias*), `alloc_run` (reserve N contiguous free slots), and
+`write_run`. Split out of the old `delete_entry`, `remove_dir_slots` frees the
+directory slots **without** touching the data chain — rename has to move the slot
+and keep the clusters, and calling `delete_entry` after writing the new slot would
+have freed clusters the file is still using.
+
+**Three bugs found, the last one pre-existing and serious:**
+
+1. **`rename(a, a)` returned `EEXIST`.** The existence check rejected the target
+   because the target *is* the source. POSIX says a no-op success. Any caller that
+   renames-before-writing churned its own alias on every call. Now compared by
+   *slot identity* (`dir_cluster` + `dir_index`), not path string, so a
+   case-differing path still counts as the same entry.
+2. **An idempotency trap in the alias probe.** Re-applying the same long name saw
+   the entry's *own* `~1` alias as a collision and bumped it to `~2`. This is why
+   `derive_name` takes an `except_short` argument.
+3. **Data loss: creating a file into a freed slot destroyed the *next* entry.**
+   `write_run` "re-terminated" the directory by writing `0x00` into the slot after
+   the new entry, unconditionally. `alloc_run` takes the **lowest** free slot, so
+   with `[A][B][C]`, deleting `B` and creating `D` puts `D` in `B`'s slot and then
+   zeroes `C` — `C` disappears from the directory with its data clusters still
+   allocated and now unreferenced. This was **not** introduced by rename; rename
+   only made it reachable, because it is the first operation to allocate a run in
+   front of a live entry. The write is now gone entirely: it was never needed,
+   because `alloc_run` only hands out slots that are already `0x00` or `0xE5`.
+   It is worth naming as a class — *every* filesystem bug of this phase was a
+   **writer/reader pair agreeing with each other while both disagreeing with the
+   spec or with the neighbours on disk.** A round-trip test cannot see any of them.
+
+**Verification.** Boot self-test now **8 passed, 0 bad**, adding three cases:
+rename preserves a long filename; rename to the same long name is idempotent;
+creating into a freed slot keeps the neighbouring entry. The last one is
+deterministic precisely because `alloc_run` takes the lowest free slot, so A, B and
+C land on three consecutive slots and D is forced back into the middle one.
+
+`test-fs` PASSED · `test-block` PASSED (hits 174 / misses 6) · `test-fs-corrupt`
+PASSED · `test-sec` PASSED · `test-signin` 17/0 · `test-surface` PASSED ·
+`test-input` PASSED. Full sweep re-run after the final edit, sequentially.
+
+**Known limits of 1.2.1:**
+
+- **Rename still moves the directory slot, not the clusters.** Only the slot moves,
+  so it stays O(1) in file size, but the entry's `dir_index` changes. Anything that
+  caches a `RawEntry` across a rename is now stale where before it stayed valid.
+- **Still same-directory only.** Cross-directory moves need copy + delete and are
+  rejected.
+- **The new run is written before the old slots are freed.** A failure between the
+  two leaves the file reachable under both names. The opposite order would leave it
+  with no slot at all, so this is the safer of the two, but it is not atomic.
+- Everything 1.2 still carried: zero timestamps (1.3), no durability (1.4),
+  Latin-1 aliases, and no host-side validation by Windows.
+
+##### Phase 1.2 result — long filenames, and the reader was as broken as the writer
+
+Shipping the *write* was the easy half. The surprise is that FAT32 LFN **read**
+had been silently wrong the whole time, in a way that hid itself: `scan_dir`
+read its characters from `slot[14..28]` and `slot[28..30]`. The real layout is
+5 units at `1..11`, **6 at `14..26`**, and **2 at `28..32`** — so the old read
+pulled the entry's own first-cluster bytes in as a character and dropped the
+13th. Every name read back with a garbage character spliced in at the tail.
+Windows-created LFNs were never actually verified, so nothing caught it; the
+only reason userspace did not fall apart is that our tests use 8.3 names.
+
+What shipped, all in `fat.rs`:
+
+| Item | Role |
+|---|---|
+| `needs_lfn` | Decides 8.3-vs-LFN from the same acceptance rule as `make_short_name`, so a legal short name never gets redundant LFN slots. |
+| `make_unique_short` | Derives `NAME~1.EXT` probing the directory, so two long names never collide on one short entry. |
+| `lfn_slots` | Builds slots in physical reverse order (`N…1`) with `LAST_LONG` on 1, plus the rolling checksum in byte 13. |
+| `create_entry` | Now allocates `1 + lfn.len()` **contiguous** slots (a reader scans backwards from the short entry, so a gap loses the name) and re-marks the following slot `0x00` to keep the directory terminated. |
+| `scan_dir` | Fixed byte offsets; validates the run's checksum; **clears the pending run on `LAST_LONG`** so an orphaned run in front of a new entry cannot merge two names into one. |
+| `delete_entry` | Reclaims the entry's LFN slots, not just the short one. |
+| `lfn_self_test` | Boot self-test via a new `FileSystem` trait hook, run in `vfs::init`. |
+
+Five bugs found on the way, all of which a unit test would have missed:
+
+1. **The self-test itself was wrong first.** It called `write_at` with bare
+   names (`"SHORTNAME.TXT"`); the VFS path contract is absolute, so all three
+   cases returned `NotSupported` before the driver ran. Worth recording: a test
+   that passes a bad path proves nothing about the path.
+2. **The LFN reader's byte offsets were wrong** — the subject of this section.
+3. **`lfn_checksum` overflow-panicked.** `(sum & 1) << 7` plus the byte exceeds
+   `u8`. It is a mod-256 sum, so it is computed in `u16` and truncated once.
+4. **`LAST_LONG` was written to the wrong byte — and no test could have caught
+   it.** Byte 12 is the LFN *type* byte (0x00); the flag is bit 6 of the
+   **sequence** byte, i.e. byte 0. Our reader only ever took the order from
+   byte 0's low bits and never looked at bit 6, so writer and reader agreed
+   perfectly and the round-trip passed. Any *other* reader — Windows scanning
+   backwards for the flag — would never stop. This is the clearest argument in
+   the phase for checking against something other than ourselves: the layout is
+   now cross-checked against two independent implementations
+   (`monogon/osbase`, `vfat-rs`) and matches them field for field — sequence +
+   `0x40`, 5 chars at `1..11`, attr `0x0F` at 11, type at 12, checksum at 13,
+   6 chars at `14..26`, zero cluster at `26..28`, 2 chars at `28..32`.
+5. **`delete_entry` orphaned its LFN slots**, which then corrupted an unrelated
+   later create (the self-test's own cleanup surfaced it). Fixed by reclaiming
+   the run, and made survivable in the reader.
+
+One trap worth writing down, because the obvious fix is the wrong one: the
+forward scan cannot simply *reset* on `LAST_LONG`. Order 1 is stored **last** in
+a run, so clearing there discards the very run it terminates — and every
+multi-slot name breaks. `scan_dir` instead restarts the run whenever the
+descending sequence breaks, which is what makes an orphaned run harmless.
+
+**Verified:** boot self-test `[lfn] done: 5 passed, 0 bad` (11-char one-slot,
+20-char two-slot reverse order, lowercase round-trip, colliding-base aliases,
+and rename-drops-the-stale-name) · `test-fs` PASSED (stat/seek/rename/unlink) ·
+`test-shell` PASSED (`fstest` + `lnxtest` from ring 3) · `test-block` PASSED
+(hits 174 / misses 6) · `test-fs-corrupt` PASSED · `test-sec` PASSED (SMEP/SMAP).
+
+**Known limits of this phase:**
+
+- **`rename` cannot give a file a long name.** Superseded by 1.2.1, which does.
+  What is still true: rename is same-directory only, and it moves the directory
+  slot rather than the clusters.
+- **Directory timestamps are only stamped at creation**, so a long-named file has
+  a usable creation time but a recursive "what changed" scan will miss files
+  added to or removed from a directory. Partly 1.3.
+- **Validated against a second implementation, not against Windows.** 1.5 added
+  `tests/fat32-verify.ps1`, an independent host-side reader — and it immediately
+  found that our checksum and chunk ordering were both wrong. Windows itself
+  still has not opened an image we wrote (`Mount-DiskImage` refuses it on this
+  host). So "the spec is satisfied" now rests on a second implementation, not on
+  the vendor. See `docs/OPEN_ISSUES.md` A3.
+- **Latin-1 only.** Names are UTF-16 in and UTF-16 out, but the alias generator
+  filters to ASCII, so a purely non-ASCII name degrades to `FILE~1`.
+
+### P16.1 — Phase limits: what each stage does **NOT** give you
+
+A plan that only lists what a phase adds is misleading. Each phase below is
+followed by the thing it is routinely mistaken for — the capability that is
+*still missing* once the phase is green. Read these before believing a phase
+"finished".
+
+#### Phase 0 (DONE) — hardening and tidying
+
+**You get:** SMEP/SMAP enforced; sound page-table aliasing; a bulk `fill_row`.
+
+**You do NOT get:**
+- **Process isolation.** All ring-3 programs still share one address space and
+  can read/write each other's memory *and the kernel's*. SMAP/SMEP stop a
+  program *executing* kernel code and stop *accidental* kernel reads of user
+  pages — they do nothing about a kernel that is handed a bad pointer. This is
+  finding A and it is Phase 3.1.
+- **KPTI.** Meltdown's page-table side channel is completely unmitigated.
+- **Durability.** Nothing written is guaranteed to survive a power cut.
+- **Speed.** The 0.3 change is *reasoned*, not benchmarked. No number here is a
+  measurement.
+- **A working `blit` fast path** — reverted, see above.
+
+#### Phase 1 — cheap correctness (1.1, 1.2 done)
+
+**You get (after 1.1, 1.2):** disks above 128 GiB are addressable; FAT32 names
+round-trip through the real on-disk layout, so files Windows made with long
+names are visible under those names, not just their 8.3 aliases.
+
+**You do NOT get:**
+- **Any speed from the address width.** Still PIO — see the note above. A 4 TB
+  disk is *reachable* and *unusably slow*.
+- **Filesystem integrity.** ext2 is still revision 1, single block group, **no
+  journal**. 1.4 adds `fsync`, which makes writes durable *to the disk*; it does
+  **not** make the filesystem crash-consistent. A power cut mid-metadata-update
+  still corrupts ext2. Only ext4 (2.4) fixes that.
+- **Durability at all.** 1.2 makes a *name* survive; it does not make its
+  *contents* survive a power cut. Nothing is fsynced until 1.4.
+- **Long names on rename.** Fixed in 1.2.1: rename now writes the LFN run and moves
+  the slot. Still same-directory only, and it moves the directory slot rather than
+  the cluster chain.
+- **Timestamps.** Read and written on both filesystems since 1.3, but kernel-driven
+  only (no `utimensat`), directory mtime does not move when its contents change,
+  and nothing outside this kernel has ever read them back.
+- **Windows-verified interop.** Superseded by 1.5: a second, independent reader
+  now validates what we write. Windows itself still has not, so read this as
+  "spec-conformant by two implementations", not "confirmed by the vendor".
+- **A modern FS.** ext2 has no extents and no 64-bit; it does have timestamps now.
+
+## Repository layout (2026-10-02)
+
+Tests and generated output were both loose in the repo root, which made the root
+hard to read and hid which files were actually source. Now:
+
+```text
+tests/            every test-*.ps1 suite (33), plus run-all.ps1
+logs/<suite>/     serial.log per suite  (git-ignored)
+logs/misc/        old build captures, LLVM IR and stray logs, moved out of the root
+```
+
+Three rules the move established, all mechanical and worth keeping:
+
+- **`$root` is the parent of `tests/`.** Each script derives it from its own path,
+  so it is `Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)`.
+  Getting this wrong points a suite at a non-existent `target\debug\images` and it
+  fails for a reason that has nothing to do with the code under test.
+- **Logs live in the repo, scratch images do not.** The serial log is small,
+  useful, and the artifact you actually want after a failure. The 40 MB disk
+  image is disposable and stays in `%TEMP%`.
+- **Suites run sequentially, and `tests/run-all.ps1` enforces it.** Every suite
+  begins with `Stop-Process qemu-system-x86_64`, so two at once kill each other's
+  VM and produce failures indistinguishable from real regressions. The runner
+  kills QEMU between suites, summarises to `logs/run-all/summary.log`, and
+  supports `-Only fs,block,m7` to run a subset.
+
+#### Phase 2 — graphics and filesystems (planned)
+
+**Intended to give:** damage that actually reaches scanout; huge pages; virtio-gpu
+as the live backend; a journalled filesystem.
+
+**Known limits to expect:**
+- **Bridging surface damage to scanout will NOT make the compositor fast.** It
+  makes it *correct*. The present path is still a software copy through
+  `TRANSFER_TO_HOST_2D` with no hardware acceleration and no real vsync — that is
+  Phase 2.3's job and, ultimately, M15.
+- **ext4 without a journal replay policy is still a corruption risk** on power
+  loss. `fsync` + `jbd2` ordering gets most of the way, but ext4's defaults
+  (`data=ordered`) are a compromise, not a guarantee.
+- **Giant unwritten extents / delayed allocation** interact badly with a
+  write-through cache that has no `fsync`. 1.4 has to land *first* or 2.4 will
+  look fine and lose data.
+- **Huge pages do nothing for the present path** — they help TLB pressure on the
+  CPU side, not DMA.
+- **Finishing virtio-gpu will not make dispi disappear.** dispi stays as a
+  fallback, which means two code paths must keep working forever.
+
+#### Phase 3 — the process model (planned)
+
+**Intended to give:** per-process address spaces; `mmap`; migration; virtio-blk.
+
+**Known limits to expect:**
+- **Per-process CR3 without a proper VM subsystem is isolation, not virtual
+  memory.** Address spaces will be forked/copied wholesale. No COW, no
+  swap, no ballooning, no THP-backed anonymous memory.
+- **Enabling migration does NOT make the scheduler good.** It removes the
+  affinity filter; it does not add a load balancer, does not fix the measured
+  ~134 ms wake latency, and P2's deadline timer (still open) remains the actual
+  pacing fix.
+- **KPTI becomes *possible* but is not automatic.** Isolation makes a full
+  per-process CR3 table affordable; it does not build one.
+- **virtio-blk ends the PIO problem but is still not a real storage stack** —
+  no NCQ, no write barrier, no TRIM/discard, and `blkcache` stays a
+  write-through cache in front of it.
+- **`mmap` without `madvise`/`mremap` tuning is a blunt instrument**, and file
+  mapping without page-cache coherency (`msync` semantics) will be subtly wrong.
+
+#### Phase 4 — connectivity and Windows binaries (planned)
+
+**Intended to give:** a network stack; running PE binaries.
+
+**Known limits to expect:**
+- **A hand-written TCP is not a hardened TCP.** There are decades of
+  state-machine, congestion-control and reassembly attacks that a from-scratch
+  implementation has to survive. "It handshakes" is not "it is safe on the
+  internet".
+- **Running Windows `.exe` requires syscall emulation, and Windows is not
+  POSIX.** The hard parts are the Win32/NT syscall surface, the loader's
+  relocations and imports, and — not optional — **no memory safety**. A PE
+  binary gets raw pointer access into the kernel's address space unless Phase 3.1
+  isolation is genuinely solid. Phase 4 without Phase 3 is the single worst
+  ordering mistake available in this plan.
+- **No GPU acceleration.** Even with a network and PE loader, rendering is CPU
+  compositing. M15 is the capstone that makes it a gaming OS, and it is last for
+  a reason.
+
+#### The uncomfortable summary
+
+The fastest-to-slowest ordering means the **biggest** limitations land last.
+Concretely: after Phase 2 the OS will look the most complete and be the least
+safe. A green Phase 2 is not a shippable OS — Phases 3 and 4 are what turn "a
+demo that boots" into "something you could daily-drive", and Phase 4.7 in
+particular should not be started until 3.1 is genuinely done.
+
+#### Phase 2 — Big but self-contained (~6–10 weeks)
+
+- 2.1 2 MiB huge pages
+- 2.2 **surface→scanout damage bridge** — unblocks every future app
+- 2.3 finish virtio-gpu, demote dispi to fallback
+- 2.4 **ext4 driver** (journal + extents + 64-bit + feature flags)
+
+#### Phase 3 — The hard rework (~2–3 months)
+
+- 3.1 **per-process CR3 + address spaces** (finding A)
+- 3.2 `mmap`/`munmap`/`mprotect`/`madvise` (needs 3.1)
+- 3.3 shared memory (needs 3.1)
+- 3.4 **re-enable scheduler migration** — falls out of 3.1
+- 3.5 virtio-blk, replace ATA PIO
+
+#### Phase 4 — The monsters (~4–6 months)
+
+- 4.1 virtio-net · 4.2 Ethernet + ARP · 4.3 IPv4/IPv6 · 4.4 UDP
+- 4.5 **TCP** — the single largest item in the project
+- 4.6 socket syscall API
+- 4.7 PE `.exe`/`.dll` loader (M12)
+
+### The good news in the plan
+
+`TaskCtx` (`scheduler.rs:88`) was already refactored into one owned allocation
+specifically so migration could be re-enabled safely — *"That is what makes safe
+migration possible again."* Items 3.1 and 3.4 are therefore mostly **unblocking
+existing design**, not inventing new architecture.
+
+### Milestone gates
+
+- **End P0** → all suites green; SMEP/SMAP asserted in the serial log
+- **End P1** → new `test-fsync.ps1`: kill mid-write, verify no corruption
+- **End P2** → `test-surface.ps1` proves damage reaches scanout; ext4 mounts a
+  64-bit image
+- **End P3** → new `test-proc-isolation.ps1`: proc A cannot read proc B
+  (today it **can**)
+- **End P4** → `test-net.ps1`: loopback + UDP + TCP handshake
+
+---
+
 ## UEFI (M9 — done)
 
 **Status:** ✅ the same kernel binary now boots **both ways**: BIOS/MBR

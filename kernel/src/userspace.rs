@@ -85,10 +85,14 @@ pub fn init(
         USER_TRAMPOLINE,
         PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE,
     );
-    unsafe {
+    // P16-0.1: the trampoline page is USER_ACCESSIBLE, so SMAP refuses this
+    // supervisor write until an explicit window is opened (see `sec::with_stac`).
+    // The page is deliberately mapped WRITABLE for this write and tightened to
+    // exec-only immediately afterwards.
+    crate::sec::with_stac(|| unsafe {
         (USER_TRAMPOLINE as *mut u8).write_volatile(0xEB);
         ((USER_TRAMPOLINE + 1) as *mut u8).write_volatile(0xFE);
-    }
+    });
     unsafe {
         mapper
             .update_flags(
@@ -437,10 +441,19 @@ fn at_random_bytes() -> [u8; 16] {
 /// Write `bytes` ending exactly at `*sp` (stack grows down: `sp` is left at
 /// the first byte of the written region). Caller owns the address space.
 fn write_bytes_down(sp: &mut u64, bytes: &[u8]) {
-    unsafe {
-        *sp -= bytes.len() as u64;
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), *sp as *mut u8, bytes.len());
-    }
+    // P16-0.1: the user stack is USER_ACCESSIBLE, so this deliberate
+    // kernel->user write needs an SMAP window (see `sec::with_stac`).
+    //
+    // The decrement MUST happen before the copy, in the same order as the
+    // original `unsafe` block: the contract is "bytes end exactly at *sp", so
+    // the copy targets the ALREADY-DECREMENTED sp. Copying first and
+    // decrementing after writes one region too high — which is past the top of
+    // the stack mapping and faults with a bare `CAUSED_BY_WRITE`.
+    *sp -= bytes.len() as u64;
+    let dst = *sp as *mut u8;
+    crate::sec::with_stac(|| unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+    });
 }
 
 /// C1: build the process-start stack in the freshly mapped user-stack slot
@@ -507,40 +520,45 @@ fn build_initial_stack(
     // The contiguous process-start block (argc .. AT_NULL): starts
     // 16-aligned directly below the strings region.
     let block_start = (sp - block as u64) & !0xF;
-    let mut w = block_start as *mut u64;
-    unsafe {
-        *w = argv.len() as u64; // argc
-        w = w.add(1);
-        for p in &argv_ptrs {
-            *w = *p;
+    // P16-0.1: another deliberate kernel->user write into the freshly mapped
+    // (USER_ACCESSIBLE) stack — see `sec::with_stac`. Same reason as
+    // `write_bytes_down`, which handles the strings just above.
+    crate::sec::with_stac(|| {
+        let mut w = block_start as *mut u64;
+        unsafe {
+            *w = argv.len() as u64; // argc
             w = w.add(1);
-        }
-        *w = 0; // argv terminator
-        w = w.add(1);
-        for p in &envp_ptrs {
-            *w = *p;
+            for p in &argv_ptrs {
+                *w = *p;
+                w = w.add(1);
+            }
+            *w = 0; // argv terminator
             w = w.add(1);
-        }
-        *w = 0; // envp terminator
-        w = w.add(1);
-        macro_rules! auxv {
-            ($k:expr, $v:expr) => {{
-                *w = $k;
+            for p in &envp_ptrs {
+                *w = *p;
                 w = w.add(1);
-                *w = $v;
-                w = w.add(1);
-            }};
+            }
+            *w = 0; // envp terminator
+            w = w.add(1);
+            macro_rules! auxv {
+                ($k:expr, $v:expr) => {{
+                    *w = $k;
+                    w = w.add(1);
+                    *w = $v;
+                    w = w.add(1);
+                }};
+            }
+            auxv!(AT_PHDR, info.phdr_vaddr.unwrap_or(0));
+            auxv!(AT_PHENT, 56);
+            auxv!(AT_PHNUM, info.phnum);
+            auxv!(AT_PAGESZ, 4096);
+            auxv!(AT_BASE, info.at_base); // M9.7: static-PIE load base
+            auxv!(AT_ENTRY, info.entry);
+            auxv!(AT_RANDOM, random_ptr);
+            auxv!(AT_EXECFN, execfn);
+            auxv!(AT_NULL, 0);
         }
-        auxv!(AT_PHDR, info.phdr_vaddr.unwrap_or(0));
-        auxv!(AT_PHENT, 56);
-        auxv!(AT_PHNUM, info.phnum);
-        auxv!(AT_PAGESZ, 4096);
-        auxv!(AT_BASE, info.at_base); // M9.7: static-PIE load base
-        auxv!(AT_ENTRY, info.entry);
-        auxv!(AT_RANDOM, random_ptr);
-        auxv!(AT_EXECFN, execfn);
-        auxv!(AT_NULL, 0);
-    }
+    });
 
     Ok(block_start)
 }
@@ -568,7 +586,29 @@ fn map_page(
 /// Hand-rolled ELF64 loader: validates the header, maps every PT_LOAD
 /// segment (file data + zeroed BSS tail), returns `e_entry`. Returns `Err`
 /// (no panic) on any malformation — disk-loaded images are user input.
+///
+/// P16-0.1: the whole body runs inside one `sec::with_stac` window because
+/// EVERY meaningful step here is a supervisor write to a USER_ACCESSIBLE page:
+/// mapping (before the final protection is tightened), the segment copy, the
+/// BSS zero fill, the relocation fixups and the initial user stack. Those pages
+/// are user-accessible from the moment `map_page` creates them, so SMAP refuses
+/// every one of those writes.
+///
+/// One window around the loader is the honest granularity today: a per-write
+/// window would need the closure inside ~6 call sites and buys nothing while
+/// every program still shares ONE address space (Phase 3.1). When loading moves
+/// to per-process address spaces, this becomes per-page and the window can be
+/// narrowed to the copy alone.
 fn load_elf(
+    elf: &[u8],
+    mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<ElfLoadInfo, &'static str> {
+    crate::sec::with_stac(|| load_elf_inner(elf, mapper, frame_allocator))
+}
+
+/// The real loader body; see [`load_elf`] for why it is wrapped.
+fn load_elf_inner(
     elf: &[u8],
     mapper: &mut OffsetPageTable,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
@@ -731,11 +771,16 @@ fn load_elf(
             va += 0x1000;
         }
 
-        unsafe {
+        // P16-0.1: the segment pages are USER_ACCESSIBLE, so SMAP blocks a
+        // supervisor write to them. Loading the image IS a deliberate
+        // kernel->user write, so it runs in an explicit STAC window. Without
+        // this the very first `userspace::init` dies with a write-protection
+        // #PF — which is SMAP working correctly, not a hardware fault.
+        crate::sec::with_stac(|| unsafe {
             let dst = map_va as *mut u8;
             core::ptr::copy_nonoverlapping(elf.as_ptr().add(p_offset), dst, p_filesz);
             core::ptr::write_bytes(dst.add(p_filesz), 0, p_memsz - p_filesz);
-        }
+        });
         extents.push((start, end));
 
         if final_flags != map_flags {
@@ -792,6 +837,20 @@ fn load_elf(
 /// elsewhere (e.g. a fresh page) would silently corrupt the shared user
 /// address space, and an unmapped target must never fault the kernel.
 fn apply_relative_relocations(
+    elf: &[u8],
+    load_base: u64,
+    extents: &[(u64, u64)],
+) -> Result<(), &'static str> {
+    // P16-0.1: this writes fixups into the loaded (USER_ACCESSIBLE) image, so it
+    // needs an SMAP window in its OWN right — not merely the one `load_elf`
+    // already has open. Defence in depth: this function is the one that would
+    // fault the moment SMAP is enabled, and it must not depend on its caller
+    // happening to wrap it.
+    crate::sec::with_stac(|| apply_relative_relocations_inner(elf, load_base, extents))
+}
+
+/// The real relocator; see [`apply_relative_relocations`] for the SMAP window.
+fn apply_relative_relocations_inner(
     elf: &[u8],
     load_base: u64,
     extents: &[(u64, u64)],

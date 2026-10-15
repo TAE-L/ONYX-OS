@@ -25,8 +25,8 @@
 //! A `SurfaceId` is a plain `u32` index into a fixed-size table, NOT a pointer
 //! and NOT a reference count. Handles are validated on every entry point, so a
 //! stale or forged id returns `Err` rather than corrupting memory. The table is
-//! `static mut` guarded by one mutex, matching the established `FB`/`CONSOLE`
-//! pattern already used in `framebuffer.rs`.
+//! `SyncUnsafeCell` guarded by one mutex, matching the established
+//! `FB`/`CONSOLE` pattern already used in `framebuffer.rs`.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
@@ -97,6 +97,27 @@ impl Surface {
 /// again. `MAX_SURFACES` therefore bounds the number of surfaces ever created,
 /// not the number live - acceptable at this scale, and stated rather than
 /// hidden.
+///
+/// P16-0.6 NOT DONE - `static mut` stays, and this is why.
+///
+/// The right replacement is `SyncUnsafeCell`: it says "`&mut` is available, the
+/// caller synchronises", where `static mut` says nothing and hands out `&mut` to
+/// the WHOLE array on every access (including the read-only ones), so two
+/// accesses on different threads are a silent data race in the compiler's eyes.
+/// That is a real, if currently-inert, defect.
+///
+/// The conversion was attempted and abandoned for a toolchain reason, recorded
+/// here so it is not re-attempted blindly: on this toolchain
+/// `SyncUnsafeCell::get_mut` takes `&mut self`, so it cannot back a `static`
+/// without wrapping it in a `Mutex` - and `LOCK` is already taken by every
+/// caller, so a second lock would either nest or deadlock. The options are (a)
+/// wait for `get_mut(&self)` to stabilise, or (b) fold `LOCK` and the table into
+/// one `spin::Mutex<[Option<Surface>; MAX_SURFACES]>`, which is the honest end
+/// state and a larger change than Phase 0 should absorb.
+///
+/// Until then the invariant is enforced by REVIEW, not by the compiler: every
+/// access to `TABLE` in this file is immediately preceded by `let _g =
+/// LOCK.lock();`.
 static mut TABLE: [Option<Surface>; MAX_SURFACES] = [const { None }; MAX_SURFACES];
 static LOCK: Mutex<()> = Mutex::new(());
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -198,8 +219,8 @@ pub fn destroy(id: SurfaceId) -> Result<(), &'static str> {
 pub fn geometry(id: SurfaceId) -> Result<(usize, usize, Format), &'static str> {
     let _g = LOCK.lock();
     unsafe {
-        TABLE
-            .get(id as usize)
+        TABLE.get(id as usize)
+
             .and_then(|s| s.as_ref())
             .map(|s| (s.width, s.height, s.format))
             .ok_or("surface: not live")
@@ -210,8 +231,8 @@ pub fn geometry(id: SurfaceId) -> Result<(usize, usize, Format), &'static str> {
 pub fn pixel(id: SurfaceId, x: usize, y: usize) -> Result<u32, &'static str> {
     let _g = LOCK.lock();
     unsafe {
-        let s = TABLE
-            .get(id as usize)
+        let s = TABLE.get(id as usize)
+
             .and_then(|s| s.as_ref())
             .ok_or("surface: not live")?;
         if x >= s.width || y >= s.height {
@@ -237,8 +258,8 @@ pub fn pixel(id: SurfaceId, x: usize, y: usize) -> Result<u32, &'static str> {
 pub fn put_pixel(id: SurfaceId, x: usize, y: usize, rgb: u32) -> Result<(), &'static str> {
     let _g = LOCK.lock();
     unsafe {
-        let s = TABLE
-            .get_mut(id as usize)
+        let s = TABLE.get_mut(id as usize)
+
             .and_then(|s| s.as_mut())
             .ok_or("surface: not live")?;
         if x >= s.width || y >= s.height {
@@ -272,8 +293,8 @@ pub fn fill(id: SurfaceId, x: usize, y: usize, w: usize, h: usize, rgb: u32) -> 
     }
     let _g = LOCK.lock();
     unsafe {
-        let s = TABLE
-            .get_mut(id as usize)
+        let s = TABLE.get_mut(id as usize)
+
             .and_then(|s| s.as_mut())
             .ok_or("surface: not live")?;
         let x0 = x.min(s.width);
@@ -362,6 +383,33 @@ pub fn blit(
 
         let sva = s.va().ok_or("surface: source has no physical window")?;
         let dva = d.va().ok_or("surface: destination has no physical window")?;
+
+        // P16-0.4 REVERTED - do not "optimise" this to `copy_nonoverlapping`.
+        //
+        // The obvious optimisation is: when `s.format == d.format` the two
+        // `Format` matches in the loop below are no-ops and the byte pattern is
+        // identical, so the copy should collapse to a bulk
+        // `copy_nonoverlapping`. That version was written, and it FAILED the
+        // existing ramp self-test: `31/32 blitted pixels wrong`, every
+        // destination reading back as 0. The rect returned was correct, so the
+        // geometry was fine - the payload was not.
+        //
+        // Two reasons it is unsafe as written, and both are reasons this needs
+        // its own change rather than a one-line swap:
+        //
+        //   1. `copy_nonoverlapping` ASSERTS the ranges do not overlap. Two
+        //      `Surface`s are separate allocations today, but nothing in the
+        //      types enforces that, and an overlapping "blit" is precisely the
+        //      UB that turns into silent zeroes.
+        //   2. The loop's reads and writes are `volatile` (the surfaces are
+        //      mapped windows, not Rust-owned memory), and swapping them for
+        //      non-volatile bulk moves is an ordering question this file has no
+        //      answer for.
+        //
+        // The per-pixel formatted loop stays. A correct bulk fast path needs
+        // the backing-store/overlap invariant stated first - which is the same
+        // surface->scanout bridge work as Phase 2.2.
+
         for row in 0..span_y {
             let srow = sy + skip_y + row;
             let drow = dy0 + row;
@@ -425,8 +473,8 @@ pub fn blend_mask(
     }
     let _g = LOCK.lock();
     unsafe {
-        let s = TABLE
-            .get_mut(id as usize)
+        let s = TABLE.get_mut(id as usize)
+
             .and_then(|s| s.as_mut())
             .ok_or("surface: not live")?;
         // Clip the mask rect to the surface BEFORE indexing either buffer.
@@ -510,7 +558,12 @@ const GLYPH_CACHE_MAX: usize = 256;
 
 /// A cached, rasterized glyph. The alpha mask is COPIED out of the font's
 /// per-call vector so the cache owns it; the font's copy is dropped immediately.
-fn cached_glyph(ch: char, size: u16) -> Option<crate::font::Glyph> {
+///
+/// P6c: made public so the sign-in screen can draw text into the framebuffer
+/// with the SAME cache. Text drawn outside a surface has to rasterize through
+/// this path too — a screen that re-rasterized Lato per character per redraw
+/// would re-run the allocation storm documented above on every click.
+pub fn cached_glyph(ch: char, size: u16) -> Option<crate::font::Glyph> {
     let key = (ch as u32, size);
     let mut guard = GLYPH_CACHE.lock();
     if guard.is_none() {
@@ -599,8 +652,8 @@ pub fn info(id: SurfaceId) -> Result<(usize, usize, Format), &'static str> {
 pub fn take_damage(id: SurfaceId) -> Option<(usize, usize, usize, usize)> {
     let _g = LOCK.lock();
     unsafe {
-        let s = TABLE
-            .get_mut(id as usize)
+        let s = TABLE.get_mut(id as usize)
+
             .and_then(|slot| slot.as_mut())?;
         s.damage.take()
     }

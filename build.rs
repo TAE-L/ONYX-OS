@@ -372,6 +372,25 @@ fn append_fat32_partition(image_path: &Path, out_dir: &Path) {
             "run /ARGTEST.ELF alpha beta gamma\n",
             // M9.7: raw Linux-ABI static-PIE via the syscall shim.
             "run /LNXTEST.ELF\n",
+            // P16 interop fixtures. These exist so `tests/test-fatinterop.ps1`
+            // can boot WITHOUT -snapshot and then verify the entries with an
+            // INDEPENDENT host-side FAT32 parser (and with Windows itself where
+            // the host permits it). Every other suite uses -snapshot, so these
+            // never survive into another test's image.
+            //
+            // No spaces: the shell splits a command on whitespace, so a filename
+            // cannot contain one. The length matrix is chosen to hit the slot
+            // boundaries a wrong `>= 12` comparison gets wrong -- 13 chars is
+            // exactly ONE LFN slot, 14 is two.
+            "write /ABCDEFGHIJKLM boundary 13\n",
+            "write /ABCDEFGHIJKLMN boundary 14\n",
+            "write /InteropTwentyCharsLong 24\n",
+            "write /InteropVeryLongDocumentNameFortyCharsIndeed 43\n",
+            "write /interop.lower.name.txt lowercase\n",
+            // Must stay a PURE 8.3 entry: if this one grows LFN slots, the
+            // "8.3-legal names are byte-identical to the pre-LFN layout" claim
+            // is false and Windows will show a duplicate-looking pair.
+            "write /LEGAL83.TXT eight dot three\n",
             "echo autoexec done - entering interactive mode\n",
         ),
     )

@@ -37,6 +37,13 @@ pub enum FsError {
 pub struct FileStat {
     pub size: u64,
     pub is_dir: bool,
+    /// P16-1.3: Unix seconds. `0` means "no timestamp recorded" -- an entry
+    /// written by a tool that zeroed the field, or a filesystem that has no
+    /// clock. It does NOT mean 1970-01-01, which would be indistinguishable
+    /// from real data.
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
 }
 
 pub struct DirEntry {
@@ -72,6 +79,17 @@ pub trait FileSystem: Send {
         let _ = (dev, path);
         Err(FsError::NotSupported)
     }
+    /// P16-1.4: force the file's metadata out to the device and drop any cached
+    /// copy of it, so the next read comes from the disk rather than from memory.
+    ///
+    /// The default is `Ok(())` for backends with nothing to flush. Note what this
+    /// does NOT promise: it makes the entry durable to the device, it does not
+    /// make the filesystem crash-consistent. On an unjournaled ext2 a power cut
+    /// mid-metadata-update still corrupts the volume -- only ext4 fixes that.
+    fn fsync(&mut self, dev: &mut AtaDrive, path: &str) -> Result<(), FsError> {
+        let _ = (dev, path);
+        Ok(())
+    }
     /// Remove the file at `path`. Directories are rejected with `IsDir`.
     fn unlink(&mut self, dev: &mut AtaDrive, path: &str) -> Result<(), FsError> {
         let _ = (dev, path);
@@ -81,6 +99,15 @@ pub trait FileSystem: Send {
     fn rename(&mut self, dev: &mut AtaDrive, from: &str, to: &str) -> Result<(), FsError> {
         let _ = (dev, from, to);
         Err(FsError::NotSupported)
+    }
+
+    /// P16-1.2: run the filesystem's own long-filename round-trip self-test.
+    ///
+    /// On the trait so the caller reaches the ALREADY-MOUNTED instance through
+    /// the same indirection the rest of the VFS uses. `Fat32` overrides it.
+    /// Other backends keep the no-op default.
+    fn lfn_self_test(&mut self, dev: &mut AtaDrive) {
+        let _ = dev;
     }
 }
 
@@ -165,7 +192,7 @@ pub fn init() {
             serial_writeln!("M6: no large FAT32 partition found on boot disk");
             return None;
         };
-        match crate::fat::Fat32::mount(&mut disk.drive, part.start_lba as u32) {
+        match crate::fat::Fat32::mount(&mut disk.drive, part.start_lba) {
             Ok(fs) => {
                 serial_writeln!(
                     "M6: FAT32 mounted (LBA {}): {}",
@@ -202,6 +229,36 @@ pub fn init() {
             }
         }
         Err(e) => serial_writeln!("M6: root listing failed: {e:?}"),
+    }
+
+    // P16-1.2: long-filename round-trip, run once here because this is the one
+    // place with both the mounted filesystems and a live drive. It runs against
+    // the ALREADY-MOUNTED instance, so it cannot disagree with the one the rest
+    // of the system uses.
+    run_lfn_self_test();
+}
+
+/// Run each mounted filesystem's long-filename self-test.
+///
+/// P16-1.2. The mount lock is taken INSIDE `with_disk` only for the duration of
+/// the call, and the `dyn FileSystem` reference comes from the same lock — the
+/// alternative (holding `MOUNTS` across `with_disk`) would invert the
+/// mounts-first, then-DISK order this file documents as deadlock-free.
+fn run_lfn_self_test() {
+    if !MOUNTS.lock().iter().any(|m| m.label == "FAT32") {
+        serial_writeln!("[lfn] SKIP: FAT32 not mounted");
+        return;
+    }
+    let ok = crate::block::with_disk(|disk| {
+        let mut guard = MOUNTS.lock();
+        let Some(i) = guard.iter().position(|m| m.label == "FAT32") else {
+            return false;
+        };
+        guard[i].fs.lfn_self_test(&mut disk.drive);
+        true
+    });
+    if ok.is_none() {
+        serial_writeln!("[lfn] SKIP: disk unavailable");
     }
 }
 
@@ -261,4 +318,10 @@ pub fn unlink(path: &str) -> Result<(), FsError> {
 /// Rename `from` to `to`.
 pub fn rename(from: &str, to: &str) -> Result<(), FsError> {
     with_fs(from, |fs, dev| fs.rename(dev, from, to))?
+}
+
+/// P16-1.4: make `path`'s metadata durable. Dispatched by path, like every other
+/// VFS entry point, because that is the only thing that selects a backend.
+pub fn fsync(path: &str) -> Result<(), FsError> {
+    with_fs(path, |fs, dev| fs.fsync(dev, path))?
 }

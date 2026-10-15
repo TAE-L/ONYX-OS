@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "user/evtest", "user/argtest", "user/hello", "user/fstest", "user/shell", "tools/mkfat", "tools/mkext2"]
+members = ["kernel", "user/evtest", "user/argtest", "user/hello", "user/fstest", "user/shell", "tools/mkfat", "tools/mkext2", "tools/fatfs-verify"]
 exclude = ["test_asm"]
 
 [package]

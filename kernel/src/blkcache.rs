@@ -24,7 +24,7 @@ pub const CACHE_ENTRIES: usize = 2048;
 pub const READ_AHEAD: usize = 4;
 
 struct Entry {
-    lba: u32,
+    lba: u64,
     valid: bool,
     /// Second-chance bit: set on access, cleared on a sweep pass.
     dwell: bool,
@@ -46,7 +46,11 @@ struct Cache {
     misses: usize,
     /// End LBA (lba+count) of the last read; set when that read was a
     /// sequential continuation of the previous one.
-    last_seq_end: u32,
+    ///
+    /// P16-1.1: `u64` with the cache key — a `u32` here would make sequential
+    /// detection silently wrong for any partition above 128 GiB (the end LBA
+    /// would wrap and the cache would think an unrelated read was sequential).
+    last_seq_end: u64,
     seq_valid: bool,
 }
 
@@ -64,7 +68,7 @@ impl Cache {
 
     /// Look up a sector, returning its data as a copy so the caller's borrow
     /// of the cache ends before any later `hits += 1` / `insert`.
-    fn find(&mut self, lba: u32) -> Option<[u8; SECTOR_SIZE]> {
+    fn find(&mut self, lba: u64) -> Option<[u8; SECTOR_SIZE]> {
         self.entries
             .iter_mut()
             .find(|e| e.valid && e.lba == lba)
@@ -75,7 +79,7 @@ impl Cache {
     }
 
     /// Check presence without touching the dwell bit (RA + tests).
-    fn contains(&self, lba: u32) -> bool {
+    fn contains(&self, lba: u64) -> bool {
         self.entries.iter().any(|e| e.valid && e.lba == lba)
     }
 
@@ -83,7 +87,7 @@ impl Cache {
     /// cached, the entry is updated IN PLACE — otherwise a write of a
     /// previously-read sector would leave a stale duplicate that `find`
     /// (first-match scan) would keep returning.
-    fn insert(&mut self, lba: u32, data: &[u8; SECTOR_SIZE]) {
+    fn insert(&mut self, lba: u64, data: &[u8; SECTOR_SIZE]) {
         for e in self.entries.iter_mut() {
             if e.valid && e.lba == lba {
                 e.data.copy_from_slice(data);
@@ -120,15 +124,15 @@ static CACHE: Mutex<Cache> = Mutex::new(Cache::new());
 
 /// Cached read of `count` sectors at `lba` into `buf` (cache hits + coalesced
 /// raw misses + sequential read-ahead). Runs with IF=0.
-pub fn read(dev: &mut AtaDrive, lba: u32, count: u8, buf: &mut [u8]) -> Result<(), AtaError> {
+pub fn read(dev: &mut AtaDrive, lba: u64, count: u8, buf: &mut [u8]) -> Result<(), AtaError> {
     if count == 0 || buf.len() < count as usize * SECTOR_SIZE {
         return dev.read_sectors_raw(lba, count, buf);
     }
     let mut c = CACHE.lock();
     let sequential = c.seq_valid && lba == c.last_seq_end;
 
-    let cnt = u32::from(count);
-    let mut i: u32 = 0;
+    let cnt = u64::from(count);
+    let mut i: u64 = 0;
     while i < cnt {
         let s = lba + i;
         match c.find(s) {
@@ -141,7 +145,7 @@ pub fn read(dev: &mut AtaDrive, lba: u32, count: u8, buf: &mut [u8]) -> Result<(
             None => {
                 // Coalesce consecutive miss sectors into one raw read.
                 let start = s;
-                let mut run: u32 = 1;
+                let mut run: u64 = 1;
                 while i + run < cnt && !c.contains(lba + i + run) {
                     run += 1;
                 }
@@ -165,7 +169,7 @@ pub fn read(dev: &mut AtaDrive, lba: u32, count: u8, buf: &mut [u8]) -> Result<(
     // Read-ahead on a sequential continuation (best-effort past EOF).
     if sequential {
         let mut scratch = [0u8; READ_AHEAD * SECTOR_SIZE];
-        let mut k: u32 = 0;
+        let mut k: u64 = 0;
         while (k as usize) < READ_AHEAD {
             let s = c.last_seq_end + k;
             if c.contains(s) {
@@ -173,7 +177,7 @@ pub fn read(dev: &mut AtaDrive, lba: u32, count: u8, buf: &mut [u8]) -> Result<(
                 continue;
             }
             let start = s;
-            let mut run: u32 = 1;
+            let mut run: u64 = 1;
             while (run as usize) < READ_AHEAD - (k as usize) && !c.contains(s + run) {
                 run += 1;
             }
@@ -192,13 +196,12 @@ pub fn read(dev: &mut AtaDrive, lba: u32, count: u8, buf: &mut [u8]) -> Result<(
     }
     Ok(())
 }
-
 /// Cached (write-through) write of `count` sectors: disk first, then cache.
 /// Runs with IF=0.
-pub fn write(dev: &mut AtaDrive, lba: u32, count: u8, buf: &[u8]) -> Result<(), AtaError> {
+pub fn write(dev: &mut AtaDrive, lba: u64, count: u8, buf: &[u8]) -> Result<(), AtaError> {
     dev.write_sectors_raw(lba, count, buf)?;
     let mut c = CACHE.lock();
-    for k in 0..u32::from(count) {
+    for k in 0..u64::from(count) {
         let off = k as usize * SECTOR_SIZE;
         let mut sec = [0u8; SECTOR_SIZE];
         sec.copy_from_slice(&buf[off..off + SECTOR_SIZE]);
@@ -234,13 +237,13 @@ pub fn stats() -> (usize, usize) {
 }
 
 /// Is sector `lba` currently cached? (Tests.)
-pub fn is_cached(lba: u32) -> bool {
+pub fn is_cached(lba: u64) -> bool {
     let c = CACHE.lock();
     c.contains(lba)
 }
 
 /// End LBA of the most recent sequential read, if any. (Tests.)
-pub fn last_seq_end() -> Option<u32> {
+pub fn last_seq_end() -> Option<u64> {
     let c = CACHE.lock();
     c.seq_valid.then_some(c.last_seq_end)
 }
