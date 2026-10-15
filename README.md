@@ -41,7 +41,7 @@ kernel/app boundary and tested from ring 3 rather than being re-plumbed later.
 
 | | |
 |---|---|
-| Kernel | **~24,000 lines** of `no_std` Rust (`kernel/src/`) |
+| Kernel | **25,540 lines** of `no_std` Rust across 42 files in `kernel/src/` (23,969 non-blank) |
 | Syscalls | **24** |
 | Test suites | **35** PowerShell suites in `tests/`, plus an independent FAT32 verifier |
 | Milestones | **M0 → M10 complete**; M9.5 deferred; M11–M15 not started |
@@ -168,8 +168,10 @@ stayed green. It was caught only because a third implementation disagreed with
 
 The architecture audit put it plainly: *no craftsmanship problems, several
 architectural ones*. Comments explain *why*, failures are documented rather
-than hidden, self-tests read real pixels. But the layering means **~4,700
-lines of graphics work sits on top of a layer that does not exist**: surface
+than hidden, self-tests read real pixels. But the layering means **4,709
+lines of graphics work** (`surface.rs` 665 + `framebuffer.rs` 1,869 +
+`font.rs` 993 + `gpu.rs` 881 + `compositor.rs` 301, counted today) sits on
+top of a layer that does not exist yet: surface
 damage and present damage are still separate accumulators (finding J), so a
 composited frame never reaches scanout. The architecture should have been
 designed before the graphics, not discovered after them.
@@ -185,9 +187,11 @@ mistake. Every milestone made it more expensive to change.
 ### 5. The audit came too late
 
 The architecture audit ran against a **16,110-line kernel** — after
-filesystems, graphics, SMP and GPU work were all built. Findings A–M would
-have been far cheaper at 4,000 lines. Reviews like that should be periodic,
-not something you run when the project feels finished.
+filesystems, graphics, SMP and GPU work were all built. The kernel is
+**25,540 lines** today (measured across `kernel/src/*.rs`), so it grew by
+another ~9,400 lines after the audit rather than before it. Findings A–M
+would have been far cheaper at 4,000 lines. Reviews like that should be
+periodic, not something you run when the project feels finished.
 
 ### 6. Verification discipline was enforced by prose, not tooling
 
